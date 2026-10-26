@@ -19,31 +19,40 @@ from typing import Literal
 from fr.triage.batch import (
     BatchStage,
     DependencyState,
+    allowed_authors,
     batch_item_id,
     batch_pr,
     batch_repo,
     closeout_state,
     dependency_state,
     derive_batch_stage,
+    distrust,
     last_dispatch,
 )
 from fr.triage.batch_drive import (
     ARCHIVE_PREFIXES,
+    ARCHIVE_WAIT,
     AWAITING_LIVE_HOLD,
+    CONFLICTING,
     Action,
     IdleSession,
     LivePr,
     Pass,
     Snapshot,
+    attributed,
+    checks_verdict,
     closeout_event,
     closeout_item_id,
     default_selection,
     drive_pass,
+    held_archive_conflict,
     idle_session,
 )
 from fr.triage.claims import expired, from_issue_claim, held_line, held_map
 from fr.triage.components import stamp_text
-from fr.triage.merge_stops import MergeStop, live_stop
+from fr.triage.lanes import lane_of, live_stops
+from fr.triage.merge_stops import MergeStop, archive_stop_key, live_stop
+from fr.triage.mergeability import CONFLICT_HINT, conflicting
 from fr.triage.model import (
     Batch,
     CancelEvent,
@@ -60,13 +69,31 @@ from fr.triage.views import drive_snapshot
 BoardStatus = Literal["working", "blocked", "idle", "done", "unknown", "absent"]
 """One session's live state as the board shows it; `absent` when the runner holds none."""
 
-Column = Literal["proposed", "waiting", "running", "pr-open", "closing-out", "partial", "done"]
+Column = Literal[
+    "proposed",
+    "waiting",
+    "running",
+    "needs-developer",
+    "pr-open",
+    "needs-reviewer",
+    "needs-tester",
+    "needs-devops",
+    "closing-out",
+    "partial",
+    "done",
+]
 
 COLUMN_TITLES: Mapping[Column, str] = {
     "proposed": "Proposed",
     "waiting": "Waiting",
     "running": "Running",
+    # The four Needs-you lanes (exit-gates R17): decided from the run cursor and the gate
+    # labels (`lanes.lane_of`), never from session status.
+    "needs-developer": "Needs you · Developer",
     "pr-open": "PR open",
+    "needs-reviewer": "Needs you · Reviewer",
+    "needs-tester": "Needs you · Tester",
+    "needs-devops": "Needs you · DevOps",
     "closing-out": "Closing out",
     # A merged batch with a member still open, owed its close-out (gh#985): the driver
     # still acts on it, so it is not Done until that close-out is archived.
@@ -104,13 +131,31 @@ _ACTION_PHRASES: Mapping[str, str] = {
     "export-merge": "state export PR ready to merge",
     "export-reconcile": "state export merged; the drive records it",
     "export-closed": "state export PR closed; the drive re-exports",
+    "export-conflict": "state export PR conflicts; the operator must act",
     "dedupe": "duplicate candidates to judge",  # names no batch; never a card hint
     # Claim bookkeeping (triage-claims §3.F): what the drive writes before it acts.
     "claim": "claims owed; the drive writes them",
     "refresh": "claims due a refresh",
     "release": "claims to release",
+    "settle": "closed issues to settle",
+    "archive-conflict": "archive PR conflicts; handed to its close-out",
+    # The gate ledger (exit-gates R13, R14): a gated batch's first pass and its pass.
+    "awaiting-live": "gated: its issues to label fr:awaiting-live",
+    "gate-pass": "gate's rows walked; the drive passes it",
+    "ledger-unread": "gate labels unread; close-out waits",
+    "post-merge": "post_merge due",
+    "closeout-held": "close-out held: retry it by name",
+    "closeout-handback": "close-out PR handed back",
+    "closeout-stuck": "close-out PR stuck",
+    "closeout-unrecorded": "close-out pushed, nothing recorded",
+    "closeout-reopened": "close-out PR reopened: needs approval",
+    "closeout-merged": "close-out PR merged",
+    "closeout-pr-closed": "close-out PR closed unmerged",
+    "closeout-needs-review": "close-out PR needs review",
+    "closeout-abandoned": "close-out ended with no PR",
 }
 NEEDS_YOU = "needs you: session blocked"
+NEEDS_YOU_ARCHIVE_HELD = "needs you: archive conflict, hand-backs spent"  # merge-truth R12
 NEEDS_YOU_MERGE_STOPPED = "needs you: merge stopped"  # gh#987, followed by the reason
 # R6's per-column fallbacks.
 HINT_QUEUED = "queued"
@@ -139,21 +184,58 @@ def _idle_hint(idle: IdleSession, collected_at: str) -> str:
     return f"idle, dispatched {idle.minutes_since} min ago, no PR as of {when_}"
 
 
-def _archive_prs(batch_repo_: str, facts: Facts) -> list[LivePr]:
-    """The collected archive PRs of *batch_repo_*, as the driver's attribution reads them."""
-    return [
-        LivePr(
-            number=p.number,
-            state=p.state,
-            draft=p.is_draft,
-            head=p.head_oid,
-            head_ref=p.head_ref,
-            files=tuple(p.files),
-            trusted=not p.cross_repo,
+def _archive_prs(batch_repo_: str, facts: Facts, ci_none: Collection[str] = ()) -> list[LivePr]:
+    """The collected archive PRs of *batch_repo_*, unlinked and linked to an issue
+    (merge-truth R10), as the driver's attribution reads them: trusted by the rule
+    `attributed()` applies (gh#936), checks by the facts' verdict, green on a repo in
+    *ci_none* as the driver judges it."""
+    allowed = allowed_authors(batch_repo_, facts)
+    out: dict[int, LivePr] = {}
+    for p in (*facts.prs, *(q for issue in facts.issues for q in issue.prs)):
+        if p.repo != batch_repo_ or not p.head_ref.startswith(ARCHIVE_PREFIXES):
+            continue
+        if p.number in out:
+            continue
+        verdict, failing = checks_verdict([], p.checks or {}, ci_none=batch_repo_ in ci_none)
+        out[p.number] = LivePr(
+            number=p.number, state=p.state, draft=p.is_draft, head=p.head_oid,
+            checks=verdict, failing=failing, head_ref=p.head_ref, files=tuple(p.files),
+            trusted=distrust(p.author, p.cross_repo, allowed) is None,
+            mergeable=p.mergeable or "",
         )  # fmt: skip
-        for p in facts.prs
-        if p.repo == batch_repo_ and p.head_ref.startswith(ARCHIVE_PREFIXES)
-    ]
+    return list(out.values())
+
+
+def _open_archive(batch: Batch, archives: Sequence[LivePr]) -> LivePr | None:
+    """The batch's attributed open archive PR while it closes out (merge-truth R10)."""
+    event = closeout_event(batch)
+    if event is None or event.archived is not None:
+        return None
+    return next((p for p in archives if p.state == "OPEN" and attributed(p, batch, event)), None)
+
+
+def _archive_wait(batch: Batch, archives: Sequence[LivePr]) -> str | None:
+    """The card's line for a close-out with an attributed open archive PR (merge-truth
+    R10): the PR and what it waits on. None when it has none."""
+    p = _open_archive(batch, archives)
+    if p is None:
+        return None
+    if p.mergeable == CONFLICTING:
+        wait = "conflicts with the default branch"
+    elif p.checks == "green":
+        wait = "ready to merge"
+    else:
+        wait = f"checks {p.checks}"
+    return f"{ARCHIVE_WAIT} #{p.number}: {wait}"
+
+
+def _held_archive(batch: Batch, archives: Sequence[LivePr]) -> str | None:
+    """A held archive conflict (merge-truth R12) still at the open archive PR's head:
+    the card's needs-you line, else None."""
+    held, p = held_archive_conflict(batch), _open_archive(batch, archives)
+    if held is None or p is None or p.number != held.pr or p.head != held.head:
+        return None
+    return f"{NEEDS_YOU_ARCHIVE_HELD} (archive PR #{held.pr})"
 
 
 # ---------------------------------------------------------------- the model
@@ -286,11 +368,17 @@ class Board:
 # ------------------------------------------------------------------ columns
 
 
-def column_of(batch: Batch, facts: Facts, batches: Sequence[Batch]) -> Column:
-    """R2's table, from `derive_batch_stage`, `dependency_state` and `closeout_state`."""
+def column_of(
+    batch: Batch, facts: Facts, batches: Sequence[Batch], *, stop: MergeStop | None = None
+) -> Column:
+    """R2's table, from `derive_batch_stage`, `dependency_state` and `closeout_state`; a
+    batch `lane_of` places is in that Needs-you lane instead (exit-gates R17). *stop* is
+    the batch's live merge stop."""
     if not batch.events:
         waiting = any(dependency_state(d, batches, facts) != "satisfied" for d in batch.after)
         return "waiting" if waiting else "proposed"
+    if (lane := lane_of(batch, facts, stop)) is not None:
+        return lane.lane
     stage = derive_batch_stage(batch, facts)
     if stage in _COLUMN_OF_STAGE:
         return _COLUMN_OF_STAGE[stage]
@@ -357,6 +445,8 @@ def action_phrase(action: Action) -> str:
         return f"held: {action.detail}"
     if action.kind == "enqueue":
         return f"enqueue PR #{action.pr}"
+    if action.kind == "warn" and action.detail.startswith(ARCHIVE_WAIT):
+        return action.detail  # an archive PR's waiting line, never "CI failing" (R9)
     return _ACTION_PHRASES[action.kind]
 
 
@@ -404,6 +494,11 @@ def fallback_hint(
 # -------------------------------------------------------------------- cards
 
 
+def _conflicting(batch: Batch, facts: Facts) -> bool:
+    pr = batch_pr(batch, facts)
+    return pr is not None and conflicting(pr.mergeable, pr.merge_state)
+
+
 def _members(batch: Batch, facts: Facts) -> tuple[Member, ...]:
     found = {i.key: i for i in facts.issues}
     out = []
@@ -445,6 +540,7 @@ def _idle_of(
     status: BoardStatus | None,
     closeout_status: BoardStatus | None,
     now: datetime | None,
+    archives: Sequence[LivePr],
 ) -> IdleSession | None:
     """The batch's idle session by `idle_session`, the driver's own rule, judged at *now*
     (the wall clock: session status is live). None without a clock or a repo."""
@@ -452,7 +548,6 @@ def _idle_of(
         return None
     threshold = facts.config_for(repo).idle_session_minutes
     stage = derive_batch_stage(batch, facts)
-    archives = _archive_prs(repo, facts)
     return idle_session(
         batch, repo=repo, closeout=False, status=status, stage=stage,
         archives=archives, now=now, threshold=threshold,
@@ -475,8 +570,11 @@ def _card(
     notes: Mapping[str, str] | None = None,
     awaiting: frozenset[str] = frozenset(),
     queued: frozenset[str] = frozenset(),
+    ci_none: Collection[str] = (),
 ) -> Card:
-    column = column_of(batch, facts, batches)
+    stop = stops.get(batch.id)
+    lane = lane_of(batch, facts, stop)
+    column = column_of(batch, facts, batches, stop=stop)
     deps = tuple(Dep(d, dependency_state(d, batches, facts)) for d in batch.after)
     repo = batch_repo(batch, facts)
     dispatch, closeout = last_dispatch(batch), closeout_event(batch)
@@ -487,24 +585,50 @@ def _card(
     if closeout is not None and closeout.runner != "hand":
         key = closeout_item_id(repo, batch.id) if repo else ""
         closeout_status = statuses.get(key, "unknown")
-    stop = stops.get(batch.id)
-    idle = _idle_of(batch, facts, repo, status, closeout_status, now)
-    needs_you = "blocked" in (status, closeout_status) or stop is not None or idle is not None
+    # The lane reads the batch PR's own stop; an archive stop (merge-truth R12) also puts
+    # the card in front of the person, through its hint, never through a lane.
+    stop = stops.get(batch.id) or stops.get(archive_stop_key(batch.id))
+    archives = _archive_prs(repo, facts, ci_none) if repo else []
+    idle = _idle_of(batch, facts, repo, status, closeout_status, now, archives)
+    held_archive = _held_archive(batch, archives)
+    first = actions.get(batch.id)
+    red = (
+        (_red_phrase(batch, first) or action_phrase(first))
+        if first and first.kind == "warn"
+        else None
+    )
+    needs_you = (
+        "blocked" in (status, closeout_status)
+        or stop is not None
+        or lane is not None
+        or idle is not None
+        or held_archive is not None
+    )
     if "blocked" in (status, closeout_status):
         # A runner that says why (`SessionNotes`, cloud-triage R15) adds its words.
         keys = (batch_item_id(repo, batch.id), closeout_item_id(repo, batch.id)) if repo else ()
         said = [n for key in keys if (n := (notes or {}).get(key))]
         hint = f"{NEEDS_YOU}: {'; '.join(said)}" if said else NEEDS_YOU
+    elif lane is not None and not (lane.lane == "needs-reviewer" and red is not None):
+        hint = f"needs you: {lane.reason}"  # p5-r5: the column's own reason, always
+    elif lane is not None:
+        hint = red or ""  # p5-r4: a red delivered PR is not one to approve
     elif stop is not None:
         hint = f"{NEEDS_YOU_MERGE_STOPPED}: {stop.reason}"
+    elif held_archive is not None:
+        hint = held_archive
     elif idle is not None:
         hint = _idle_hint(idle, facts.collected_at)
+    elif (wait := _archive_wait(batch, archives)) is not None:
+        hint = wait
     elif held := [d for d in batch.after if d in stops]:
         # The pass plans this batch's dispatch on the dependency merging first; a
         # stopped merge never lands, so it waits on it as the driver does ("held").
         hint = "waits on " + ", ".join(f"{d} (merge stopped)" for d in held)
     elif batch.id in actions:
         hint = _red_phrase(batch, actions[batch.id]) or action_phrase(actions[batch.id])
+        if actions[batch.id].kind in ("merge", "enqueue") and _conflicting(batch, facts):
+            hint = CONFLICT_HINT  # R19: the train still plans it; the card never says ready
     elif batch.id in queued:
         hint = HINT_IN_MERGE_QUEUE
     elif batch.id in awaiting:
@@ -573,16 +697,22 @@ def _own_expiries(facts: Facts, me: str, now: datetime) -> dict[str, ClaimExpiry
     return {b: ClaimExpiry(at, expired=at <= now) for b, at in earliest.items()}
 
 
-def live_stops(
-    batches: Sequence[Batch], facts: Facts, stops: Mapping[str, MergeStop]
+def _board_stops(
+    batches: Sequence[Batch],
+    facts: Facts,
+    stops: Mapping[str, MergeStop],
+    ci_none: Collection[str] = (),
 ) -> dict[str, MergeStop]:
-    """The recorded stops that still hold: the batch's PR is open, at the stopped head."""
-    out: dict[str, MergeStop] = {}
+    """`lanes.live_stops` (the batch PR's stops that still hold), plus each archive stop
+    (`archive:<batch>`, merge-truth R12) while the batch's attributed archive PR is open
+    at its head."""
+    out = live_stops(batches, facts, stops)
     for b in batches:
-        pr = batch_pr(b, facts)
-        if pr is not None and pr.state == "OPEN":
-            if (stop := live_stop(stops.get(b.id), pr.head_oid)) is not None:
-                out[b.id] = stop
+        key = archive_stop_key(b.id)
+        if key in stops and (repo := batch_repo(b, facts)):
+            archive = _open_archive(b, _archive_prs(repo, facts, ci_none))
+            if archive is not None and (stop := live_stop(stops[key], archive.head)):
+                out[key] = stop
     return out
 
 
@@ -597,7 +727,7 @@ def build_board(
     notes: Mapping[str, str] | None = None,
     ci_none: Collection[str] = (),
 ) -> Board:
-    """One card per batch in seven columns, sorted by wave (none last) then id (R2).
+    """One card per batch in eleven columns, sorted by wave (none last) then id (R2).
     *stops* are the driver's recorded merge stops (gh#987); one counts only while the
     batch's PR is open at the head it was recorded at. *now* is the wall clock (passed in):
     with it a card whose session sat idle past the repo's `idle_session_minutes` with no PR is
@@ -614,7 +744,7 @@ def build_board(
     actions, awaiting = _first_actions(plan), _awaiting(snapshot, plan)
     queued = _in_merge_queue(plan)
     selected = default_selection(batches)
-    live = live_stops(batches, facts, stops or {})
+    live = _board_stops(batches, facts, stops or {}, ci_none)
     cards = [
         _card(
             b,
@@ -629,6 +759,7 @@ def build_board(
             notes=notes,
             awaiting=awaiting,
             queued=queued,
+            ci_none=ci_none,
         )
         for b in batches
     ]

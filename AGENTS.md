@@ -165,7 +165,7 @@ uv workspace monorepo, version lockstepped across every manifest (see
     {list,create,edit,cancel,suggest,dispatch,merge,drive}`
     (`commands/triage_batch_cmd.py`) turn a group of judged issues into one
     fr-goal run with one PR. `judgements.yaml` carries `batches:` with
-    engine-appended `events` (fr reads schemas 1–8 and writes 8, see
+     engine-appended `events` (fr reads schemas 1–12 and writes 12, see
     the waves paragraph below) and `facts.json` schema 8
     (open-PR join with `files`/`head_oid`, `batch_prs`, per-repo `config` from
     the target repo's `.fr/triage.yaml`). The engine is `fr/triage/batch.py`
@@ -191,8 +191,11 @@ uv workspace monorepo, version lockstepped across every manifest (see
     **Waves and the driver** (2026-10-02 spec, `wave-driver`): judgements
     schema 3 adds `wave`/`after` per batch and the `post_merge`/`closeout`
     events; schema 7 adds audited `replacement` attempt/success/failure events
-    that never change dispatch age or lifecycle; current writers stamp 8 (read
-    1–8), adding `claim_taken`, which makes a taken member's claim owed (gh#1120).
+    that never change dispatch age or lifecycle; 8 adds `claim_taken`, which makes a
+    taken member's claim owed (gh#1120); 9 the merge-train events; 10 the collected close-out
+    (`closeouts:`, `closeout_handback`, `closeout_hold`, exit-gates R15/R27); current writers
+     stamp 12 (read 1–12), adding recovery ownership/session audit metadata;
+     11 added `archive_conflict` (merge-truth R12).
     `fr triage batch replace` owns scope then pane locks, checkpoints and cross-store
     repair, never replaying uncertain submission; `drive` runs waves to completion.
     `batch_drive.py` is the pure pass (a `Snapshot` in, ordered `merge`,
@@ -303,7 +306,12 @@ uv workspace monorepo, version lockstepped across every manifest (see
   Operator notes: `docs/herdr-control-sessions.md`, `packages/fr-herdr/README.md`.
   Optional `SessionReplacer` supports in-place Claude/OpenCode and model-only
   fresh replacement. Pending checkpoints exclude restart until explicit repair;
-  installed synthetic scenarios are not evidence of the operator-owned live walk.
+   installed synthetic scenarios are not evidence of the operator-owned live walk.
+   Explicit absent-source `batch replace --recover` uses `fr_herdr.recovery` and
+   global pane/tab/agent joins, pre-allocation server/item/source-keyed intent,
+   a new herdr pane and observed session identity. Repair never allocates or sends
+   input. Recovery HOLD overrides conflict/unfinished continuation on reconstruction
+   and managed restart; the disposable actual-client walk is post-merge Tester.
   It was the first to take `unit="run"` work: `fr triage batch dispatch` builds it
   through `fr_dispatch.registry.load_runner`'s `from_env()` and it opens a
   herdr tab, starts the harness on the batch's model and submits the brief.
@@ -315,9 +323,15 @@ uv workspace monorepo, version lockstepped across every manifest (see
   in the scope's state (`requests.yaml`, `sessions.yaml`) that the cloud driver's
   agent executes with its session tools and records back (`fr triage drive record`);
   re-homing is its restart. Like `fr-herdr`, it never imports `fr.triage`.
-- `fr-opencode-plugin` — **the one non-Python package**: TypeScript/Bun,
-  ports the `fr-isolation-required` Claude Code hook to an OpenCode
-  `tool.execute.before` plugin. Excluded from the uv workspace
+- `fr-opencode-plugin` — **the one non-Python package**: TypeScript/Bun, an
+  OpenCode **2.x** plugin definition (`export default { id, setup }`; 1.x is not
+  supported) porting the Claude Code hooks: the edit gate and the whole-line
+  shell gate (`fr-isolation-guard`) on `execute.before`, the merged-PR push
+  guard, the pipeline sentinel, session bind/unbind, the acceptance nag, the
+  idle nudge, the `fr` binary pin, the child-session claim, and a TUI status
+  line (`src/tui/`). Each ported hook carries a `// super-fr-parity:` marker
+  `fr harness parity` reads. `install.sh` delivers it as ONE plugin directory
+  (`scripts/deliver-opencode-plugin.sh`). Excluded from the uv workspace
   (`pyproject.toml`'s `[tool.uv.workspace].exclude`) and has its own
   `package.json`/version, so `uv run pytest` does not cover it — but it IS
   wired into CI, as the `opencode-plugin-test` job (`bun test`). Run that
@@ -466,8 +480,8 @@ tripwire will catch drift anyway:
 super-fr is itself fr-enabled — `.devcontainer/dev` + `.devcontainer/admin`
 profiles exist, and `docs/superpowers/plans/` currently holds three live plans.
 Either alone qualifies it. Both the Claude Code PreToolUse hook and
-the OpenCode plugin (`.opencode/plugins/fr-isolation-required.ts`, thin
-re-export of `packages/fr-opencode-plugin`) block Edit/Write/MultiEdit
+the OpenCode 2 plugin (`.opencode/plugins/fr-isolation-required.ts`, thin
+re-export of `packages/fr-opencode-plugin`) block file-writing tools
 outside a valid `.fr-isolation` workspace — editing this repo's own source is
 not exempt. Escapes, in preference order: enter isolation (`fr isolation up`),
 add an operator-managed path to `.fr-isolation-allow`, or set `FR_BASE_OK=1`
@@ -475,10 +489,10 @@ for one deliberate base-clone edit. Two docker-less modes now exist alongside
 the default devcontainer mode: **host-worktree** (`FR_ISOLATION_TARGET=worktree`
 — fr worktree in the host env, no profile) and **external** (a preparer-written
 `mode: external` marker fr adopts, validated by container evidence). Full
-decision tree in `plugins/super-fr/rules/fr-isolation-required.md`. (The
-OpenCode port only
-gates the `edit`/`write`/`patch`/`multiedit` tool calls, not `bash` — a known
-gap, not a sanctioned bypass.)
+decision tree in `plugins/super-fr/rules/fr-isolation-required.md`. (On both
+harnesses the shell is judged by the bash guard's decision while a pipeline is
+live — the OpenCode port judges the `shell` tool's whole command line in
+`execute.before`; outside a live pipeline a shell write is not gated.)
 
 ## Release / version bumping
 
@@ -554,6 +568,37 @@ be the bypass actor on it and `FR_AUTOMATION_APP_ID` must stay set (unsetting th
 variable after `require` falls back to `GITHUB_TOKEN`, which cannot bypass)**, or
 every release fails (release.py reports that refusal
 by name, never as a lost race).
+
+**Release gating** (spec `2026-10-14-exit-gates` R20, R21, R25, R26). Before it
+cuts anything, `release.py` reads every PR merged since the last final tag, with
+its labels, through `gh` (the workflow token, `FR_RELEASE_STATUS_TOKEN`), and asks
+`fr release status --from-json <facts> --json`, run with **no forge credential**
+in its environment, which of those PRs merged since the last **final** tag
+(`vX.Y.Z` exactly; an RC tag never counts) still carry `gate:tester` or
+`gate:devops` without the `-passed` label. While any do, a run cuts a release
+candidate instead: `release: vX.Y.Z-rc.N`, tagged and published as a GitHub
+pre-release, **consuming no fragment**, or nothing at all when nothing has
+merged since the newest RC tag. Once nothing waits, the final `X.Y.Z` consumes
+the fragments. `release.yml` also runs daily, because a gate passes with no push to main.
+The read is cross-checked against the code: every PR `git log <last final>..HEAD`
+names (`(#N)` or `Merge pull request #N`, the release bot's own commits skipped)
+must be in it. A failed read, a read at its 1000 cap, a PR the read misses, or a
+failed `fr` decision makes the gate state **unknown**, which cuts an RC, never a
+final and never a refusal (nothing when nothing merged since the newest RC). So a
+token that cannot read labels means **RCs only** until it is fixed; `--version`
+stays the explicit override for a final. A computed version at or below HEAD's
+releases nothing (a removed fragment never moves the version backwards), and an
+untagged RC at HEAD (a failed tag push) is tagged on the next run.
+`FR_RELEASE_STATUS_TOKEN` is the workflow's `github.token`, so it also carries
+the job's contents and issues write; it reaches only the `gh` read, never `fr`
+or repo code. Exactly these calls authenticate: the `gh` read, the `gh release`
+and `gh issue` writes, and the two pushes. The bump, `uv lock --check`, the
+migration, the staged suite, `fr`'s decision and every other git command run
+credential-free.
+An RC is spelled `X.Y.ZrcN` (PEP 440) in `pyproject.toml`/`uv.lock` and
+`X.Y.Z-rc.N` everywhere else. `scripts/versions.py`'s `Version` is the one
+parser every script reads both spellings through. `fr_version` floors admit an RC of the
+final they name (`fr.version_floor.admits`).
 
 Patch = default (skill copy, CLI fixes, refactors). Minor = user-visible
 workflow additions (new subcommand/skill/mandatory behavior) — e.g. the

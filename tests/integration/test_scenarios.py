@@ -96,6 +96,24 @@ def test_herdr_batch_replace(installed: Path, tmp_path: Path) -> None:
     _scenario("herdr-batch-replace", installed, tmp_path)
 
 
+def test_triage_closed_recovery(installed: Path, tmp_path: Path) -> None:
+    _scenario("triage-closed-recovery", installed, tmp_path)
+
+
+def test_herdr_closed_recovery_live_instructions() -> None:
+    done = subprocess.run(
+        ["bash", str(SCENARIOS / "herdr-closed-recovery-live.sh")],
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert done.returncode == 3, done.stderr
+    assert "OWED" in done.stdout and "disposable" in done.stdout
+    assert "ok: herdr-closed-recovery-live" not in done.stdout
+
+
 def test_herdr_opencode_live_instructions(tmp_path: Path) -> None:
     """Only the walk's honest instruction/verdict contract; never a live pass."""
     done = subprocess.run(
@@ -169,13 +187,20 @@ def test_the_install_refuses_a_source_without_the_package(tmp_path: Path) -> Non
 def test_every_scenario_script_has_a_test_here() -> None:
     on_disk = {p.stem for p in SCENARIOS.glob("*.sh") if not p.name.startswith("_")}
     here = {
+        "triage-closed-recovery",
+        "herdr-closed-recovery-live",
         "verification-strategy-resolution",
         "shipped-verification-strategies",
         "spec-verification-section",
+        "exit-gates-declared-exit",
+        "exit-gates-verify-without-section",
+        "exit-gates-set-downgrade",
         "walk-recording-prints-close",
         "awaiting-live-triage",
         "matrix-status-split",
         "debt-report",
+        "opencode-store-v2",
+        "opencode-plugin-v2",
         "closeout-owed",
         "triage-closed-in-progress",
         "triage-config-skew",
@@ -205,6 +230,8 @@ def test_every_scenario_script_has_a_test_here() -> None:
         "merge-train-red-recovery",
         "merge-train-queue",
         "batch-merge-skip-held",
+        "triage-closed-settle",
+        "triage-retire-sync",
     }
     assert on_disk == here
 
@@ -219,6 +246,18 @@ def test_shipped_verification_strategies(installed: Path, tmp_path: Path) -> Non
 
 def test_spec_verification_section(installed: Path, tmp_path: Path) -> None:
     _scenario("spec-verification-section", installed, tmp_path)
+
+
+def test_exit_gates_declared_exit(installed: Path, tmp_path: Path) -> None:
+    _scenario("exit-gates-declared-exit", installed, tmp_path)
+
+
+def test_exit_gates_verify_without_section(installed: Path, tmp_path: Path) -> None:
+    _scenario("exit-gates-verify-without-section", installed, tmp_path)
+
+
+def test_exit_gates_set_downgrade(installed: Path, tmp_path: Path) -> None:
+    _scenario("exit-gates-set-downgrade", installed, tmp_path)
 
 
 def test_walk_recording_prints_close(installed: Path, tmp_path: Path) -> None:
@@ -335,3 +374,19 @@ def test_triage_adopt_hold(installed: Path, tmp_path: Path) -> None:
 
 def test_triage_adopt_list(installed: Path, tmp_path: Path) -> None:
     _scenario("triage-adopt-list", installed, tmp_path)
+
+
+def test_triage_closed_settle(installed: Path, tmp_path: Path) -> None:
+    _scenario("triage-closed-settle", installed, tmp_path)
+
+
+def test_triage_retire_sync(installed: Path, tmp_path: Path) -> None:
+    _scenario("triage-retire-sync", installed, tmp_path)
+
+
+def test_opencode_store_v2(installed: Path, tmp_path: Path) -> None:
+    _scenario("opencode-store-v2", installed, tmp_path)
+
+
+def test_opencode_plugin_v2(installed: Path, tmp_path: Path) -> None:
+    _scenario("opencode-plugin-v2", installed, tmp_path)

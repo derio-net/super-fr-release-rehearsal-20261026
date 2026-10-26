@@ -55,9 +55,10 @@ from fr.triage.batch_drive import (
     DEFAULT_WORKSPACE_PREFIX,
     closeout_event,
     closeout_item_id,
+    event_item_id,
     wave_group,
 )
-from fr.triage.check import clean_label_targets
+from fr.triage.check import clearing_rule
 from fr.triage.components import pages_present, refresh_navs, skew_banner, strip_nav
 from fr.triage.drive_lock import live_driver
 from fr.triage.driver import Mailbox
@@ -142,7 +143,12 @@ def probe_item(
     """The batch's (or its close-out's) run item identity: what a runner matches a session by."""
     from fr_dispatch.work_item import WorkItem
 
-    item_id = (closeout_item_id if closeout else batch_item_id)(scope_repo, batch.id)
+    event = closeout_event(batch) if closeout else None
+    item_id = (
+        event_item_id(scope_repo, batch.id, event)  # a collected close-out's own item (R15)
+        if event is not None
+        else (closeout_item_id if closeout else batch_item_id)(scope_repo, batch.id)
+    )
     return WorkItem(
         id=item_id,
         unit="run",
@@ -357,14 +363,15 @@ def local_ci_none(facts: Facts) -> frozenset[str]:
 
 
 def in_progress_note(facts: Facts, scope_args: Sequence[str]) -> str | None:
-    """The board's note on closed issues still labelled `fr:in-progress` (board-truth R2):
-    the count of stale ones and the command that cleans them, None when there are none."""
-    n = len(clean_label_targets(facts))
+    """The board's note on closed issues still labelled `fr:in-progress` or `fr:claimed`
+    (board-truth R2, post-merge truth R15): the count of `stale` and `release-pending`
+    ones and how they clear (`clearing_rule`), None when there are none."""
+    n = sum(1 for e in facts.stale_in_progress if e.state in ("stale", "release-pending"))
     if not n:
         return None
-    args = " ".join(scope_args)
-    cmd = f"fr triage clean-labels {args}".rstrip()
-    return f"{n} closed issue{'s' if n != 1 else ''} still labelled fr:in-progress: run `{cmd}`"
+    noun = f"closed issue{'s' if n != 1 else ''}"
+    rule = clearing_rule(" ".join(scope_args))
+    return f"{n} {noun} still labelled fr:in-progress or fr:claimed: {rule}"
 
 
 def write_board(

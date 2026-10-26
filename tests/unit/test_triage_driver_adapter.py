@@ -32,6 +32,7 @@ from tests.unit.test_triage_batch_drive_cmd import (  # noqa: F401 - fixtures
     _drive,
     _events,
     _lines,
+    _sandbox,
     _state,
     checkout_fixture,
     world_fixture,
@@ -42,6 +43,13 @@ CONFIG = {
     "post_merge": ["./scripts/install.sh"],
     "post_merge_restart": "idle",
 }
+
+
+@pytest.fixture(autouse=True)
+def _sandbox_here(_sandbox: None) -> None:  # noqa: F811 - the drive tests' fixture
+    """The drive tests' sandbox (HOME, XDG_CONFIG_HOME and the pass clock), which
+    autouse does not reach across modules — without it this module read the wall
+    clock and its close-out ids were right only on the day they were written."""
 
 
 class Runners:
@@ -214,8 +222,8 @@ def test_the_host_runs_post_merge_and_restarts_after_it(
 
     assert code == 0, out
     assert checkout.commands == [["./scripts/install.sh"]]
-    assert _events(tmp_path, "b1") == ["dispatch", "post_merge", "closeout"]
-    assert runners.dispatched() == {"herdr": [f"{REPO}/run/closeout-b1"]}
+    assert _events(tmp_path, "b1") == ["dispatch", "post_merge"]  # the marker, not an event
+    assert runners.dispatched() == {"herdr": [f"{REPO}/run/closeout-{NOW.date().isoformat()}-1"]}
 
 
 def test_the_cloud_runs_neither_post_merge_nor_its_restart(
@@ -231,8 +239,10 @@ def test_the_cloud_runs_neither_post_merge_nor_its_restart(
 
     assert acted
     assert checkout.commands == []
-    assert _events(tmp_path, "b1") == ["dispatch", "closeout"]
-    assert runners.dispatched() == {"claude-cloud": [f"{REPO}/run/closeout-b1"]}
+    assert _events(tmp_path, "b1") == ["dispatch"]  # the marker, not an event
+    assert runners.dispatched() == {
+        "claude-cloud": [f"{REPO}/run/closeout-{NOW.date().isoformat()}-1"]
+    }
     assert "restart" not in capsys.readouterr().out
 
 
@@ -259,7 +269,7 @@ def test_the_host_never_switches_the_operators_clone(
 
     _drive(tmp_path, "--once", "--yes")
 
-    assert checkout.switched == [False]
+    assert checkout.switched and not any(checkout.switched)  # post_merge's and close-out's
 
 
 def test_a_close_out_another_drivers_runner_owns_is_reported_and_left_to_it(
@@ -280,3 +290,30 @@ def test_a_close_out_another_drivers_runner_owns_is_reported_and_left_to_it(
     out = capsys.readouterr().out
     (line,) = _lines(out, "closeout")
     assert "herdr" in line and "left to" in line
+
+
+def test_an_archive_conflict_left_to_another_driver_builds_no_merge_context(
+    tmp_path: Path,
+    world: World,
+    checkout: DriveCheckout,
+    runners: Runners,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """p2-r9: a close-out on a runner this driver lacks is left to that runner's driver
+    before anything is read for the brief: no merge context (a fetch, a forge read)."""
+    from tests.unit.test_triage_batch_drive_cmd import _conflicting_archive
+
+    _conflicting_archive(world, tmp_path)  # its close-out runs on `fake`, not claude-cloud
+    built: list[str] = []
+    real = triage_batch_cmd._Driver.merge_ctx
+
+    def _recording(self: Any, facts: Any, repo: str) -> Any:
+        built.append(repo)
+        return real(self, facts, repo)
+
+    monkeypatch.setattr(triage_batch_cmd._Driver, "merge_ctx", _recording)
+    _cloud_pass(tmp_path)
+    (line,) = _lines(capsys.readouterr().out, "archive-conflict")
+    assert "which this driver lacks" in line, line
+    assert built == []

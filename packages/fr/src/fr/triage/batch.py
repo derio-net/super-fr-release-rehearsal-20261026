@@ -29,6 +29,7 @@ from fr.triage.model import (
     JUDGEMENTS_SCHEMA,
     Batch,
     CancelEvent,
+    CollectedCloseout,
     DispatchEvent,
     Export,
     Facts,
@@ -37,6 +38,7 @@ from fr.triage.model import (
     Judgements,
     Launch,
     PullRequest,
+    ReplacementEvent,
     TriageConfig,
     _check_schema,
     batch_marker,
@@ -121,6 +123,17 @@ def recorded_branch(batch: Batch) -> str:
     the event recorded."""
     event = last_dispatch(batch)
     return event.branch if event is not None else batch_branch(batch)
+
+
+def effective_handle(batch: Batch) -> str | None:
+    """Last successful owner since the latest dispatch; lifecycle remains immutable."""
+    owner = None
+    for event in batch.events:
+        if isinstance(event, DispatchEvent):
+            owner = event.handle
+        elif isinstance(event, ReplacementEvent) and event.result == "success" and owner:
+            owner = event.target_pane or event.handle
+    return owner
 
 
 _LABEL_REF = re.compile(r"(?<![\w./-])([A-Za-z0-9][\w.-]*)#(\d+)\b")
@@ -584,6 +597,18 @@ def save_exports(path: Path, exports: Sequence[Export], *, read: Sequence[Export
         "exports",
         _dump_exports(exports),
         unchanged=lambda now: list(now.exports) == list(read),
+    )
+
+
+def save_closeouts(
+    path: Path, closeouts: Sequence[CollectedCloseout], *, read: Sequence[CollectedCloseout]
+) -> Judgements:
+    """Write *closeouts* as `path`'s `closeouts:` section (exit-gates R15): the sibling of
+    `save_exports`, under the same refuse-or-write discipline."""
+    docs = [c.model_dump(mode="json", exclude_defaults=True) for c in closeouts]
+    block = yaml.safe_dump({"closeouts": docs}, sort_keys=False, allow_unicode=True, width=100)
+    return _rewrite(
+        path, "closeouts", block, unchanged=lambda now: list(now.closeouts) == list(read)
     )
 
 

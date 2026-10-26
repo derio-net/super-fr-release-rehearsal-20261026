@@ -33,6 +33,22 @@ clone under `~/.cache/fr/src` and re-running updates it.
 curl -fsSL https://raw.githubusercontent.com/derio-net/super-fr/main/scripts/bootstrap.sh | bash
 ```
 
+Pick a channel with `--version` (every other flag still reaches `install.sh`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/derio-net/super-fr/main/scripts/bootstrap.sh | bash -s -- --version RC
+```
+
+| `--version` | Installs |
+|---|---|
+| *(none)* | the newest release `vX.Y.Z` (`origin/main` if none is installable yet) |
+| `RC` | the newest release candidate `vX.Y.Z-rc.N` |
+| `X.Y.Z` / `X.Y.Z-RC` / `X.Y.Z-rc.N` | that release / the newest RC of it / exactly that RC |
+| `main` | `origin/main`, the development channel |
+
+An unknown version, or a tag that predates channels, installs nothing and lists
+the installable ones.
+
 Prefer to read it first?
 
 ```bash
@@ -43,9 +59,18 @@ bash bootstrap.sh
 Claude Code: the installer registers the `derio-net` marketplace and enables
 `super-fr@derio-net--super-fr` plus `super-fr-dispatch@derio-net--super-fr` for you.
 
-OpenCode: the installer copies skills and slash commands when
+OpenCode (**2.x only**): the installer copies skills and slash commands when
 `~/.config/opencode` already exists. On a fresh OpenCode setup, force that step
-with `OPENCODE_SKILLS_INSTALL=1`.
+with `OPENCODE_SKILLS_INSTALL=1`. It also delivers the super-fr plugin as one
+directory, `~/.config/opencode/plugins/fr-opencode-plugin/`, and lists that
+directory in `cli.json`'s `plugins`. The plugin gates file-writing tools outside
+an fr-isolation workspace, refuses a base-repo `shell` command (judged on its
+whole command line) while a pipeline is live, refuses a push from a branch whose
+PR already merged, pins the `fr` binary for the shell, nags once per session
+about open acceptance debt, nudges an idle run forward, and renders an fr status
+line in the TUI. OpenCode 1.x is not supported: the plugin is written to
+OpenCode 2's plugin API, and `fr` refuses a 1.x session by name, telling you to
+upgrade.
 
 Hermes Agent: the installer copies skills and wires the hooks/rules when
 `~/.hermes` already exists. On a fresh Hermes setup, force that step with
@@ -468,7 +493,7 @@ context file (it outranks `AGENTS.md`, so read both).
 | `fr-cncd` | CNC daemon runner adapter |
 | `fr-herdr` | herdr runner: takes `fr triage batch dispatch` runs into a herdr tab (the first run-unit runner) |
 | `fr-claude-cloud` | claude-cloud runner: the cloud wave driver's mailbox; its agent creates, messages and archives Claude Code cloud sessions for each batch |
-| `fr-opencode-plugin` | OpenCode `tool.execute.before` port of the isolation edit guard |
+| `fr-opencode-plugin` | OpenCode 2.x plugin: edit and shell gates, push guard, acceptance nag, idle nudge, `fr` pin and a TUI status line |
 | `plugins/super-fr/hooks/hermes/` | Hermes `pre_tool_call` ports of the isolation edit + bash/push guards |
 
 ## Requirements

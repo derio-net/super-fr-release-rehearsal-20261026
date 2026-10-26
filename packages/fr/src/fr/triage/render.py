@@ -28,7 +28,7 @@ from fr.acceptance.model import DEBT_STATUSES, LISTED_STATUSES
 from fr.triage.batch import BATCH_STAGES, derive_batch_stage, last_dispatch, planned_merge_order
 from fr.triage.batch import batch_pr as find_batch_pr
 from fr.triage.batch_drive import finished_waves
-from fr.triage.check import CheckResult, classify, is_set_apart
+from fr.triage.check import CLEARING_RULE, CheckResult, classify, is_set_apart
 from fr.triage.components import (
     CHROME_CSS,
     GRID_CSS,
@@ -44,6 +44,7 @@ from fr.triage.components import (
 )
 from fr.triage.debt import digest_for, issue_figures, untrusted_for
 from fr.triage.fragments import Entry, Resolved, splice
+from fr.triage.merge_stops import MergeStop
 from fr.triage.model import issue_key
 from fr.triage.stage import IN_FLIGHT
 from fr.triage.views import (
@@ -855,8 +856,9 @@ def _needs_section(
     judgements: Judgements,
     session_notes: Mapping[str, str] | None = None,
     ci_none: Collection[str] = (),
+    stops: Mapping[str, MergeStop] | None = None,
 ) -> str:
-    rows = needs_you(facts, judgements, session_notes, ci_none=ci_none)
+    rows = needs_you(facts, judgements, session_notes, ci_none=ci_none, stops=stops)
     head = '<section class="decide" id="needs-you-now"><h2>Needs you now</h2>'
     if not rows:
         return f'{head}<p class="quiet">Nothing needs you now.</p></section>'
@@ -1124,7 +1126,7 @@ def _awaiting_live(
 
 
 def _closed_in_progress(entries: Sequence[StaleInProgress]) -> str:
-    """Closed issues still labelled `fr:in-progress`, a collapsed group of their own
+    """Closed issues still labelled `fr:in-progress` or `fr:claimed`, a collapsed group of their own
     (board-truth R2): absent when there are none."""
     if not entries:
         return ""
@@ -1135,11 +1137,11 @@ def _closed_in_progress(entries: Sequence[StaleInProgress]) -> str:
         + "</li>"
         for e in entries
     )
+    rule = re.sub(r"`([^`]+)`", r"<code>\1</code>", esc(CLEARING_RULE))
     inner = (
-        '<p class="tier-desc">Closed, but the <code>fr:in-progress</code> label is still on. '
-        "<strong>stale</strong> ones are cleaned by <code>fr triage clean-labels</code>; "
-        "<strong>release-pending</strong> ones by the next <code>fr triage claim sync "
-        "--yes</code>; <strong>held</strong> ones belong to another scope.</p>"
+        '<p class="tier-desc">Closed, but the <code>fr:in-progress</code> or '
+        f"<code>fr:claimed</code> label is still on: {rule}. "
+        "<strong>held</strong> ones belong to another scope.</p>"
         f"<ul>{items}</ul>"
     )
     return collapsed("closed-in-progress", "Closed but in progress", len(entries), inner)
@@ -1155,6 +1157,7 @@ def render(
     session_notes: Mapping[str, str] | None = None,
     ci_none: Collection[str] = (),
     present: Sequence[str] = ("backlog",),
+    stops: Mapping[str, MergeStop] | None = None,
 ) -> str:
     """The board for *facts* and *judgements*: same inputs, same bytes.
 
@@ -1164,7 +1167,8 @@ def render(
     sections and places authored fragments among them; None is the default order. *board*
     links the sibling `board.html` (the batch Kanban, `fr triage board`) from the Batches
     section; the caller says whether one exists. *session_notes* are blocked sessions'
-    notes by item id (cloud-triage R15), listed under Needs you now.
+    notes by item id (cloud-triage R15), listed under Needs you now. *stops* are the
+    driver's recorded merge stops: a conflicting export PR's is listed too (merge-truth R12).
     """
     show_repo = facts.kind != "repo"
     result = classify(facts, judgements)  # the one classification, shared below
@@ -1234,7 +1238,7 @@ def render(
 
     builders: dict[str, Callable[[], str]] = {
         "since": lambda: _since_table(since),
-        "needs": lambda: _needs_section(facts, judgements, session_notes, ci_none),
+        "needs": lambda: _needs_section(facts, judgements, session_notes, ci_none, stops),
         "next-up": lambda: _next_section(facts, judgements),
         "waves": lambda: _waves_section(facts, judgements),
         "possible-duplicates": lambda: _possible_duplicates(result.candidates, by_key),
