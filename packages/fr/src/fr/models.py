@@ -1,0 +1,162 @@
+"""Tier→model binding config, backing `fr models` (spec §B.2).
+
+`tier` on a phase is harness-neutral; the concrete model is resolved at dispatch
+from config, mirroring the `~/.config/fr/repos.yaml` user-config pattern
+(`fr.repos`). Resolution order is repo override > user config; a missing binding
+returns ``None`` so the caller (fr-goal) can fall back to a runtime prompt and
+persist the answer.
+
+Config shape (``harness → tier → model``)::
+
+    claude-code:
+      mechanical: claude-haiku-4-5
+      standard: claude-sonnet-5
+      hard: claude-opus-4-8
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+
+import yaml
+
+ModelsConfig = dict[str, dict[str, str]]
+
+REPO_MODELS_REL = Path("docs/superpowers/models.yaml")
+"""A repo's own tier→model bindings, relative to its root — read wherever a
+command needs the repo-over-user rule: `fr models`'s own commands, `fr run`'s
+tier resolution, and triage batch dispatch's orchestrator fallback (spec
+2026-09-27-triage-batch-launch §A). One constant so all three read the same
+path."""
+
+
+class ModelsError(Exception):
+    """Raised when a models config file is structurally invalid."""
+
+
+def xdg_config_home() -> Path:
+    """Base config dir: ``$XDG_CONFIG_HOME``, else ``$HOME/.config``.
+
+    Shared with `fr.opencode_agents.default_config_home`, which needs the
+    SAME resolution (it lives under the same base, at ``opencode/agent/``
+    rather than ``fr/models.yaml``) so the two can never disagree about
+    where "the config dir" is.
+    """
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    return Path(xdg) if xdg else Path.home() / ".config"
+
+
+def default_models_path() -> Path:
+    """User-level models config, honoring ``$XDG_CONFIG_HOME`` then ``$HOME``."""
+    return xdg_config_home() / "fr" / "models.yaml"
+
+
+def _yaml_problem(exc: yaml.YAMLError) -> str:
+    """What is wrong and where. PyYAML's first line is its parsing CONTEXT
+    ("while parsing a flow sequence"); the problem and its mark are what an
+    operator needs to fix the file."""
+    problem = getattr(exc, "problem", None)
+    mark = getattr(exc, "problem_mark", None)
+    if problem and mark is not None:
+        return f"{problem} (line {mark.line + 1}, column {mark.column + 1})"
+    return (str(exc).strip().splitlines() or [""])[0]
+
+
+def load_models(path: Path) -> ModelsConfig:
+    """Parse a ``harness → tier → model`` mapping. A missing file yields ``{}``."""
+    if not path.exists():
+        return {}
+    try:
+        raw = yaml.safe_load(path.read_text()) or {}
+    except yaml.YAMLError as exc:
+        raise ModelsError(f"{path}: not valid YAML: {_yaml_problem(exc)}") from exc
+    if not isinstance(raw, dict):
+        raise ModelsError(f"{path}: top level must be a harness→tier→model mapping")
+    out: ModelsConfig = {}
+    for harness, tiers in raw.items():
+        if not isinstance(tiers, dict):
+            raise ModelsError(f"{path}: harness '{harness}' must map tiers to models")
+        out[harness] = {str(t): str(m) for t, m in tiers.items()}
+    return out
+
+
+def resolved_config(*, repo_cfg: ModelsConfig, user_cfg: ModelsConfig) -> ModelsConfig:
+    """The whole ``harness → tier → model`` map with repo overriding user,
+    per (harness, tier).
+
+    THE one implementation of the repo-over-user rule. `resolve` is a lookup
+    on this, and `fr models {set,apply,resolve}` all go through it, because
+    the materialiser needs the whole map while `resolve` needs one value —
+    and two functions computing the same rule is how they come to disagree.
+    They did: a falsy repo binding used to shadow a real user one under a
+    plain dict merge, while `resolve` fell through to the user config
+    (review r-p2-f2). A falsy binding is not a binding, so it never shadows.
+    """
+    merged: ModelsConfig = {}
+    for cfg in (user_cfg, repo_cfg):
+        for harness, tiers in cfg.items():
+            for tier, model in tiers.items():
+                if model:
+                    merged.setdefault(harness, {})[tier] = model
+    return merged
+
+
+def resolve(
+    harness: str,
+    tier: str,
+    *,
+    repo_cfg: ModelsConfig,
+    user_cfg: ModelsConfig,
+) -> str | None:
+    """Resolve ``(harness, tier) → model`` with repo overriding user; else None.
+
+    A lookup on `resolved_config` rather than its own traversal, so the two
+    cannot drift — see that function's note."""
+    return resolved_config(repo_cfg=repo_cfg, user_cfg=user_cfg).get(harness, {}).get(tier)
+
+
+def binding_layer(
+    harness: str,
+    tier: str,
+    *,
+    repo_cfg: ModelsConfig,
+    user_cfg: ModelsConfig,
+) -> str | None:
+    """Which layer a binding comes from — ``"repo"``, ``"user"`` or ``None``.
+
+    Beside `resolved_config` and under the same falsy-is-unbound rule: a falsy
+    repo value is not a binding, so it reports ``"user"``. `fr.bindings` needs it
+    because a repo-layer binding is a tracked contract that fr refuses to rewrite
+    (spec 2026-10-06-model-binding-churn R9)."""
+    if repo_cfg.get(harness, {}).get(tier):
+        return "repo"
+    if user_cfg.get(harness, {}).get(tier):
+        return "user"
+    return None
+
+
+def set_binding(path: Path, harness: str, tier: str, model: str) -> None:
+    """Persist one ``harness/tier → model`` binding, preserving other entries."""
+    cfg = load_models(path)
+    cfg.setdefault(harness, {})[tier] = model
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(cfg, sort_keys=True))
+
+
+_MODEL_DATE = re.compile(r"-\d{8}$")
+
+
+def model_family(model: str) -> str:
+    """`model` without a context-window suffix or a trailing snapshot date, so
+    a binding's `claude-haiku-4-5` and a transcript's
+    `claude-haiku-4-5-20251001` compare equal: the dispatch honoured the
+    binding, and a warning would be noise (review of gh#637).
+
+    Shared by `fr run resolve`'s observed-model warning and `fr run cost`'s
+    per-phase mismatch mark (spec 2026-10-06-cost-evidence §E), so the two can
+    never disagree about what counts as the same model."""
+    from fr.usage.readers.claude_code import normalize_model
+
+    return _MODEL_DATE.sub("", normalize_model(model))

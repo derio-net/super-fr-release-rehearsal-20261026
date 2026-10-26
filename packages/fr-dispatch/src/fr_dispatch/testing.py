@@ -1,0 +1,155 @@
+"""Reusable runner contracts, for an adapter's own test suite.
+
+**Run-unit contract** (spec 2026-09-25-triage-batches §3.C). A runner takes
+batch work — `unit="run"` items dispatched by `fr triage batch dispatch` — when:
+
+1. its class has a `from_env()` classmethod that builds it from environment
+   and config alone (`check_constructible`; `registry.load_runner` calls it);
+2. it has a non-empty `name`, `refresh()` runs, `slot_budget()` returns an int;
+3. `can_dispatch(item)` accepts a run item — the cheap routing gate, consulted
+   before `preflight` or any backend call;
+4. `dispatch(item)` honours the payload: the brief and the model it carries
+   reach the backend (`check_run_unit_contract`'s *sent* probe shows what did).
+
+Explicit `AssertionError`s with messages, no pytest import: `fr_dispatch` does
+not depend on a test framework, and a failed contract reads the same in any
+runner. Never a bare `assert` — `python -O` strips those, and the contract would
+pass everything (review r2p-f12a).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import TYPE_CHECKING, cast
+
+from fr_dispatch.protocols import AdoptTarget, SessionAdopter, SessionCloser
+from fr_dispatch.work_item import RUN_PAYLOAD_KEYS, WorkItem, run_item_id
+
+if TYPE_CHECKING:
+    from fr_dispatch.protocols import Runner
+
+__all__ = [
+    "RUN_PAYLOAD_KEYS",
+    "check_adopt_contract",
+    "check_close_contract",
+    "check_constructible",
+    "check_run_unit_contract",
+    "run_item",
+]
+
+
+def run_item(
+    repo: str = "example-org/alpha",
+    run_id: str = "batch-contract",
+    *,
+    harness: str = "claude",
+    model: str = "contract-model-7",
+    brief: str = "/fr-goal contract brief",
+    **extra: object,
+) -> WorkItem:
+    """A well-formed run item carrying every documented payload key."""
+    payload: dict[str, object] = {
+        "brief": brief,
+        "harness": harness,
+        "model": model,
+        "branch": f"feat/{run_id}",
+        "reserved_version": None,
+        "issues": ["alpha#1", "alpha#2"],
+        **extra,
+    }
+    return WorkItem(
+        id=run_item_id(repo, run_id),
+        unit="run",
+        workflow="fr-goal",
+        repo=repo,
+        parent=None,
+        inputs=(),
+        payload=payload,
+        tracking=None,
+    )
+
+
+def _require(ok: bool, message: str) -> None:
+    """Raise `AssertionError(message)` unless *ok* — an assert that survives -O."""
+    if not ok:
+        raise AssertionError(message)
+
+
+def check_constructible(runner_cls: type) -> None:
+    """The class builds itself from the environment: a callable `from_env`."""
+    factory = getattr(runner_cls, "from_env", None)
+    _require(
+        callable(factory),
+        f"{runner_cls.__name__} has no from_env(): it cannot be constructed outside its own bridge",
+    )
+
+
+def check_run_unit_contract(runner: Runner, item: WorkItem, *, sent: Callable[[], str]) -> None:
+    """Assert *runner* meets the run-unit contract for *item*.
+
+    *sent* returns what the runner's backend received (a faked CLI's argv, a
+    recorded request) as text; the brief and the model must both appear in it.
+    `can_dispatch` is checked before anything that could reach a backend.
+    """
+    _require(
+        isinstance(runner.name, str) and bool(runner.name), "runner.name must be a non-empty str"
+    )
+    runner.refresh()  # typed `-> None` by the protocol; the contract is that it runs
+    budget = runner.slot_budget()
+    _require(isinstance(budget, int) and budget >= 0, f"slot_budget() returned {budget!r}")
+    _require(
+        runner.can_dispatch(item),
+        f"runner `{runner.name}` does not take run-unit work: can_dispatch refused {item.id}",
+    )
+    missing = [k for k in RUN_PAYLOAD_KEYS if k not in item.payload]
+    _require(not missing, f"the contract item lacks payload keys {missing}")
+    runner.dispatch(item)
+    text = sent()
+    for key in ("brief", "model"):
+        value = str(item.payload[key])
+        _require(
+            value in text, f"dispatch did not pass the payload's {key} ({value!r}) to its backend"
+        )
+
+
+def check_close_contract(runner: object, item: WorkItem) -> None:
+    """Assert *runner* is a `SessionCloser` and reports `absent` for an item it holds nothing for.
+
+    *item* must be one the runner does not hold: closing it is the probe.
+    """
+    _require(
+        isinstance(runner, SessionCloser),
+        f"{type(runner).__name__} is not a SessionCloser: it has no close(item)",
+    )
+    outcome = runner.close(item)  # type: ignore[attr-defined]
+    _require(
+        outcome == "absent",
+        f"close({item.id}) returned {outcome!r} for an item the runner does not hold; "
+        "the contract is 'absent'",
+    )
+
+
+def check_adopt_contract(runner: object, *, unknown_tab: str = "contract-no-such-tab") -> None:
+    """Assert *runner* is a `SessionAdopter` whose reads keep the contract.
+
+    `describe(unknown_tab)` is None, `list_sessions()` is a list of `AdoptTarget`,
+    and each listed session describes as itself. *unknown_tab* must be one the
+    runner does not hold. Nothing is adopted: the contract only reads.
+    """
+    _require(
+        isinstance(runner, SessionAdopter),
+        f"{type(runner).__name__} is not a SessionAdopter: it lacks describe/list_sessions/adopt",
+    )
+    adopter = cast("SessionAdopter", runner)
+    got = adopter.describe(unknown_tab)
+    _require(got is None, f"describe({unknown_tab!r}) returned {got!r} for a tab it does not hold")
+    sessions = adopter.list_sessions()
+    _require(isinstance(sessions, list), f"list_sessions() returned {type(sessions).__name__}")
+    for target in sessions:
+        _require(
+            isinstance(target, AdoptTarget), f"list_sessions() yielded {target!r}, not AdoptTarget"
+        )
+        _require(
+            adopter.describe(target.tab) == target,
+            f"describe({target.tab!r}) disagrees with list_sessions() for that tab",
+        )

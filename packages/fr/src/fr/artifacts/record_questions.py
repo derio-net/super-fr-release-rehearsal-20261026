@@ -1,0 +1,94 @@
+"""The `record` kind's 1 -> 2 migration: question-round declarations (spec
+`2026-09-26-dynamic-brainstorm-question-rounds-design.md` §3.B).
+
+`StepRecord` gained `questions`, and it is `extra="forbid"`, so this is a
+shape change under `.claude/rules/artifact-versioning.md`: a stamp bump (in
+`fr.artifacts.registry`, and nowhere else) plus this migration, which the
+package `__init__` imports for its side effect — a migration nobody imports
+never runs.
+
+**It rewrites no body, and that is the whole design.** `questions` is
+optional and absent-by-default, which is exactly what every v1 record
+already means ("one round, undeclared"), so there is nothing to translate:
+the runner writes the new stamp itself once `fn` returns. What is left for
+`fn` is the one decision a stamp-only migration can still get wrong:
+stamping a file it cannot actually read. A record is git-tracked and
+hand-editable while its step is in progress, and a truncated or malformed
+one that gets stamped `2` is *worse* than one left at 1 — it now claims a
+shape it does not have, and the migration will never look at it again. So
+`fn` loads the raw yaml mapping, builds a copy with `schema_version` replaced
+by 2, and validates THAT copy against the live `StepRecord` (a v1 body is a
+valid v2 body — the change is additive) before letting the runner write the
+stamp; a record that fails is reported and left on its current version, like
+`run_provenance`'s guard.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from fr.artifacts.runner import MIGRATIONS, ArtifactMigrationError, SchemaMigration
+
+MIGRATION_NAME = "record-question-rounds"
+
+__all__ = [
+    "MIGRATION_NAME",
+    "RECORD_QUESTIONS_MIGRATION",
+    "UnreadableRecordError",
+    "guard_record",
+]
+
+
+class UnreadableRecordError(ArtifactMigrationError):
+    """A record file the migration will not stamp, because it does not read
+    as a version-2 `StepRecord`."""
+
+
+def guard_record(path: Path) -> None:
+    """Refuse to let the runner stamp a record that does not read as a record
+    of version 1 to 6. Reads through the FROZEN `fr.record.legacy.RecordV6`,
+    never the live `StepRecord`: the 6 -> 7 hop removed fields, so the live
+    model is no longer a superset of the older bodies every earlier hop reads
+    (artifact-versioning rule). Shared by the hops 1 -> 2 through 5 -> 6."""
+    from fr.record.legacy import RecordV6Error, record_v6_from_data
+
+    try:
+        text = path.read_text()
+    except OSError as e:
+        raise UnreadableRecordError(f"{path}: cannot read: {e}") from e
+    try:
+        data: Any = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise UnreadableRecordError(
+            # No version number: this guard is shared by every record hop
+            # (review d3), so naming one version misreports the others.
+            f"{path}: not valid YAML, so fr will not stamp it ({e})."
+        ) from e
+    if data is None:
+        data = {}  # `parse_record` reads an empty file as `{}`; agree with it (p1-r4)
+    if not isinstance(data, dict):
+        raise UnreadableRecordError(
+            f"{path}: top level must be a mapping, got {type(data).__name__}"
+        )
+    try:
+        record_v6_from_data({**data, "schema_version": 6})
+    except RecordV6Error as e:
+        raise UnreadableRecordError(
+            f"{path}: not a readable record, so fr will not stamp it ({e}). "
+            "Fix the file by hand — it is left on its "
+            "current version and will be retried."
+        ) from e
+
+
+RECORD_QUESTIONS_MIGRATION = SchemaMigration(
+    kind="record",
+    from_version=1,
+    to_version=2,
+    fn=guard_record,
+    description="record: add question-round declaration (`questions`) — stamp only, no body change",
+)
+
+MIGRATIONS.register(RECORD_QUESTIONS_MIGRATION)

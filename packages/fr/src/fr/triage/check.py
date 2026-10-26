@@ -1,0 +1,572 @@
+"""`check` — the issue sets plus unranked PRs that make triage debt visible (spec §3.F).
+
+Pure: facts and judgements in, sets out. The command only formats them.
+
+- **unranked** — an open issue with no judgement;
+- **settled** — judged, and now `closed` or `merged`; a judged PR that is now
+  closed or merged is settled too (`settled_prs`, gh#902);
+- **orphaned** — a judgement whose key names no repo collect read: a typo'd or
+  renamed repo, or one outside the scope. That is the ONLY meaning, so it is the
+  only set whose members are safe to fix or remove without asking the forge again;
+- **unreachable** — a judgement collect could not settle either way: the forge
+  would not show its issue (`Facts.unviewed`, whose reason may say the issue does
+  not exist — a deleted issue or a typo'd number), its repo was `Facts.skipped`,
+  or its key names a collected repo but was added after the last collect. Never
+  orphaned: pruning a judgement over a transient failure, or over stale facts,
+  would destroy the ranking (reviews r-p2-check-sets, phase-4 C1/C2);
+- **unplaced** — an open issue (judged or not) in no open batch, in no feature
+  group and not parked (wave-driver R9). The still-open members of a cancelled,
+  merged, partial or abandoned batch are unplaced: that batch is no longer open;
+- **no severity** — an open, judged issue whose judgement carries no `severity`
+  (triage-pages-goal R11);
+- **duplicate unknown** — a judged issue whose `duplicate_of` names an issue the facts
+  do not hold;
+- **stale dispatch** — an open issue labelled `fr:in-progress` whose fr-batch
+  marker comment is older than the repo's `stale_dispatch_days` (default 3)
+  with no open or merged linked PR — a closed-unmerged one is not progress
+  (spec 2026-09-25-triage-batches §3.E). The age is measured from the
+  marker's forge `createdAt` to `collected_at`, so every machine agrees and no
+  clock is read; a marker time that cannot be read is skipped, never raised.
+  Reported, never acted on;
+- **closed in progress** — a CLOSED issue still labelled `fr:in-progress` (board-truth
+  R2; `Facts.stale_in_progress`, read by collect): `stale` ones are what `fr triage
+  clean-labels` cleans (`clean_label_targets`, the one predicate), `release-pending`
+  ones carry this scope's own un-released claim (the next `claim sync` clears both
+  labels), `held` ones another scope's;
+- **awaiting live** — an open issue labelled `fr:awaiting-live`: its fix has merged
+  and a post-merge acceptance row still waits for its walk (spec
+  2026-10-06-verification-strategies §F, R18). It is not ranked or proposed as work,
+  so it is in neither unranked, unplaced, no severity nor stale dispatch, and the
+  board shows it in a group of its own;
+- **debt digests** and **owed** — open issues carrying the debt marker (current or
+  legacy) as a line of their own, and open `fr:owed` issues (debt-engine R14, R16). Like
+  awaiting live they are never ranked, unranked, unplaced or without severity; each
+  digest's figures are parsed from its body at check time;
+- **duplicate candidates** — groups of open issues the engine (`fr.triage.dedupe`)
+  proposes as duplicates, with each flagged pair's reasons. A proposal, never a
+  verdict: the fr-triage skill judges each into `duplicate_of` or `distinct_from`;
+- **duplicates** — every open issue judged `duplicate_of` an original, with that
+  original's state (`open`, `closed`, or `missing` plus why) and, when it exists, the
+  exact `gh issue close … --duplicate-of …` command to print. Never run by fr. A
+  judged duplicate is placed, so it is never **unplaced**.
+
+Every key comparison goes through `fr.triage.model.normalize_key` (or
+`issue_key`, which is built on it). There is no second normaliser here.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Any, Literal
+
+from fr.labels import FR_AWAITING_LIVE, FR_IN_PROGRESS, FR_OWED
+from fr.triage.batch import closeout_state, derive_batch_stage, is_open
+from fr.triage.claims import expired, from_issue_claim, holder, owed_claims
+from fr.triage.debt import is_marked, is_trusted_digest, issue_figures
+from fr.triage.dedupe import CandidateGroup, candidates
+from fr.triage.model import (
+    Batch,
+    Facts,
+    Issue,
+    IssueClaim,
+    Judgements,
+    PullRequest,
+    StaleInProgress,
+    issue_key,
+    normalize_key,
+)
+
+SETTLED_STAGES = frozenset({"closed", "merged"})
+
+JUDGED_AFTER_COLLECT = "judged after the last collect; run `fr triage collect` again to settle it"
+"""Reason for a key in a collected repo that the last collect never viewed.
+
+`check` reads the facts of the LAST collect, and collect only views the judged
+keys it knew about. A key added since is absent because the facts predate it,
+which says nothing about whether its issue exists (phase-4 review C2)."""
+
+
+@dataclass(frozen=True)
+class Unreachable:
+    key: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class Stale:
+    key: str
+    title: str
+    url: str
+    marker_at: str
+    days: int  # whole days between the marker and the collect
+
+
+@dataclass(frozen=True)
+class Duplicate:
+    """An open issue judged a duplicate, with its original's state (spec §3.C)."""
+
+    key: str
+    title: str
+    url: str
+    original: str  # key
+    state: Literal["open", "closed", "missing"]
+    reason: str = ""  # missing: why
+    command: str = ""  # "" when missing
+
+
+@dataclass(frozen=True)
+class HeldElsewhere:
+    """An open issue another scope's un-released claim holds (triage-claims R7)."""
+
+    key: str
+    title: str
+    url: str
+    claim: IssueClaim
+
+
+@dataclass(frozen=True)
+class ExpiredClaim:
+    """An un-released claim, this scope's or another's, past its expires-at (R7)."""
+
+    key: str
+    claim: IssueClaim
+
+
+@dataclass(frozen=True)
+class OwedClaim:
+    """A member this scope owes a claim that facts show unwritten (R3, R7)."""
+
+    key: str
+    batch: str
+
+
+@dataclass(frozen=True)
+class ClaimSets:
+    held_elsewhere: list[HeldElsewhere] = field(default_factory=list)
+    expired_claims: list[ExpiredClaim] = field(default_factory=list)
+    claims_owed: list[OwedClaim] = field(default_factory=list)
+
+
+def claim_sets(facts: Facts, judgements: Judgements, me: str, now: datetime) -> ClaimSets:
+    """R7's three sets, from facts' claims and this scope's batches. Only open issues:
+    collect reads no closed issue's comments, so facts know no claim there."""
+    held: list[HeldElsewhere] = []
+    stale: list[ExpiredClaim] = []
+    open_issues = {i.key: i for i in facts.issues if i.state == "open"}
+    for i in open_issues.values():
+        if (h := holder([from_issue_claim(c) for c in i.claims], me)) is not None:
+            raw = next(c for c in i.claims if c.comment_id == h.comment_id)
+            held.append(HeldElsewhere(key=i.key, title=i.title, url=i.url, claim=raw))
+        stale.extend(
+            ExpiredClaim(key=i.key, claim=c) for c in i.claims if expired(from_issue_claim(c), now)
+        )
+    batches = judgements.batches
+    stages = {b.id: derive_batch_stage(b, facts) for b in batches}
+    archived = {b.id for b in batches if closeout_state(b) == "archived"}
+    owed: list[OwedClaim] = []
+    held_keys = {h.key for h in held}
+    for key, bid in owed_claims(batches, stages, archived):
+        issue = open_issues.get(key)
+        if issue is None or key in held_keys:  # held elsewhere is not owed (p1-r6)
+            continue
+        own = next((c for c in issue.claims if c.signer == me), None)
+        if own is None or own.batch != bid:
+            owed.append(OwedClaim(key=key, batch=bid))
+    return ClaimSets(held, stale, owed)
+
+
+@dataclass(frozen=True)
+class CheckResult:
+    unranked: list[Issue]
+    unranked_prs: list[PullRequest]
+    settled: list[Issue]
+    orphaned: list[str]
+    unreachable: list[Unreachable]
+    stale: list[Stale] = field(default_factory=list)
+    unplaced: list[Issue] = field(default_factory=list)
+    settled_prs: list[PullRequest] = field(default_factory=list)
+    no_severity: list[Issue] = field(default_factory=list)
+    duplicate_unknown: list[str] = field(default_factory=list)
+    # Judgements whose `duplicate_of` target is itself a duplicate: a chain or a cycle
+    # leaves no original on the board for its members (review p3-r2).
+    duplicate_chained: list[str] = field(default_factory=list)
+    awaiting_live: list[Issue] = field(default_factory=list)
+    debt_digests: list[Issue] = field(default_factory=list)
+    untrusted_digests: list[Issue] = field(default_factory=list)
+    owed: list[Issue] = field(default_factory=list)
+    candidates: list[CandidateGroup] = field(default_factory=list)
+    duplicates: list[Duplicate] = field(default_factory=list)
+    claims: ClaimSets = field(default_factory=ClaimSets)
+    closed_in_progress: list[StaleInProgress] = field(default_factory=list)
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+    config_ignored: list[tuple[str, list[str]]] = field(default_factory=list)
+
+    def to_json(self) -> dict[str, Any]:
+        def row(i: Issue) -> dict[str, Any]:
+            return {"key": i.key, "title": i.title, "stage": i.stage, "url": i.url}
+
+        def pr_row(pr: PullRequest) -> dict[str, Any]:
+            return {
+                "key": issue_key(pr.repo, pr.number),
+                "number": pr.number,
+                "title": pr.title,
+                "state": pr.state,
+                "url": pr.url,
+            }
+
+        return {
+            "skipped": [{"repo": r, "reason": why} for r, why in self.skipped],
+            "config_ignored": {r: list(keys) for r, keys in self.config_ignored},
+            "unranked": [row(i) for i in self.unranked],
+            "unranked_prs": [pr_row(pr) for pr in self.unranked_prs],
+            "settled": [row(i) for i in self.settled],
+            "settled_prs": [pr_row(pr) for pr in self.settled_prs],
+            "orphaned": list(self.orphaned),
+            "unreachable": [{"key": u.key, "reason": u.reason} for u in self.unreachable],
+            "unplaced": [row(i) for i in self.unplaced],
+            "no_severity": [row(i) for i in self.no_severity],
+            "duplicate_unknown": list(self.duplicate_unknown),
+            "duplicate_chained": list(self.duplicate_chained),
+            "awaiting_live": [row(i) for i in self.awaiting_live],
+            "debt_digests": [{**row(i), "figures": issue_figures(i)} for i in self.debt_digests],
+            "untrusted_digests": [row(i) for i in self.untrusted_digests],
+            "owed": [row(i) for i in self.owed],
+            "duplicate_candidates": [
+                {
+                    "keys": list(g.keys),
+                    "pairs": [{"a": p.a, "b": p.b, "reasons": list(p.reasons)} for p in g.pairs],
+                }
+                for g in self.candidates
+            ],
+            "duplicates": [
+                {
+                    "key": d.key,
+                    "title": d.title,
+                    "url": d.url,
+                    "original": d.original,
+                    "state": d.state,
+                    "reason": d.reason,
+                    "command": d.command,
+                }
+                for d in self.duplicates
+            ],
+            "stale_dispatch": [
+                {
+                    "key": s.key,
+                    "title": s.title,
+                    "url": s.url,
+                    "marker_at": s.marker_at,
+                    "days": s.days,
+                }
+                for s in self.stale
+            ],
+            "closed_in_progress": [
+                {
+                    "key": e.key,
+                    "title": e.title,
+                    "url": e.url,
+                    "closed_at": e.closed_at,
+                    "state": e.state,
+                }
+                for e in self.closed_in_progress
+            ],
+            "held_elsewhere": [
+                {
+                    "key": h.key,
+                    "title": h.title,
+                    "url": h.url,
+                    "holder": h.claim.signer,
+                    "batch": h.claim.batch,
+                    "expires": h.claim.expires,
+                }
+                for h in self.claims.held_elsewhere
+            ],
+            "expired_claims": [
+                {
+                    "key": e.key,
+                    "signer": e.claim.signer,
+                    "batch": e.claim.batch,
+                    "expires": e.claim.expires,
+                }
+                for e in self.claims.expired_claims
+            ],
+            "claims_owed": [{"key": o.key, "batch": o.batch} for o in self.claims.claims_owed],
+        }
+
+
+def skew_entries(
+    facts: Facts,
+) -> tuple[list[tuple[str, list[str]]], list[tuple[str, str]]]:
+    """The (repo, ignored keys) and (repo, skip reason) lists the skew banner and `check`
+    both report, sorted by repo (R5)."""
+    ignored = [(repo, sorted(keys)) for repo, keys in sorted(facts.config_ignored.items()) if keys]
+    skipped = [(s.repo, s.reason) for s in sorted(facts.skipped, key=lambda s: s.repo)]
+    return ignored, skipped
+
+
+def _unreachable_reason(key: str, facts: Facts) -> str | None:
+    """Why *key*'s issue could not be reached, or None if nothing explains it."""
+    for u in facts.unviewed:
+        if normalize_key(u.key) == key:
+            return u.reason
+    _, _, number = key.rpartition("#")
+    if number.isdigit():
+        for s in facts.skipped:
+            if issue_key(s.repo, int(number)) == key:
+                return s.reason
+        for repo in facts.collected:
+            if issue_key(repo, int(number)) == key:
+                return JUDGED_AFTER_COLLECT
+    return None
+
+
+def _missing_reason(key: str, facts: Facts) -> str:
+    """Why a `duplicate_of` target is in no issue list, the first that applies (§3.C).
+
+    Not `_unreachable_reason`: its "judged after the last collect" wording would be
+    false here, because a target is named, not judged.
+    """
+    prs = [
+        *facts.prs,
+        *facts.batch_prs,
+        *facts.judged_prs,
+        *(p for i in facts.issues for p in i.prs),
+    ]
+    if any(issue_key(p.repo, p.number) == key for p in prs):
+        return "a pull request, not an issue"
+    for u in facts.unviewed:
+        if normalize_key(u.key) == key:
+            return u.reason
+    _, _, number = key.rpartition("#")
+    if number.isdigit():
+        for s in facts.skipped:
+            if issue_key(s.repo, int(number)) == key:
+                return s.reason
+        for repo in facts.collected:
+            if issue_key(repo, int(number)) == key:
+                return "added since the last collect; run `fr triage collect` again"
+    return "not in any collected repo"
+
+
+def duplicates(facts: Facts, judgements: Judgements) -> list[Duplicate]:
+    """The duplicates set: see the module docstring."""
+    found = {i.key: i for i in facts.issues}
+    out: list[Duplicate] = []
+    for issue in sorted(facts.issues, key=lambda i: i.key):
+        judged = judgements.issues.get(issue.key)
+        if issue.state != "open" or judged is None or not judged.duplicate_of:
+            continue
+        original = found.get(judged.duplicate_of)
+        common = dict(key=issue.key, title=issue.title, url=issue.url, original=judged.duplicate_of)
+        if original is None:
+            out.append(
+                Duplicate(
+                    **common, state="missing", reason=_missing_reason(judged.duplicate_of, facts)
+                )
+            )
+            continue
+        command = f"gh issue close {issue.number} --repo {issue.repo} --duplicate-of {original.url}"
+        out.append(Duplicate(**common, state=original.state, command=command))
+    return out
+
+
+def _aware(stamp: str | None) -> datetime | None:
+    """*stamp* as an aware datetime; None when it is missing, unparseable or naive.
+
+    `check` always exits 0 (review r2p-f13), so a time it cannot compare is
+    skipped rather than raised.
+    """
+    if not stamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def clean_label_targets(facts: Facts) -> list[StaleInProgress]:
+    """The closed issues `fr triage clean-labels` may unlabel: the `stale` ones only. A
+    `release-pending` one is the claim sync's to clear, a `held` one is another scope's
+    (board-truth R2, R3); `check` and the verb both select through this."""
+    return [e for e in facts.stale_in_progress if e.state == "stale"]
+
+
+def stale_dispatches(facts: Facts) -> list[Stale]:
+    """The stale-dispatch set: see the module docstring."""
+    collected = _aware(facts.collected_at)
+    if collected is None:
+        return []
+    out: list[Stale] = []
+    for i in facts.issues:
+        # Only an OPEN or MERGED linked PR is progress; one closed unmerged is
+        # not, so it does not hide a stale dispatch (review r2p-f13).
+        if (
+            i.state != "open"
+            or any(p.state in {"OPEN", "MERGED"} for p in i.prs)
+            or FR_IN_PROGRESS.name not in i.labels
+            # Its fix merged through a Refs PR, which links no closing PR: it awaits
+            # its live walk, which is not a stale dispatch (spec §F, R18).
+            or is_awaiting_live(i)
+        ):
+            continue
+        marker = _aware(i.dispatch_marker_at)
+        if marker is None:
+            continue
+        age = collected - marker
+        if age > timedelta(days=facts.config_for(i.repo).stale_dispatch_days):
+            out.append(
+                Stale(
+                    key=i.key,
+                    title=i.title,
+                    url=i.url,
+                    marker_at=i.dispatch_marker_at or "",
+                    days=age.days,
+                )
+            )
+    return out
+
+
+def is_awaiting_live(issue: Issue) -> bool:
+    """Whether `issue` is open and carries `fr:awaiting-live`."""
+    return issue.state == "open" and FR_AWAITING_LIVE.name in issue.labels
+
+
+def is_debt_digest(issue: Issue, facts: Facts) -> bool:
+    """Whether `issue` is an open debt digest: the marker, current or legacy, as a line
+    of its own, written by a trusted author (debt-engine R14; `fr.triage.debt`)."""
+    return is_trusted_digest(issue, facts)
+
+
+def is_owed(issue: Issue) -> bool:
+    """Whether `issue` is open and carries `fr:owed` (debt-engine R16)."""
+    return issue.state == "open" and FR_OWED.name in issue.labels
+
+
+def is_set_apart(issue: Issue, facts: Facts) -> bool:
+    """Whether `issue` is in a set of its own that is never ranked or proposed as work:
+    awaiting live, a debt digest or owed."""
+    return is_awaiting_live(issue) or is_debt_digest(issue, facts) or is_owed(issue)
+
+
+def batch_awaits_live(batch: Batch, facts: Facts) -> bool:
+    """Whether every open member of *batch* awaits its live walk (at least one is
+    open): such a batch is no work, so the driver holds it (spec §F, R18)."""
+    members = [i for i in facts.issues if i.key in batch.ids and i.state == "open"]
+    return bool(members) and all(is_awaiting_live(i) for i in members)
+
+
+def awaiting_live_issues(facts: Facts) -> list[Issue]:
+    """The awaiting-live set: see the module docstring."""
+    return [i for i in facts.issues if is_awaiting_live(i)]
+
+
+def unplaced_issues(facts: Facts, judgements: Judgements) -> list[Issue]:
+    """The unplaced set: see the module docstring."""
+    placed: set[str] = set()
+    for batch in judgements.batches:
+        if is_open(batch, facts):
+            placed.update(batch.ids)
+    for feature in judgements.features:
+        placed.update(feature.ids)
+    placed.update(k for k, j in judgements.issues.items() if j.kind == "parked" or j.duplicate_of)
+    return [
+        i
+        for i in facts.issues
+        if i.state == "open" and i.key not in placed and not is_set_apart(i, facts)
+    ]
+
+
+def classify(
+    facts: Facts,
+    judgements: Judgements,
+    *,
+    me: str | None = None,
+    now: datetime | None = None,
+) -> CheckResult:
+    """Sort issues into their sets and report open PRs without a judgement. Given this
+    scope's id *me* and the clock *now*, also the claim sets (triage-claims R7)."""
+    judged = {normalize_key(k) for k in judgements.issues}
+    found = {i.key: i for i in facts.issues}
+    unranked = [
+        i
+        for i in facts.issues
+        if i.state == "open" and i.key not in judged and not is_set_apart(i, facts)
+    ]
+    unranked_prs = [
+        pr for pr in facts.prs if pr.state == "OPEN" and issue_key(pr.repo, pr.number) not in judged
+    ]
+    settled = [found[k] for k in sorted(judged & found.keys()) if found[k].stage in SETTLED_STAGES]
+    orphaned: list[str] = []
+    unreachable: list[Unreachable] = []
+    # A judgement may name a PR (open PRs are ranked under the same key); one the
+    # facts carry is found, never orphaned or unreachable (gh#902).
+    prs = [
+        *facts.prs,
+        *facts.batch_prs,
+        *facts.judged_prs,
+        *(p for i in facts.issues for p in i.prs),
+    ]
+    found_prs = {issue_key(p.repo, p.number) for p in prs}
+    settled_prs = sorted(
+        (
+            p
+            for p in facts.judged_prs
+            if p.state != "OPEN" and issue_key(p.repo, p.number) in judged
+        ),
+        key=lambda p: issue_key(p.repo, p.number),
+    )
+    for key in sorted(judged - found.keys() - found_prs):
+        reason = _unreachable_reason(key, facts)
+        if reason is None:
+            orphaned.append(key)
+        else:
+            unreachable.append(Unreachable(key=key, reason=reason))
+    ignored_keys, skipped_repos = skew_entries(facts)
+    return CheckResult(
+        skipped=skipped_repos,
+        config_ignored=ignored_keys,
+        unranked=unranked,
+        unranked_prs=unranked_prs,
+        settled=settled,
+        orphaned=orphaned,
+        unreachable=unreachable,
+        stale=stale_dispatches(facts),
+        closed_in_progress=list(facts.stale_in_progress),
+        unplaced=unplaced_issues(facts, judgements),
+        no_severity=[
+            i
+            for i in facts.issues
+            if i.state == "open"
+            and i.key in judged
+            and judgements.issues[i.key].severity is None
+            and not is_set_apart(i, facts)
+        ],
+        duplicate_unknown=sorted(
+            k
+            for k, j in judgements.issues.items()
+            if j.duplicate_of and j.duplicate_of not in found
+        ),
+        duplicate_chained=sorted(
+            k
+            for k, j in judgements.issues.items()
+            if j.duplicate_of
+            and (t := judgements.issues.get(j.duplicate_of)) is not None
+            and t.duplicate_of
+        ),
+        settled_prs=settled_prs,
+        awaiting_live=awaiting_live_issues(facts),
+        debt_digests=[i for i in facts.issues if is_debt_digest(i, facts)],
+        untrusted_digests=[
+            i for i in facts.issues if is_marked(i) and not is_debt_digest(i, facts)
+        ],
+        owed=[i for i in facts.issues if is_owed(i)],
+        candidates=candidates(facts, judgements),
+        duplicates=duplicates(facts, judgements),
+        claims=(
+            claim_sets(facts, judgements, me, now)
+            if me is not None and now is not None
+            else ClaimSets()
+        ),
+    )

@@ -1,0 +1,574 @@
+"""vk.repair — idempotent stale-ref normalization (2026-06-06 design).
+
+The repair walk rewrites spec-table File cells and plan `_meta.yaml`
+refs (`parent_plan`, `prior_rework`, `spec`) to the canonical
+lifecycle-independent form, preserving everything else byte-for-byte,
+and warns loudly — never silently — about refs it cannot resolve.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from fr.repair import repair_repo
+
+SLUG = "2026-05-10-x"
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> Path:
+    (tmp_path / ".git").mkdir()
+    for d in ("plans", "implemented/plans", "specs", "implemented/specs"):
+        (tmp_path / "docs/superpowers" / d).mkdir(parents=True)
+    return tmp_path
+
+
+def _spec_with_cell(repo: Path, cell: str, name: str = "2026-05-10-fixture.md") -> Path:
+    spec = repo / "docs/superpowers/specs" / name
+    spec.write_text(
+        "# Fixture\n\nProse stays untouched.\n\n## Implementation Plans\n\n"
+        "| Plan | Repo | File | Depends on |\n"
+        "|---|---|---|---|\n"
+        f"| Plan X | `derio-net/test` | {cell} | — |\n"
+    )
+    return spec
+
+
+def test_repair_rewrites_legacy_cell_preserving_annotation(repo: Path) -> None:
+    (repo / "docs/superpowers/implemented/plans" / SLUG).mkdir()
+    spec = _spec_with_cell(
+        repo,
+        f"`docs/superpowers/archived-plans/{SLUG}/` (shipped via PR #146, archived 2026-05-17)",
+    )
+    result = repair_repo(repo, write=True)
+    text = spec.read_text()
+    assert f"| `{SLUG}` (shipped via PR #146, archived 2026-05-17) |" in text
+    assert "archived-plans" not in text
+    # other columns + prose untouched
+    assert "| Plan X | `derio-net/test` |" in text
+    assert "Prose stays untouched." in text
+    assert len(result.rewrites) == 1
+    assert not result.warnings
+
+
+def test_repair_rewrites_meta_refs(repo: Path) -> None:
+    plan = repo / "docs/superpowers/plans/2026-05-10-x-rework-1"
+    plan.mkdir()
+    (repo / "docs/superpowers/implemented/plans" / SLUG).mkdir()
+    spec = _spec_with_cell(repo, f"`{SLUG}`")
+    meta = plan / "_meta.yaml"
+    meta.write_text(
+        "schema_version: 2\n"
+        "plan: 2026-05-10-x-rework-1\n"
+        f"spec: docs/superpowers/specs/{spec.name}\n"
+        "target_repo: derio-net/test\n"
+        f"parent_plan: docs/superpowers/archived-plans/{SLUG}/\n"
+        "origin_items: []\n"
+    )
+    result = repair_repo(repo, write=True)
+    text = meta.read_text()
+    assert f"parent_plan: {SLUG}\n" in text
+    assert f"spec: {spec.name}\n" in text
+    # untouched fields stay byte-identical
+    assert "schema_version: 2\n" in text
+    assert "origin_items: []\n" in text
+    assert {(r.file.name, r.field) for r in result.rewrites} >= {
+        ("_meta.yaml", "parent_plan"),
+        ("_meta.yaml", "spec"),
+    }
+
+
+def test_repair_unresolvable_ref_warns_loudly_and_leaves_ref(repo: Path) -> None:
+    spec = _spec_with_cell(repo, "`docs/superpowers/archived-plans/2026-05-10-gone/`")
+    before = spec.read_text()
+    result = repair_repo(repo, write=True)
+    assert spec.read_text() == before  # untouched
+    assert len(result.warnings) == 1
+    w = result.warnings[0]
+    assert spec.name in w
+    assert "2026-05-10-gone" in w
+    assert "docs/superpowers/plans/2026-05-10-gone" in w  # every tried path named
+    assert "docs/superpowers/implemented/plans/2026-05-10-gone" in w
+    assert "docs/superpowers/archived-plans/2026-05-10-gone" in w
+
+
+def test_repair_idempotent(repo: Path) -> None:
+    (repo / "docs/superpowers/implemented/plans" / SLUG).mkdir()
+    spec = _spec_with_cell(repo, f"docs/superpowers/archived-plans/{SLUG}/")
+    repair_repo(repo, write=True)
+    after_first = spec.read_text()
+    second = repair_repo(repo, write=True)
+    assert spec.read_text() == after_first
+    assert not second.rewrites  # fixed point
+
+
+def test_repair_dry_run_writes_nothing(repo: Path) -> None:
+    (repo / "docs/superpowers/implemented/plans" / SLUG).mkdir()
+    spec = _spec_with_cell(repo, f"docs/superpowers/archived-plans/{SLUG}/")
+    before = spec.read_text()
+    result = repair_repo(repo, write=False)
+    assert spec.read_text() == before
+    assert len(result.rewrites) == 1  # planned, not applied
+
+
+def test_repair_cross_repo_unresolved_mentions_per_repo_scope(repo: Path) -> None:
+    """An unresolvable row may be cross-repo — the warning says so
+    instead of guessing."""
+    _spec_with_cell(repo, "`docs/superpowers/plans/2026-05-10-remote/`")
+    result = repair_repo(repo, write=True)
+    assert result.warnings
+    assert "own repo" in result.warnings[0] or "cross-repo" in result.warnings[0]
+
+
+def test_repair_walks_implemented_specs_too(repo: Path) -> None:
+    (repo / "docs/superpowers/implemented/plans" / SLUG).mkdir()
+    spec = repo / "docs/superpowers/implemented/specs/2026-05-10-done.md"
+    spec.write_text(
+        "# Done\n\n## Implementation Plans\n\n"
+        "| Plan | Repo | File | Depends on |\n"
+        "|---|---|---|---|\n"
+        f"| Plan X | `derio-net/test` | `docs/superpowers/archived-plans/{SLUG}/` | — |\n"
+    )
+    result = repair_repo(repo, write=True)
+    assert f"`{SLUG}`" in spec.read_text()
+    assert len(result.rewrites) == 1
+
+
+# --- Implementation Plans header normalization (spec-table-header-guard) ----
+
+
+def test_repair_normalizes_mislabeled_header(repo: Path) -> None:
+    """A header that mislabels its own columns (e.g. `Phases | Status |
+    Created` over Repo/File/Depends-on data) is rewritten to the canonical
+    `Plan | Repo | File | Depends on` form — the row data is untouched."""
+    spec = repo / "docs/superpowers/specs/2026-05-10-bad-header.md"
+    spec.write_text(
+        "# Bad header\n\n## Implementation Plans\n\n"
+        "| Plan | Phases | Status | Created |\n"
+        "|------|--------|--------|---------|\n"
+        "| 2026-05-10-bad-header | `derio-net/test` | `2026-05-10-bad-header` | — |\n"
+    )
+    result = repair_repo(repo, write=True)
+    text = spec.read_text()
+    assert "| Plan | Repo | File | Depends on |\n" in text
+    assert "Phases" not in text
+    assert "| 2026-05-10-bad-header | `derio-net/test` | `2026-05-10-bad-header` | — |" in text
+    assert any(r.field == "Implementation Plans header" for r in result.rewrites)
+
+
+def test_repair_normalizes_mislabeled_header_in_implemented_specs(repo: Path) -> None:
+    spec = repo / "docs/superpowers/implemented/specs/2026-05-10-done.md"
+    spec.write_text(
+        "# Done\n\n## Implementation Plans\n\n"
+        "| Plan | Target repo | Slug | Status |\n"
+        "|------|-------------|------|--------|\n"
+        "| 2026-05-10-done | `derio-net/test` | `2026-05-10-done` | — |\n"
+    )
+    result = repair_repo(repo, write=True)
+    assert "| Plan | Repo | File | Depends on |\n" in spec.read_text()
+    assert any(r.file.name == "2026-05-10-done.md" for r in result.rewrites)
+
+
+def test_repair_header_already_canonical_no_rewrite(repo: Path) -> None:
+    spec = _spec_with_cell(repo, "`docs/superpowers/plans/2026-05-10-x/`")
+    before = spec.read_text()
+    result = repair_repo(repo, write=True)
+    assert spec.read_text().splitlines()[4] == before.splitlines()[4]  # header line untouched
+    assert not any(r.field == "Implementation Plans header" for r in result.rewrites)
+
+
+def test_repair_header_normalization_idempotent(repo: Path) -> None:
+    spec = repo / "docs/superpowers/specs/2026-05-10-bad-header.md"
+    spec.write_text(
+        "# Bad header\n\n## Implementation Plans\n\n"
+        "| Plan | Phases | Status | Created |\n"
+        "|------|--------|--------|---------|\n"
+        "| 2026-05-10-bad-header | `derio-net/test` | `2026-05-10-bad-header` | — |\n"
+    )
+    repair_repo(repo, write=True)
+    after_first = spec.read_text()
+    second = repair_repo(repo, write=True)
+    assert spec.read_text() == after_first
+    assert not any(r.field == "Implementation Plans header" for r in second.rewrites)
+
+
+def test_repair_leaves_non_canonical_column_count_untouched(repo: Path) -> None:
+    """A 5-column header (the pre-migrate `Status` column) is out of scope
+    for this repair — that's `migrate.py`'s job, not a mislabeling."""
+    spec = repo / "docs/superpowers/specs/2026-05-10-five-col.md"
+    spec.write_text(
+        "# Five col\n\n## Implementation Plans\n\n"
+        "| Plan | Repo | File | Status | Depends on |\n"
+        "|------|------|------|--------|------------|\n"
+        "| Some plan | `derio-net/test` | `2026-05-10-five-col` | Complete | — |\n"
+    )
+    before = spec.read_text()
+    result = repair_repo(repo, write=True)
+    assert spec.read_text() == before
+    assert not any(r.field == "Implementation Plans header" for r in result.rewrites)
+
+
+def test_repair_header_dry_run_writes_nothing(repo: Path) -> None:
+    spec = repo / "docs/superpowers/specs/2026-05-10-bad-header.md"
+    spec.write_text(
+        "# Bad header\n\n## Implementation Plans\n\n"
+        "| Plan | Phases | Status | Created |\n"
+        "|------|--------|--------|---------|\n"
+        "| 2026-05-10-bad-header | `derio-net/test` | `2026-05-10-bad-header` | — |\n"
+    )
+    before = spec.read_text()
+    result = repair_repo(repo, write=False)
+    assert spec.read_text() == before
+    assert any(r.field == "Implementation Plans header" for r in result.rewrites)
+
+
+def test_repair_meta_null_and_tilde_are_placeholders(repo: Path) -> None:
+    """`spec: null` / `~` / `none` are sentinels, not refs — no warning, no
+    rewrite ('none' parity with self_review's placeholder list; spuriously
+    warned in the 2026-06-06 fleet sweep on frank + willikins)."""
+    plan = repo / "docs/superpowers/plans/2026-05-10-nullspec"
+    plan.mkdir()
+    meta = plan / "_meta.yaml"
+    meta.write_text(
+        "schema_version: 2\nplan: 2026-05-10-nullspec\n"
+        "spec: none\nparent_plan: ~\nprior_rework: null\n"
+    )
+    result = repair_repo(repo, write=True)
+    assert not result.warnings
+    assert not result.rewrites
+
+
+def test_repair_warns_on_ambiguous_slug_across_roots(repo: Path) -> None:
+    """Spec promise: same slug under two roots → active wins AND a
+    warning names both (review finding 1, 2026-06-06)."""
+    (repo / "docs/superpowers/plans" / SLUG).mkdir()
+    (repo / "docs/superpowers/implemented/plans" / SLUG).mkdir()
+    _spec_with_cell(repo, f"docs/superpowers/archived-plans/{SLUG}/")
+    result = repair_repo(repo, write=True)
+    assert len(result.rewrites) == 1  # still rewrites (active wins)
+    assert any(
+        "ambiguous" in w
+        and f"docs/superpowers/plans/{SLUG}" in w
+        and f"docs/superpowers/implemented/plans/{SLUG}" in w
+        for w in result.warnings
+    ), result.warnings
+
+
+def test_repair_never_touches_fenced_blocks_after_table(repo: Path) -> None:
+    """A code fence abutting the table (no blank line) must not be
+    rewritten even if it contains 4-column pipe rows (review finding 2)."""
+    (repo / "docs/superpowers/implemented/plans" / SLUG).mkdir()
+    spec = repo / "docs/superpowers/specs/2026-05-10-fenced.md"
+    spec.write_text(
+        "# F\n\n## Implementation Plans\n\n"
+        "| Plan | Repo | File | Depends on |\n"
+        "|---|---|---|---|\n"
+        f"| Plan X | `derio-net/test` | `docs/superpowers/archived-plans/{SLUG}/` | — |\n"
+        "```\n"
+        f"| fake | row | `docs/superpowers/archived-plans/{SLUG}/` | — |\n"
+        "```\n"
+    )
+    repair_repo(repo, write=True)
+    text = spec.read_text()
+    assert f"| Plan X | `derio-net/test` | `{SLUG}` | — |" in text  # real row fixed
+    assert (
+        f"| fake | row | `docs/superpowers/archived-plans/{SLUG}/` | — |" in text
+    )  # fence untouched
+
+
+# --- plan-config dead-key stripping (2026-06-16 cleanup) ---------------------
+
+_DEAD_PLAN_CONFIG = (
+    'plan:\n  filename: "YYYY-MM-DD-{name}.md"\n  save_to: docs/superpowers/plans/\n\n'
+    "dispatch:\n  target: github-issues\n  owner: derio-net\n\n"
+    "header:\n  required:\n    - Status\n"
+)
+
+
+def _write_plan_config(repo: Path, text: str) -> Path:
+    cfg = repo / "docs/superpowers/plan-config.yaml"
+    cfg.write_text(text)
+    return cfg
+
+
+def test_repair_reports_plan_config_dead_keys_dry_run(repo: Path) -> None:
+    cfg = _write_plan_config(repo, _DEAD_PLAN_CONFIG)
+    result = repair_repo(repo, write=False)
+    removed = {r.old for r in result.rewrites if r.file.name == "plan-config.yaml"}
+    assert removed == {"plan.save_to", "dispatch"}
+    # Dry-run writes nothing.
+    assert cfg.read_text() == _DEAD_PLAN_CONFIG
+
+
+def test_repair_strips_plan_config_dead_keys_on_write(repo: Path) -> None:
+    cfg = _write_plan_config(repo, _DEAD_PLAN_CONFIG)
+    repair_repo(repo, write=True)
+    text = cfg.read_text()
+    assert "save_to" not in text
+    assert "dispatch:" not in text
+    assert 'filename: "YYYY-MM-DD-{name}.md"' in text  # live key intact
+
+
+def test_repair_clean_plan_config_no_rewrite(repo: Path) -> None:
+    clean = 'plan:\n  filename: "YYYY-MM-DD-{name}.md"\n\nheader:\n  required:\n    - Status\n'
+    _write_plan_config(repo, clean)
+    result = repair_repo(repo, write=True)
+    assert not [r for r in result.rewrites if r.file.name == "plan-config.yaml"]
+
+
+def test_repair_plan_config_is_idempotent(repo: Path) -> None:
+    _write_plan_config(repo, _DEAD_PLAN_CONFIG)
+    repair_repo(repo, write=True)
+    again = repair_repo(repo, write=True)
+    assert not [r for r in again.rewrites if r.file.name == "plan-config.yaml"]
+
+
+def test_repair_quiet_on_pending_row(repo: Path) -> None:
+    """A `pending`/`tbd` placeholder row is an intentional decided-but-unbuilt
+    slice (#351/#359): repair leaves it untouched with NO unresolved-ref
+    warning and NO rewrite."""
+    (repo / "docs/superpowers/implemented/plans" / SLUG).mkdir()
+    spec = repo / "docs/superpowers/specs" / "2026-05-10-sliced.md"
+    spec.write_text(
+        "# Sliced\n\n## Implementation Plans\n\n"
+        "| Plan | Repo | File | Depends on |\n"
+        "|---|---|---|---|\n"
+        f"| Slice A | `derio-net/test` | `docs/superpowers/implemented/plans/{SLUG}/` | — |\n"
+        "| Slice B | `derio-net/other` | `pending` | — |\n"
+    )
+    result = repair_repo(repo, write=True)
+    # no warning about the pending row
+    assert not any("pending" in w.lower() for w in result.warnings), result.warnings
+    assert not any("Slice B" in w for w in result.warnings), result.warnings
+    # no rewrite targets the pending cell; the row is left verbatim
+    assert all("Slice B" not in r.field for r in result.rewrites)
+    assert "| Slice B | `derio-net/other` | `pending` | — |" in spec.read_text()
+
+
+# --- scoped repair + canonical spec form (2026-09-26 archive-repair-scope) ---
+
+
+def _plan_with_spec(repo: Path, slug: str, spec: str) -> Path:
+    plan = repo / "docs/superpowers/plans" / slug
+    plan.mkdir()
+    meta = plan / "_meta.yaml"
+    meta.write_text(f"plan: {slug}\nspec: {spec}\n")
+    return meta
+
+
+def _bare_spec(repo: Path, name: str = "x-design.md") -> Path:
+    p = repo / "docs/superpowers/specs" / name
+    p.write_text("# X\n")
+    return p
+
+
+def test_scoped_repair_touches_only_named_plans(repo: Path) -> None:
+    _bare_spec(repo)
+    full = "docs/superpowers/specs/x-design.md"
+    a = _plan_with_spec(repo, "2026-09-01-a", full)
+    b = _plan_with_spec(repo, "2026-09-02-b", full)
+    before_b = b.read_bytes()
+    result = repair_repo(repo, write=True, only_plans=frozenset({"2026-09-01-a"}))
+    assert a.read_text() == "plan: 2026-09-01-a\nspec: x-design.md\n"
+    assert b.read_bytes() == before_b
+    assert [r.file for r in result.rewrites] == [a]
+
+
+def test_unscoped_repair_still_rewrites_every_plan(repo: Path) -> None:
+    _bare_spec(repo)
+    full = "docs/superpowers/specs/x-design.md"
+    a = _plan_with_spec(repo, "2026-09-01-a", full)
+    b = _plan_with_spec(repo, "2026-09-02-b", full)
+    repair_repo(repo, write=True)
+    assert "spec: x-design.md" in a.read_text()
+    assert "spec: x-design.md" in b.read_text()
+
+
+def test_scoped_repair_only_rewrites_named_file_cell_rows(repo: Path) -> None:
+    (repo / "docs/superpowers/implemented/plans" / "2026-09-01-a").mkdir()
+    (repo / "docs/superpowers/plans" / "2026-09-02-b").mkdir()
+    spec = repo / "docs/superpowers/specs/2026-09-fixture.md"
+    spec.write_text(
+        "# F\n\n## Implementation Plans\n\n"
+        "| Plan | Repo | File | Depends on |\n|---|---|---|---|\n"
+        "| Free label | `o/r` | `docs/superpowers/plans/2026-09-01-a/` | — |\n"
+        "| 2026-09-01-a | `o/r` | `docs/superpowers/plans/2026-09-02-b/` | — |\n"
+        "| Gone | `o/r` | `docs/superpowers/plans/2026-09-03-missing/` | — |\n"
+    )
+    result = repair_repo(repo, write=True, only_plans=frozenset({"2026-09-01-a"}))
+    text = spec.read_text()
+    assert "| Free label | `o/r` | `2026-09-01-a` | — |" in text
+    # Name cell matches the scope but the File cell slug does not: untouched.
+    assert "`docs/superpowers/plans/2026-09-02-b/`" in text
+    assert "2026-09-03-missing/" in text
+    assert len(result.rewrites) == 1
+    assert not result.warnings
+
+
+def test_scoped_repair_skips_plan_config_and_header_repair(repo: Path) -> None:
+    cfg = repo / "docs/superpowers/plan-config.yaml"
+    cfg.write_text("plan:\n  save_to: docs/x\n")
+    spec = repo / "docs/superpowers/specs/2026-09-hdr.md"
+    spec.write_text(
+        "# H\n\n## Implementation Plans\n\n| Name | Where | Path | After |\n|---|---|---|---|\n"
+    )
+    cfg_before, spec_before = cfg.read_bytes(), spec.read_bytes()
+    result = repair_repo(repo, write=True, only_plans=frozenset({"2026-09-01-a"}))
+    assert cfg.read_bytes() == cfg_before
+    assert spec.read_bytes() == spec_before
+    assert not result.rewrites
+    unscoped = repair_repo(repo, write=True)
+    assert any(r.field == "Implementation Plans header" for r in unscoped.rewrites)
+    assert any(r.field == "plan-config dead key" for r in unscoped.rewrites)
+
+
+# --- canonical_spec_ref ---
+
+
+def test_canonical_spec_ref_shortens_only_the_same_file(repo: Path) -> None:
+    from fr.refs import canonical_spec_ref
+
+    _bare_spec(repo)
+    other = repo / "notes"
+    other.mkdir()
+    (other / "x-design.md").write_text("# other\n")
+    assert canonical_spec_ref("docs/superpowers/specs/x-design.md", repo) == "x-design.md"
+    assert canonical_spec_ref("x-design.md", repo) == "x-design.md"
+    # same name, different file: resolution by slug would repoint it — leave verbatim
+    assert canonical_spec_ref("notes/x-design.md", repo) == "notes/x-design.md"
+    # unresolvable and cross-repo refs are left verbatim
+    assert canonical_spec_ref("docs/superpowers/specs/nope.md", repo) == (
+        "docs/superpowers/specs/nope.md"
+    )
+    cross = "owner/repo:docs/superpowers/specs/x-design.md"
+    assert canonical_spec_ref(cross, repo) == cross
+    # a spec that moved to implemented/ still canonicalizes a stale full path
+    (repo / "docs/superpowers/implemented/specs/y-design.md").write_text("# y\n")
+    assert canonical_spec_ref("docs/superpowers/specs/y-design.md", repo) == "y-design.md"
+
+
+def test_canonical_spec_ref_keeps_a_repo_escaping_relative_ref_verbatim(repo: Path) -> None:
+    """#709: a relative ref that leaves the repo must not fall through to a
+    same-slug local spec just because the foreign target is absent here."""
+    from fr.refs import canonical_spec_ref
+
+    _bare_spec(repo)
+    escaping = "../sibling/docs/superpowers/specs/x-design.md"
+    assert canonical_spec_ref(escaping, repo) == escaping
+
+
+def test_canonical_spec_ref_keeps_an_absolute_out_of_repo_ref_verbatim(
+    repo: Path, tmp_path: Path
+) -> None:
+    """#709: an absolute out-of-repo path is foreign too."""
+    from fr.refs import canonical_spec_ref
+
+    _bare_spec(repo)
+    outside = str(tmp_path.parent / "elsewhere" / "x-design.md")
+    assert canonical_spec_ref(outside, repo) == outside
+
+
+def test_canonical_spec_ref_tolerates_a_relative_repo_root(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review cr-1: a relative `repo_root` beside an absolute ref must not make
+    `os.path.commonpath` raise (it refuses to mix the two) — the escape test
+    judges both as absolute paths."""
+    from fr.refs import canonical_spec_ref
+
+    _bare_spec(repo)
+    monkeypatch.chdir(repo.parent)
+    rel_root = Path(repo.name)
+    outside = str(tmp_path.parent / "elsewhere" / "x-design.md")
+    assert canonical_spec_ref(outside, rel_root) == outside
+    assert canonical_spec_ref("docs/superpowers/specs/x-design.md", rel_root) == "x-design.md"
+
+
+def test_canonical_spec_ref_still_canonicalizes_an_in_repo_dotdot(repo: Path) -> None:
+    """#709: the lexical escape test must not over-fire on an in-repo `..`."""
+    from fr.refs import canonical_spec_ref
+
+    _bare_spec(repo)
+    assert (
+        canonical_spec_ref("docs/superpowers/../superpowers/specs/x-design.md", repo)
+        == "x-design.md"
+    )
+
+
+def test_repair_leaves_a_repo_escaping_ref_byte_identical(repo: Path) -> None:
+    """#709: `fr repair` shares the escape guard — it never repoints a plan's
+    `spec:` that names a foreign path just because a same-named local spec
+    exists."""
+    _bare_spec(repo)
+    escaping = "../sibling/docs/superpowers/specs/x-design.md"
+    meta = _plan_with_spec(repo, "2026-09-01-a", escaping)
+    before = meta.read_bytes()
+    repair_repo(repo, write=True)
+    assert meta.read_bytes() == before
+
+
+def test_repair_leaves_a_same_named_spec_at_another_path_alone(repo: Path) -> None:
+    """`fr repair` shares `canonical_spec_ref`'s guard: it never repoints a plan."""
+    _bare_spec(repo)
+    (repo / "notes").mkdir()
+    (repo / "notes/x-design.md").write_text("# other\n")
+    meta = _plan_with_spec(repo, "2026-09-01-a", "notes/x-design.md")
+    before = meta.read_bytes()
+    result = repair_repo(repo, write=True)
+    assert meta.read_bytes() == before
+    assert not result.rewrites
+
+
+def test_full_path_spec_ref_still_resolves(repo: Path) -> None:
+    """Back-compat: the non-canonical full path stays readable until repaired."""
+    from fr.refs import resolve_spec_ref
+
+    spec = _bare_spec(repo)
+    res = resolve_spec_ref("docs/superpowers/specs/x-design.md", repo)
+    assert res.path is not None and res.path.resolve() == spec.resolve()
+
+
+def test_repair_still_rewrites_a_full_path_whose_spec_moved(repo: Path) -> None:
+    """#686 s2-1: the stale full path is exactly what `fr repair` exists for."""
+    (repo / "docs/superpowers/implemented/specs/x-design.md").write_text("# X\n")
+    meta = _plan_with_spec(repo, "2026-09-01-a", "docs/superpowers/specs/x-design.md")
+    repair_repo(repo, write=True)
+    assert meta.read_text() == "plan: 2026-09-01-a\nspec: x-design.md\n"
+
+
+def test_repair_still_shortens_an_ambiguous_lifecycle_path(repo: Path) -> None:
+    """#686 r2-f1: a full path into a lifecycle root is shortened, as before the
+    guard — readers resolve by slug, so keeping it would only keep a warning."""
+    _bare_spec(repo)
+    (repo / "docs/superpowers/implemented/specs/x-design.md").write_text("# X old\n")
+    meta = _plan_with_spec(repo, "2026-09-01-a", "docs/superpowers/implemented/specs/x-design.md")
+    result = repair_repo(repo, write=True)
+    assert meta.read_text() == "plan: 2026-09-01-a\nspec: x-design.md\n"
+    assert any("ambiguous" in w for w in result.warnings)
+
+
+def test_repair_does_not_warn_ambiguous_about_a_ref_it_keeps_verbatim(repo: Path) -> None:
+    """#749: the verbatim-vs-rewrite decision comes first. A repo-escaping ref
+    whose slug happens to match specs in two lifecycle roots is kept verbatim,
+    so an "ambiguous — resolved to the active one" warning describes a
+    resolution that never happens."""
+    _bare_spec(repo)
+    (repo / "docs/superpowers/implemented/specs/x-design.md").write_text("# X old\n")
+    escaping = "../sibling/docs/superpowers/specs/x-design.md"
+    meta = _plan_with_spec(repo, "2026-09-01-a", escaping)
+    before = meta.read_bytes()
+    result = repair_repo(repo, write=True)
+    assert meta.read_bytes() == before
+    assert not any("ambiguous" in w for w in result.warnings), result.warnings
+
+
+def test_canonical_spec_ref_escape_test_reads_the_path_token(repo: Path) -> None:
+    """#750: a backtick-annotated escaping ref is judged on its path token, not
+    the decorated value — the leading backtick must not turn `../` into an
+    in-repo directory name and let the ref fall through to a same-slug spec."""
+    from fr.refs import canonical_spec_ref
+
+    _bare_spec(repo)
+    decorated = "`../sibling/docs/superpowers/specs/x-design.md` (sibling's copy)"
+    assert canonical_spec_ref(decorated, repo) == decorated

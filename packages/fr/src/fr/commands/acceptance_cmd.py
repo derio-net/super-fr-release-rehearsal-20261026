@@ -1,0 +1,1031 @@
+"""`fr acceptance ...` CLI — the acceptance-matrix registry and gate.
+
+Spec: docs/superpowers/specs/2026-07-04-acceptance-matrix-design.md §4.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import typer
+from rich.console import Console
+from rich.markup import escape
+
+from fr.acceptance.model import AcceptanceError, Matrix, Row, Walk, load_matrix
+from fr.commands.common import resolve_repo_root
+
+console = Console(highlight=False)
+err_console = Console(stderr=True, highlight=False)
+
+MATRIX_REL = Path("docs/acceptance/matrix.yaml")
+
+acceptance_app = typer.Typer(
+    help="Acceptance matrix: business-level acceptance tests × verification levels.",
+    no_args_is_help=True,
+)
+
+
+def _load(root: Path) -> Matrix:
+    matrix_path = root / MATRIX_REL
+    if not matrix_path.exists():
+        err_console.print(f"no {MATRIX_REL} (run `fr acceptance init` to scaffold one)")
+        raise typer.Exit(1)
+    try:
+        return load_matrix(matrix_path)
+    except AcceptanceError as e:
+        err_console.print(f"[red]error:[/red] {escape(str(e))}")
+        raise typer.Exit(1) from e
+
+
+def _added_since(root: Path, ref: str, matrix: Matrix) -> list[str]:
+    """Row ids present now but absent from `<ref>`'s matrix (spec decision 6:
+    mid-flight additions are defended at PR time, and this diff feeds the
+    PR-body section). A base without a matrix means every row is new."""
+    import subprocess
+
+    import yaml
+
+    out = subprocess.run(
+        ["git", "show", f"{ref}:{MATRIX_REL}"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if out.returncode != 0:
+        stderr = out.stderr.strip()
+        if "does not exist" in stderr or "exists on disk, but not in" in stderr:
+            old_ids: set[str] = set()
+        else:
+            raise AcceptanceError(f"--added-since {ref}: {stderr}")
+    else:
+        try:
+            old = yaml.safe_load(out.stdout) or {}
+        except yaml.YAMLError as e:
+            raise AcceptanceError(f"--added-since {ref}: base matrix unparseable: {e}") from e
+        old_ids = {str(r["id"]) for r in old.get("rows") or [] if isinstance(r, dict) and "id" in r}
+    return [r.id for r in matrix.rows if r.id not in old_ids]
+
+
+@acceptance_app.command("check")
+def check_cmd(
+    sibling_root: str = typer.Option(
+        "..",
+        "--sibling-root",
+        help="Where sister repos live, relative to the repo root ('..' = repos as siblings).",
+    ),
+    added_since: str | None = typer.Option(
+        None,
+        "--added-since",
+        help="Also list rows added since this git ref (feeds the PR-body section).",
+    ),
+) -> None:
+    """The gate: refs resolve, staleness, exit 2 on failing rows."""
+    from fr.acceptance.check import check
+
+    root = resolve_repo_root()
+    matrix = _load(root)
+    try:
+        result = check(matrix, root, sibling_root)
+        added = _added_since(root, added_since, matrix) if added_since else []
+    except AcceptanceError as e:
+        err_console.print(f"[red]error:[/red] {escape(str(e))}")
+        raise typer.Exit(1) from e
+    if added_since is not None:
+        typer.echo(f"added since {added_since}:")
+        by_id = {r.id: r for r in matrix.rows}
+        for rid in added:
+            typer.echo(f"  {rid} — {by_id[rid].acceptance}")
+        if not added:
+            typer.echo("  (none)")
+
+    # Plain echo, never rich: `::warning::` annotations are parsed by GitHub
+    # line-by-line — rich's soft-wrap would split them and they'd vanish.
+    for r in result.warning_rows:
+        typer.echo(
+            f"::warning title=acceptance-matrix::{r.id} is {r.status}: "
+            f"{r.acceptance} — backfill owed ({r.notes[:120]})"
+        )
+    for w in result.warnings:
+        typer.echo(f"::warning title=acceptance-matrix::{w}")
+    for e_line in result.errors:
+        typer.echo(f"ERROR: {e_line}", err=True)
+    if result.failing_ids:
+        typer.echo(f"ERROR: failing acceptance rows: {result.failing_ids}", err=True)
+    if result.exit_code == 0:
+        typer.echo(result.summary)
+    raise typer.Exit(result.exit_code)
+
+
+@acceptance_app.command("report")
+def report_cmd(
+    link_mode: str = typer.Option(
+        "local", "--link-mode", help="github (CI) | local (sibling checkouts)."
+    ),
+    ref: str = typer.Option("main", "--ref", help="Own-repo ref for github links."),
+    sibling_root: str = typer.Option(
+        "..", "--sibling-root", help="Where sister repos live, relative to the repo root."
+    ),
+    out: Path | None = typer.Option(
+        None,
+        "--out",
+        help="Single explicit output/check target (repo-relative). Omit to operate on the "
+        "whole committed set (report_local.html + report_linked.html + report_linked.md).",
+    ),
+    deterministic: bool = typer.Option(
+        False,
+        "--deterministic",
+        help="Render as a pure function of matrix.yaml (matrix-derived stamp, no git "
+        "date/hash, no filesystem twin-probing) — the committed-report / drift-check path.",
+    ),
+    check: bool = typer.Option(
+        False,
+        "--check",
+        help="Verify the on-disk report matches a fresh deterministic render; write "
+        "nothing, exit non-zero on drift. Implies --deterministic.",
+    ),
+) -> None:
+    """Render the report set (or, with --check, verify it is in sync).
+
+    Default subject is the committed SET — report_local.html (local HTML),
+    report_linked.html (github HTML) and report_linked.md (github Markdown).
+    With no flags, renders the ad-hoc, uncommitted `report.html` (git-stamped,
+    honoring --link-mode). `--out` narrows to a single explicit file."""
+    from fr.acceptance.report import (
+        ci_built_reports,
+        prune_stale_reports,
+        render_committed_set,
+        render_deterministic,
+        render_report,
+        tracked_reports,
+    )
+
+    if link_mode not in ("github", "local"):
+        err_console.print(f"--link-mode must be github|local, got {link_mode!r}")
+        raise typer.Exit(2)
+    root = resolve_repo_root()
+    matrix = _load(root)
+    # No `--out` → operate on the whole committed set; an explicit `--out`
+    # (even one equal to the default path) narrows to that single file.
+
+    if check:
+        try:
+            if out is not None:
+                expected = {
+                    out.as_posix(): render_deterministic(
+                        matrix, root, (root / out).resolve().parent, sibling_root, link_mode
+                    )
+                }
+            else:
+                ci_built = ci_built_reports(root)
+                expected = render_committed_set(matrix, root, only=tracked_reports(root, ci_built))
+        except AcceptanceError as e:
+            err_console.print(f"[red]error:[/red] {escape(str(e))}")
+            raise typer.Exit(1) from e
+        stale = []
+        for rel, want in expected.items():
+            path = root / rel
+            got = path.read_text() if path.exists() else None
+            if got != want:
+                stale.append(rel)
+        if not stale:
+            line = (
+                f"{', '.join(expected)} in sync with matrix.yaml"
+                if expected
+                else "no tracked reports to check"
+            )
+            if out is None and ci_built:
+                line += f" (CI-built, skipped: {', '.join(sorted(ci_built))})"
+            typer.echo(line)
+            return
+        typer.echo(
+            f"ERROR: stale (drifted from docs/acceptance/matrix.yaml): {', '.join(stale)} — "
+            "run `fr acceptance report --deterministic` and commit the result.",
+            err=True,
+        )
+        raise typer.Exit(3)
+
+    try:
+        if out is not None:
+            out_path = (root / out).resolve()
+            html = (
+                render_deterministic(matrix, root, out_path.parent, sibling_root, link_mode)
+                if deterministic
+                else render_report(matrix, root, out_path.parent, sibling_root, link_mode, ref)
+            )
+            files = {str(out_path): html}
+        elif deterministic:
+            files = {
+                str(root / rel): html for rel, html in render_committed_set(matrix, root).items()
+            }
+            prune_stale_reports(root)
+        else:
+            # Ad-hoc default render → a single git-stamped report.html honoring
+            # --link-mode (back-compat: the CI artifact step still uses this).
+            out_path = (root / "docs" / "acceptance" / "report.html").resolve()
+            files = {
+                str(out_path): render_report(
+                    matrix, root, out_path.parent, sibling_root, link_mode, ref
+                )
+            }
+    except AcceptanceError as e:
+        err_console.print(f"[red]error:[/red] {escape(str(e))}")
+        raise typer.Exit(1) from e
+    for path_str, html in files.items():
+        p = Path(path_str)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(html)
+    typer.echo(f"wrote {', '.join(files)}")
+
+
+@acceptance_app.command("status")
+def status_cmd(
+    brief: bool = typer.Option(
+        False, "--brief", help="Counts + the 3 oldest open rows (session-start injection)."
+    ),
+) -> None:
+    """Terminal nag: counts by status + the open acceptance debt rows.
+
+    Read-only and exit-0 always — allowlist-safe like `fr status`.
+    """
+    from collections import Counter
+
+    from fr.acceptance.check import open_rows
+
+    root = resolve_repo_root()
+    matrix = _load(root)
+    counts = Counter(r.status for r in matrix.rows)
+    summary = ", ".join(f"{s}: {n}" for s, n in sorted(counts.items())) or "empty matrix"
+    typer.echo(f"acceptance: {summary}")
+    opens = open_rows(matrix)
+    if not opens:
+        typer.echo("no acceptance debt.")
+        return
+    shown = opens[:3] if brief else opens
+    for r in shown:  # open_rows: oldest origin date first
+        typer.echo(f"  {r.id} [{r.status}] {r.acceptance} — {r.notes}")
+    if brief and len(opens) > len(shown):
+        typer.echo(f"  … +{len(opens) - len(shown)} more (fr acceptance status)")
+
+
+@acceptance_app.command("summary")
+def summary_cmd() -> None:
+    """GitHub Actions-friendly Markdown summary: compact counts + collapsible debt."""
+    from collections import Counter
+    from html import escape
+
+    from fr.acceptance.check import open_rows
+
+    root = resolve_repo_root()
+    matrix = _load(root)
+    counts = Counter(r.status for r in matrix.rows)
+    lines = [
+        "## Acceptance matrix",
+        "",
+        "| status | count |",
+        "|---|---:|",
+        f"| ci | {counts.get('ci', 0)} |",
+        f"| scheduled | {counts.get('scheduled', 0)} |",
+        f"| unwired | {counts.get('unwired', 0)} |",
+        f"| walk-owed | {counts.get('walk-owed', 0)} |",
+        f"| walked | {counts.get('walked', 0)} |",
+        f"| manual | {counts.get('manual', 0)} |",
+        f"| not-implemented | {counts.get('not-implemented', 0)} |",
+        f"| failing | {counts.get('failing', 0)} |",
+        "",
+    ]
+    opens = open_rows(matrix)
+    if not opens:
+        lines.append("No open acceptance debt.")
+    else:
+        lines += [f"### Open acceptance debt ({len(opens)})", ""]
+        for r in opens:
+            lines += [
+                f"<details><summary><code>{escape(r.id)}</code> [{escape(r.status)}]</summary>",
+                "",
+                escape(r.acceptance),
+                "",
+                f"**Notes:** {escape(r.notes)}",
+                "",
+                "</details>",
+                "",
+            ]
+    lines += ["", "Full HTML report remains attached as the `acceptance-report` artifact."]
+    typer.echo("\n".join(lines))
+
+
+def _parse_levels(level: list[str], flag: str = "--level") -> dict[str, list[str]]:
+    """`['unit=own:tests/x.py', …]` → `{'unit': ['own:tests/x.py']}`.
+
+    `flag` names the option in the refusal, so a malformed `--drop-level`
+    is not reported as a malformed `--level`."""
+    levels: dict[str, list[str]] = {}
+    for item in level:
+        lv, sep, ref = item.partition("=")
+        if not sep:
+            err_console.print(f"{flag} must be '<level>=<ref>', got {item!r}")
+            raise typer.Exit(2)
+        levels.setdefault(lv, []).append(ref)
+    return levels
+
+
+def _check_verify(root: Path, verify: str | None) -> None:
+    """`--verify` names a strategy that resolves here, or `none` (spec
+    2026-10-06-verification-strategies §B) — refused before anything moves."""
+    if verify is None:
+        return
+    from fr.record.apply import strategy_error
+
+    if (why := strategy_error(verify, root)) is not None:
+        err_console.print(f"[red]error:[/red] --verify: {escape(why)}")
+        raise typer.Exit(2)
+
+
+def _walk_at(value: str | None) -> str | None:
+    """`--walk-at` as the walk's `at`: an ISO date (midnight UTC) or an ISO
+    timestamp, for a walk recorded after the fact. None when not given; a value
+    that is neither is refused, exit 2."""
+    import datetime as _dt
+
+    if value is None:
+        return None
+    try:
+        if len(value) == 10:
+            return _dt.date.fromisoformat(value).strftime("%Y-%m-%dT00:00:00Z")
+        _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return value
+    except ValueError:
+        err_console.print(
+            f"[red]error:[/red] --walk-at {value!r} is not an ISO date or timestamp "
+            "(e.g. 2026-07-09 or 2026-07-09T12:00:00Z); nothing changed"
+        )
+        raise typer.Exit(2) from None
+
+
+def _walk_from_flags(
+    root: Path,
+    evidence: str | None,
+    harness: str | None,
+    model: str | None,
+    strategy: str | None,
+    outcome: str,
+    at: str | None = None,
+) -> Walk | None:
+    """`--walk` and its companions as a `Walk`, or `None` without `--walk`.
+    Each companion is required; the strategy must resolve (spec 2026-10-06 R14)."""
+    import datetime as _dt
+
+    from fr.record.apply import strategy_error
+    from fr.verification.model import RESERVED
+
+    if evidence is None:
+        stray = [f for f, v in (("--harness", harness), ("--model", model),
+                                ("--strategy", strategy), ("--walk-at", at))
+                 if v is not None]  # fmt: skip
+        if stray:
+            err_console.print(f"[red]error:[/red] {', '.join(stray)} only go with --walk")
+            raise typer.Exit(2)
+        return None
+    missing = [f for f, v in (("--harness", harness), ("--model", model),
+                              ("--strategy", strategy)) if not v]  # fmt: skip
+    if missing:
+        err_console.print(
+            f"[red]error:[/red] --walk needs {', '.join(missing)} — a walk names the harness, "
+            "model and strategy it ran on; nothing changed"
+        )
+        raise typer.Exit(2)
+    assert strategy is not None
+    why = (
+        f"{RESERVED!r} is not a strategy a walk can run"
+        if strategy == RESERVED
+        else strategy_error(strategy, root)
+    )
+    if why is not None:
+        err_console.print(f"[red]error:[/red] --strategy: {escape(why)}")
+        raise typer.Exit(2)
+    try:
+        return Walk(
+            strategy=strategy,
+            harness=harness,  # type: ignore[arg-type]  # checked non-empty above
+            model=model,  # type: ignore[arg-type]
+            outcome=outcome,  # type: ignore[arg-type]  # pydantic validates the literal
+            at=_walk_at(at) or _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            evidence=evidence,
+        )
+    except Exception as e:  # pydantic ValidationError → operator-readable
+        err_console.print(f"[red]error:[/red] {escape(str(e))}")
+        raise typer.Exit(2) from e
+
+
+def _print_close_commands(root: Path, before: Row) -> None:
+    """R16: the issues this walk freed, each with the forge's close and
+    unlabel commands — nothing under `tracking: none`. fr never closes them."""
+    from fr.acceptance.walks import AWAITING_LIVE_LABEL, issues_now_closable
+    from fr.hostclient import issue_command
+    from fr.services.resolve import resolve_tracking
+
+    matrix = _load(root)
+    after = next(r for r in matrix.rows if r.id == before.id)
+    freed = issues_now_closable(matrix, before, after, root)
+    if not freed or resolve_tracking(root, lenient=True).type == "none":
+        return
+    w = after.walks[-1]
+    comment = f"Walk-verified ({w.strategy}, {w.harness}, {w.model}): {w.evidence}"
+    for ref in freed:
+        typer.echo(f"{ref}: every row citing it is walk-verified — close it:")
+        typer.echo("  " + issue_command(root, "issue-close", ref=ref, comment=comment))
+        typer.echo("  " + issue_command(root, "issue-unlabel", ref=ref, label=AWAITING_LIVE_LABEL))
+
+
+def _validate_refs(row: Row) -> None:
+    """Ref grammar checked BEFORE the file is touched — a shell-mangled ref
+    (zsh's `$VAR:t` modifier eating "…:tests/…") must not land and surface
+    only at the next `check`."""
+    from fr.acceptance.model import split_ref
+
+    for ref in row.refs():
+        try:
+            split_ref(ref)
+        except AcceptanceError as e:
+            err_console.print(f"[red]error:[/red] {escape(str(e))}")
+            raise typer.Exit(2) from e
+
+
+def _apply_rows(
+    root: Path,
+    item: object,
+    message: str,
+    drops: dict[str, dict[str, tuple[str, ...]]] | None = None,
+) -> None:
+    """A one-entry record through the step-record engine (spec 2026-09-25
+    §5.C.6): the matrix edit, the three reports regenerated once, one commit.
+
+    `drops` (row id → level → refs to remove, gh#624) is passed only when it
+    names something: the engine refuses an empty per-row mapping."""
+    from fr.record import apply as engine
+    from fr.record.model import StepRecord
+
+    try:
+        outcome = engine.apply_record(
+            root,
+            None,
+            StepRecord(acceptance=(item,)),  # type: ignore[arg-type]
+            target=engine.RecordTarget(message=message, acceptance_drops=drops or {}),
+        )
+    except engine.RecordRefusedError as e:
+        err_console.print(f"[red]error:[/red] {escape(str(e))}")
+        raise typer.Exit(2) from e
+    for notice in outcome.notices:
+        if notice.startswith("warning"):
+            err_console.print(f"[yellow]{notice}[/yellow]")
+
+
+@acceptance_app.command("set-status")
+def set_status_cmd(
+    row_id: str = typer.Option(..., "--id", help="Existing row id (never created here)."),
+    status: str = typer.Option(
+        ...,
+        "--status",
+        help="ci | scheduled | unwired | walk-owed | walked | manual | not-implemented | failing.",
+    ),
+    notes: str = typer.Option(
+        ...,
+        "--notes",
+        help="Why the status moved (required — a status that moved for no recorded "
+        "reason is the silent change the acceptance-matrix rule forbids).",
+    ),
+    level: list[str] = typer.Option(
+        [],
+        "--level",
+        help="'<level>=<repo>:<path>[#test_name]' evidence to ADD (repeatable) — the other "
+        "half of the documented transition.",
+    ),
+    drop_level: list[str] = typer.Option(
+        [],
+        "--drop-level",
+        help="'<level>=<ref>' evidence to REMOVE (repeatable); refused if the ref is not "
+        "on the row.",
+    ),
+    verify: str | None = typer.Option(
+        None,
+        "--verify",
+        help="<strategy|none>: the row's verification strategy (`fr verification list`; "
+        "spec 2026-10-06 §B). Omit to leave the row's existing `verify` alone — "
+        "set-status never clears it.",
+    ),
+    issue: list[str] = typer.Option(
+        [],
+        "--issue",
+        help="'owner/repo#n' issue whose promise the row carries, ADDED to its `issues` "
+        "(repeatable; spec 2026-10-06 R13).",
+    ),
+    scenario: str | None = typer.Option(
+        None,
+        "--scenario",
+        help="Repo-relative walk scenario for the row (spec 2026-10-06 R10); omit to keep "
+        "the row's existing one.",
+    ),
+    walk: str | None = typer.Option(
+        None,
+        "--walk",
+        help="Record a walk of this row: its evidence (a log path or a note). Needs "
+        "--harness, --model and --strategy (spec 2026-10-06 R14).",
+    ),
+    harness: str | None = typer.Option(None, "--harness", help="--walk: the harness walked."),
+    model: str | None = typer.Option(None, "--model", help="--walk: the model that walked it."),
+    strategy: str | None = typer.Option(
+        None, "--strategy", help="--walk: the verification strategy the walk ran."
+    ),
+    walk_outcome: str = typer.Option("pass", "--walk-outcome", help="--walk: pass | fail."),
+    walk_at: str | None = typer.Option(
+        None,
+        "--walk-at",
+        help="--walk: when the walk happened (ISO date or timestamp); default now. For a "
+        "walk recorded after the fact, from the evidence's own date.",
+    ),
+) -> None:
+    """Move an existing row's status, in place, with a reason (spec §3.G.2).
+
+    The matrix is a registry of CURRENT state, not a log: `check` and the three
+    committed reports read today's status, so this rewrites the row and
+    regenerates the report set. Provenance lives in git history, which for a
+    registry is the right place — the asymmetry with `fr journal resolve`
+    (append-only) is deliberate.
+
+    Refuses an unknown id rather than creating a row: that is `add`'s job, and
+    silently creating one on a typo'd id is how a row gets orphaned.
+
+    `--drop-level` removes a stale evidence ref in the same rewrite (gh#624),
+    so a row can be re-pointed — drop the old ref, `--level` the new one — in
+    one call. A drop naming a ref not on the row, an unknown level, or a ref
+    also named in `--level` is refused (exit 2) with nothing changed.
+
+    `--issue` adds issues the row carries; `--walk` appends a walk (spec
+    2026-10-06 §E). When that walk makes the row walk-verified and no other
+    row still holds one of its issues open, the forge's close and unlabel
+    commands are printed — fr never closes the issue itself, and prints
+    nothing under `tracking: none`.
+
+    `--verify <strategy|none>` names the row's verification strategy, in the
+    same rewrite; omitting the flag preserves whatever the
+    row already carries (`add`'s create-only, and there is no delete verb, so
+    this is the only way to set it on an existing row without hand-editing
+    matrix.yaml).
+    """
+    from typing import get_args
+
+    from fr.acceptance.edit import describe_move, drop_levels, merge_levels
+    from fr.acceptance.model import Status
+
+    root = resolve_repo_root()
+    matrix = _load(root)
+
+    valid = list(get_args(Status))
+    if status not in valid:
+        err_console.print(
+            f"[red]error:[/red] unknown status {status!r} (valid: {' | '.join(valid)})"
+        )
+        raise typer.Exit(2)
+    _check_verify(root, verify)
+    new_walk = _walk_from_flags(root, walk, harness, model, strategy, walk_outcome, walk_at)
+    target = next((r for r in matrix.rows if r.id == row_id), None)
+    if target is None:
+        known = ", ".join(r.id for r in matrix.rows) or "none"
+        err_console.print(
+            f"[red]error:[/red] no row with id {row_id!r} — nothing changed "
+            f"(`fr acceptance add` creates rows; existing ids: {known})"
+        )
+        raise typer.Exit(2)
+
+    additions = _parse_levels(level)
+    drops = _parse_levels(drop_level, flag="--drop-level")
+    both = sorted(
+        f"{lv}={ref}" for lv, refs in drops.items() for ref in refs if ref in additions.get(lv, [])
+    )
+    if both:
+        err_console.print(
+            f"[red]error:[/red] {', '.join(both)} named in both --level and --drop-level "
+            "— nothing changed"
+        )
+        raise typer.Exit(2)
+    try:
+        merged = merge_levels(drop_levels(target.levels, drops), additions)
+    except AcceptanceError as e:
+        err_console.print(f"[red]error:[/red] {escape(str(e))}")
+        raise typer.Exit(2) from e
+    new_verify = verify if verify is not None else target.verify
+    try:
+        new_row = Row(
+            id=target.id,
+            capability=target.capability,
+            acceptance=target.acceptance,
+            origin=target.origin,
+            levels=merged,
+            status=status,  # type: ignore[arg-type]  # pydantic validates the literal
+            notes=notes,
+            verify=new_verify,
+            visual=target.visual,  # set-status never touches `visual` (spec 2026-09-28 §A)
+            scenario=scenario if scenario is not None else target.scenario,
+            issues=target.issues + tuple(i for i in dict.fromkeys(issue) if i not in target.issues),
+            harnesses=target.harnesses,
+            walks=target.walks + ((new_walk,) if new_walk is not None else ()),
+        )
+    except Exception as e:  # pydantic ValidationError → operator-readable
+        err_console.print(f"[red]error:[/red] {escape(str(e))}")
+        raise typer.Exit(2) from e
+    _validate_refs(new_row)
+    from fr.acceptance.model import walked_error
+
+    if (why := walked_error(new_row)) is not None:
+        err_console.print(f"[red]error:[/red] {escape(why)}; nothing changed")
+        raise typer.Exit(2)
+
+    from fr.record.model import AcceptanceItem
+
+    _apply_rows(
+        root,
+        AcceptanceItem(
+            id=row_id,
+            status=status,
+            notes=notes,
+            levels={k: tuple(v) for k, v in additions.items()},
+            verify=verify,  # None preserves; apply.py falls back to existing
+            issues=tuple(issue),
+            scenario=scenario,
+            walk=new_walk,
+        ),
+        f"chore(fr): acceptance — {row_id} {describe_move(target, new_row)}",
+        {row_id: {k: tuple(v) for k, v in drops.items()}} if drops else None,
+    )
+    typer.echo(f"{row_id}: {describe_move(target, new_row)}")
+    if new_walk is not None:
+        _print_close_commands(root, target)
+
+
+@acceptance_app.command("add")
+def add_cmd(
+    row_id: str = typer.Option(..., "--id", help="Stable kebab-case row id."),
+    capability: str = typer.Option(..., "--capability", help="Grouping heading."),
+    acceptance: str = typer.Option(..., "--acceptance", help="The business-level statement."),
+    origin: list[str] = typer.Option(
+        [], "--origin", help="'<repo>:<path>[#anchor]' ref (repeatable)."
+    ),
+    level: list[str] = typer.Option(
+        [], "--level", help="'<level>=<repo>:<path>[#test_name]' test ref (repeatable)."
+    ),
+    status: str = typer.Option(
+        ...,
+        "--status",
+        help="ci | scheduled | unwired | walk-owed | walked | manual | not-implemented | failing.",
+    ),
+    notes: str = typer.Option("", "--notes", help="Evidence detail / backfill owed."),
+    verify: str | None = typer.Option(
+        None,
+        "--verify",
+        help="<strategy|none>: the row's verification strategy (`fr verification list`); "
+        "a post-merge one is listed as owed in the PR body (spec 2026-10-06 §B).",
+    ),
+    visual_state: list[str] = typer.Option(
+        [],
+        "--visual-state",
+        help="A named UI state visual evidence must cover (repeatable; spec 2026-09-28 §A).",
+    ),
+    visual_interaction: list[str] = typer.Option(
+        [],
+        "--visual-interaction",
+        help="A named UI interaction (limits included) visual evidence must cover "
+        "(repeatable; spec 2026-09-28 §A).",
+    ),
+    issue: list[str] = typer.Option(
+        [],
+        "--issue",
+        help="'owner/repo#n' issue whose promise the row carries (repeatable; "
+        "spec 2026-10-06 R13).",
+    ),
+    scenario: str | None = typer.Option(
+        None, "--scenario", help="Repo-relative walk scenario for the row (spec 2026-10-06 R10)."
+    ),
+    harness: list[str] = typer.Option(
+        [],
+        "--harness",
+        help="A harness the row's promise covers (repeatable; spec 2026-10-06 R14).",
+    ),
+) -> None:
+    """Insert a schema-validated row after its capability's last row (agents
+    never hand-edit YAML shapes); a new capability appends at the end.
+
+    `add` CREATES rows; moving an existing row's status is
+    `fr acceptance set-status` (re-adding an id is refused below, by design).
+    """
+    from fr.acceptance.model import Visual
+
+    root = resolve_repo_root()
+    matrix = _load(root)
+    _check_verify(root, verify)
+
+    levels = _parse_levels(level)
+    try:
+        visual = (
+            Visual(states=tuple(visual_state), interactions=tuple(visual_interaction))
+            if visual_state or visual_interaction
+            else None
+        )
+        new_row = Row(
+            id=row_id,
+            capability=capability,
+            acceptance=acceptance,
+            origin=tuple(origin),
+            levels={k: tuple(v) for k, v in levels.items()},
+            status=status,  # type: ignore[arg-type]  # pydantic validates the literal
+            notes=notes,
+            verify=verify,
+            visual=visual,
+            scenario=scenario,
+            issues=tuple(dict.fromkeys(issue)),
+            harnesses=tuple(dict.fromkeys(harness)),
+        )
+    except Exception as e:  # pydantic ValidationError → operator-readable
+        err_console.print(f"[red]error:[/red] {escape(str(e))}")
+        raise typer.Exit(2) from e
+    if any(r.id == new_row.id for r in matrix.rows):
+        err_console.print(
+            f"[red]error:[/red] duplicate row id: {new_row.id} "
+            "(move an existing row with `fr acceptance set-status`)"
+        )
+        raise typer.Exit(2)
+    _validate_refs(new_row)
+
+    from fr.record.model import AcceptanceItem
+
+    # The engine inserts textually: a load→dump cycle would destroy the
+    # header comments.
+    _apply_rows(
+        root,
+        AcceptanceItem(
+            id=new_row.id,
+            capability=new_row.capability,
+            acceptance=new_row.acceptance,
+            origin=new_row.origin,
+            levels={k: v for k, v in new_row.levels.items() if v},
+            status=new_row.status,
+            notes=new_row.notes,
+            verify=new_row.verify,
+            visual=new_row.visual,
+            scenario=new_row.scenario,
+            issues=new_row.issues,
+            harnesses=new_row.harnesses,
+        ),
+        f"chore(fr): acceptance — add {new_row.id}",
+    )
+    typer.echo(f"added row {new_row.id} ({new_row.status})")
+
+
+@acceptance_app.command("init")
+def init_cmd(
+    with_ci: bool = typer.Option(
+        False,
+        "--with-ci",
+        help="Scaffold the CI workflow even though the repo has no CI config for its "
+        "backend yet (by default one is written only beside existing CI).",
+    ),
+    refresh_ci: bool = typer.Option(
+        False,
+        "--refresh-ci",
+        help="Rewrite an existing fr-scaffolded GitHub/Gitea workflow to the current "
+        "scaffold (a file that is not fr's is refused). For GitLab, whose "
+        ".gitlab-ci.yml is shared, print the job to paste instead.",
+    ),
+) -> None:
+    """Scaffold matrix + CI workflow + backfill rule + gitignore (idempotent).
+
+    The CI workflow is written only when the repo already has CI for its
+    backend, or with `--with-ci` (gh#775)."""
+    from fr._hosts import detect_backend
+    from fr.acceptance.check import resolve_identity
+    from fr.acceptance.scaffold import init
+
+    root = resolve_repo_root()
+    try:
+        org, repo = resolve_identity(Matrix(), root)
+    except AcceptanceError as e:
+        err_console.print(f"[red]error:[/red] {escape(str(e))}")
+        raise typer.Exit(1) from e
+    backend = detect_backend(root)
+    from fr.services.model import CI_FOR_FORGE, ServicesError
+    from fr.services.resolve import resolve_services
+
+    try:
+        services = resolve_services(root)
+    except ServicesError as e:
+        err_console.print(f"[red]error:[/red] {escape(str(e))}")
+        raise typer.Exit(2) from e
+    ci = services.ci
+    if refresh_ci:
+        _refresh_ci(root, services, with_ci=with_ci)
+        return
+    if ci.source == "declared" and ci.type == "none":
+        if with_ci:
+            err_console.print(
+                "[red]error:[/red] --with-ci contradicts the declared `ci: {type: none}` in "
+                ".devcontainer/fr-profiles.yaml — change it with `fr services` or drop the flag"
+            )
+            raise typer.Exit(2)
+    from fr.acceptance.ci import ci_none_reason
+
+    reason = ci_none_reason(root, services)
+    ci_type = ci.type
+    if ci_type == "none" and with_ci:
+        ci_type = CI_FOR_FORGE[services.forge.type]
+    outcome = init(
+        root,
+        org,
+        repo,
+        backend=backend,
+        with_ci=with_ci,
+        ci_type=ci_type,
+        tracking_type=services.tracking.type,
+        no_ci_reason=reason,
+    )
+    for rel in outcome.created:
+        typer.echo(f"created {rel}")
+    for rel in outcome.modified:
+        typer.echo(f"modified {rel}")
+    for rel in outcome.removed:
+        typer.echo(f"removed {rel} (superseded legacy report)")
+    for rel in outcome.skipped:
+        typer.echo(f"exists  {rel} (left untouched)")
+    for rel in outcome.ci_built:
+        typer.echo(f"skipped {rel} (gitignored — CI builds it)")
+    for notice in outcome.notices:
+        typer.echo(notice)
+    # gh#775: commit every path changed here, as every fr writer does (gh#610).
+    # Left to the next command, only ITS paths were committed, and the rule
+    # file and `.gitignore` sat dirty until close-out stashed them. Never fails
+    # init: a refused commit (the default branch, no repo) is one stderr line.
+    from fr.records_commit import commit_records
+
+    paths = _committable(root, outcome.written, outcome.removed)
+    if paths:
+        commit_records(root, [Path(rel) for rel in paths], "chore(fr): acceptance init")
+
+
+def _refresh_ci(root: Path, services: Any, *, with_ci: bool) -> None:
+    """`init --refresh-ci`: exit 0 rewritten/current, 1 refused (foreign file,
+    nothing to refresh, or GitLab's shared file with the job to paste)."""
+    from fr.acceptance.ci import DEBT_PLATFORM, SCAFFOLD_PATHS
+    from fr.acceptance.scaffold import refresh_ci
+    from fr.records_commit import commit_records
+
+    if with_ci:
+        err_console.print("[red]error:[/red] --refresh-ci takes no --with-ci")
+        raise typer.Exit(2)
+    ci_type = services.ci.type
+    if ci_type not in SCAFFOLD_PATHS:
+        err_console.print(
+            f"[red]error:[/red] this repo's ci service is {ci_type!r}: nothing to refresh"
+        )
+        raise typer.Exit(1)
+    debt = services.tracking.type == DEBT_PLATFORM[ci_type]
+    out = refresh_ci(root, ci_type, debt=debt)
+    if out.status == "missing":
+        err_console.print(f"[red]error:[/red] {out.path} does not exist; run `fr acceptance init`")
+        raise typer.Exit(1)
+    if out.status == "foreign":
+        err_console.print(
+            f"[red]error:[/red] {out.path} is not an fr-scaffolded acceptance pipeline; "
+            "not touching it"
+        )
+        raise typer.Exit(1)
+    if out.status == "paste":
+        typer.echo(
+            f"{out.path} is shared by every job in the repo, so fr will not rewrite it. "
+            "Replace the `acceptance-report:` job with these jobs "
+            "(keep `acceptance` in `stages:`):\n"
+        )
+        typer.echo(out.text)
+        raise typer.Exit(1)
+    if out.status == "current":
+        typer.echo(f"{out.path} is already current")
+        return
+    typer.echo(
+        f"rewrote {out.path} to the current scaffold (review the diff: local edits are replaced)"
+    )
+    commit_records(root, [Path(out.path)], "chore(fr): acceptance init --refresh-ci")
+
+
+def _committable(root: Path, written: list[str], removed: list[str]) -> list[str]:
+    """The paths of `written` git will take in one `git add`: one it cannot
+    (a gitignored path, a deletion it never tracked) fails the whole add, and
+    so the whole commit (gh#775 review). An ignored path cannot dirty the tree,
+    so leaving it out loses nothing; it is named so nobody assumes otherwise."""
+    from fr.git import GitUnavailableError, git_answer
+
+    if not written:
+        return []
+    try:
+        ignored = set(git_answer(root, "check-ignore", "--", *written).stdout.split())
+        tracked = (
+            set(git_answer(root, "ls-files", "--", *removed).stdout.split()) if removed else set()
+        )
+    except GitUnavailableError:
+        return written  # commit_records reports whatever git then says
+    for rel in sorted(ignored):
+        typer.echo(f"ignored {rel} (gitignored here, so not committed)")
+    return [p for p in written if p not in ignored and (p not in removed or p in tracked)]
+
+
+BACKFILL_PROTOCOL = """\
+## Backfill work-protocol (agent-driven — see the fr-acceptance skill)
+
+1. Inventory: the uncited Test Plan specs and unlinked plans above, plus any
+   design/study docs with acceptance-like tables, and the test tree(s).
+2. DRAFT rows — one row per business acceptance, not per test — with real
+   refs and HONEST statuses: per-PR-automated evidence ⇒ `ci`; a test that
+   exists but does not run in CI ⇒ `unwired`; proven live by a recorded walk
+   ⇒ `walked`; a live walk still owed ⇒ `walk-owed`; a process that is never
+   automatable ⇒ `manual`; absent ⇒ `not-implemented`. The drift channel is
+   precisely the hand-tracked claims — when in doubt between `ci` and
+   `unwired`, choose unwired.
+3. Add rows via `fr acceptance add` (never hand-edit YAML shapes), run
+   `fr acceptance check`, fix, and open a review PR — the operator audits
+   statuses; do not inflate coverage.
+"""
+
+
+@acceptance_app.command("backfill")
+def backfill_cmd() -> None:
+    """Emit the agent backfill protocol + deterministic inventory (markdown)."""
+    import yaml
+
+    from fr.acceptance.check import SPEC_DIRS, TEST_PLAN_MARKER
+    from fr.acceptance.model import archive_twin, split_ref
+
+    root = resolve_repo_root()
+    matrix = _load(root)
+
+    referenced: set[str] = set()
+    for r in matrix.rows:
+        for ref in r.origin:
+            try:
+                _, path, _ = split_ref(ref)
+            except AcceptanceError:
+                continue
+            referenced.add(path)
+            twin = archive_twin(path)
+            if twin:
+                referenced.add(twin)
+    uncited = [
+        str(spec.relative_to(root))
+        for spec_dir in SPEC_DIRS
+        for spec in sorted((root / spec_dir).glob("*.md"))
+        if TEST_PLAN_MARKER in spec.read_text() and str(spec.relative_to(root)) not in referenced
+    ]
+
+    unlinked_plans: list[str] = []
+    plans_dir = root / "docs" / "superpowers" / "plans"
+    if plans_dir.is_dir():
+        for plan_dir in sorted(p for p in plans_dir.iterdir() if p.is_dir()):
+            linked = False
+            for phase_file in sorted(plan_dir.glob("[0-9][0-9].yaml")):
+                try:
+                    doc = yaml.safe_load(phase_file.read_text()) or {}
+                except yaml.YAMLError:
+                    continue  # unparseable plans are skipped gracefully
+                if (doc.get("phase") or {}).get("acceptance"):
+                    linked = True
+                    break
+            if not linked:
+                unlinked_plans.append(plan_dir.name)
+
+    lines = ["# Acceptance backfill — inventory + protocol", ""]
+    lines.append("## Specs with a Test Plan not yet cited by any row")
+    lines += [f"- {p}" for p in uncited] or ["- (none — every Test Plan spec is cited)"]
+    lines += ["", "## Live plans with no `acceptance:` links"]
+    lines += [f"- {p}" for p in unlinked_plans] or ["- (none)"]
+    lines += ["", "## Test-tree hints"]
+    tests_dir = root / "tests"
+    if tests_dir.is_dir():
+        lines += [f"- tests/{d.name}/" for d in sorted(tests_dir.iterdir()) if d.is_dir()] or [
+            "- tests/ (flat)"
+        ]
+    else:
+        lines.append("- (no tests/ directory found)")
+    lines += ["", BACKFILL_PROTOCOL]
+    typer.echo("\n".join(lines))
+
+
+DIGEST_MARKER = "<!-- fr-acceptance-digest -->"
+
+
+@acceptance_app.command("digest")
+def digest_cmd() -> None:
+    """Markdown for the upserted "Acceptance debt" issue (idempotence marker
+    included; zero debt prints a closable body)."""
+    from fr.debt.engine import acceptance_from_matrix
+    from fr.debt.render import acceptance_section
+
+    matrix = _load(resolve_repo_root())
+    section = acceptance_section(acceptance_from_matrix(matrix))
+    lines = [section, "", DIGEST_MARKER, "", "_generated by `fr acceptance digest`_"]
+    typer.echo("\n".join(lines))

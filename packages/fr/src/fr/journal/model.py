@@ -1,0 +1,978 @@
+"""Journal entry schema, scope→path resolution, and serialize/parse.
+
+Design rules mirror ``fr/types.py``:
+  - ``frozen=True``    -- entries are immutable values.
+  - ``extra="forbid"`` -- closed-world schema; an unknown field fails loud.
+
+Storage format (Phase 1, task 3): each entry is one Markdown block introduced
+by an HTML-comment delimiter carrying the machine header, e.g.::
+
+    <!-- fr:journal kind=finding scope=plan id=f1 created=2026-07-22T10:00:00 phase=2 state=open -->
+    ### f1 · finding · title
+    body...
+
+The comment keeps the header out of the rendered Markdown while remaining
+deterministically parseable; the body below is what a human reads.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+
+from fr.run.model import AnsweredBy
+
+JournalKind = Literal[
+    "decision",
+    "review",
+    "discovery",
+    "finding",
+    "repro",
+    "hypothesis",
+    "ruled-out",
+    "root-cause",
+    # An action the operator OWES (spec 2026-10-11-debt-engine §E, R20): what,
+    # why, how it is completed, and its owed key, as `key: value` body lines
+    # (`owed_body`). It folds apart from findings — see `open_owed_ids`.
+    # Journal kind 2: an fr that predates it cannot parse the entry at all.
+    "owed",
+]
+JournalScope = Literal["spec", "plan", "debug"]
+FindingState = Literal["fixed", "refuted", "open"]
+# The reviewer's classification of a finding it raised (spec 2026-09-24 §A).
+ReviewScope = Literal["in", "out"]
+_REVIEW_SCOPE_LABEL: dict[str, str] = {"in": "in scope", "out": "out of scope"}
+# What the FOLD can say about a finding. Two of its states are carried by a
+# TOKEN, never written as a `state=` value, because an older fr would reject an
+# unknown value and fail to parse the whole journal:
+#   - `deferred`     — an `open` resolution record carrying `tracked_by=`;
+#   - `out-of-scope` — an `open` resolution record carrying `out_of_scope=true`.
+# `parse_journal` projects tokens by name, so an older reader drops the token
+# and reads the finding as still open — fail closed, and no journal stamp bump.
+# The same rule retired `unconfirmed=true` and `delegated=true` (spec
+# 2026-09-29-spec-is-the-contract §C): this fr ignores both tokens.
+EffectiveFindingState = Literal["fixed", "refuted", "open", "deferred", "out-of-scope"]
+
+# Where deferred work may be tracked: `#N`, `owner/repo#N`, or an http(s) URL.
+# A reference, not prose — so a deferral always says where the work went.
+TRACKED_BY_RE = re.compile(r"^(#\d+|[\w.-]+/[\w.-]+#\d+|https?://\S+)$")
+
+# One owed item, one key (spec §A): a Test Plan step, a manual phase, a
+# walk-owed row, or a labelled issue that carries no fr key. The key rides in
+# an issue's `<!-- fr-owed:<key> -->` marker, so it is never free text: no
+# spaces, no `-->`, and no leading `-` (it can reach an argv).
+OWED_KEY_RE = re.compile(
+    r"^(spec:[\w.][\w.-]*#step\d+|plan:[\w.][\w.-]*#p\d+|row:[\w.][\w.-]*"
+    r"|issue:[\w.][\w.-]*/[\w.-]+#\d+)$"
+)
+OWED_FIELDS = ("what", "why", "how", "owed_key")
+"""The body lines an `owed` entry carries, in this order (spec §E)."""
+
+JOURNALS_REL = Path("docs/superpowers/journals")
+IMPLEMENTED_JOURNALS_REL = Path("docs/superpowers/implemented/journals")
+
+# Each scope gets its own subdirectory so a bare `ls journals/` tells you which
+# journal is which at a glance (a debug-slug and a plan-slug can otherwise look
+# identical). Mirrors the `specs/` + `plans/` split of the parent tree.
+SCOPE_DIRS: dict[str, str] = {"spec": "specs", "plan": "plans", "debug": "debug"}
+
+# Specs are written `<YYYY-MM-DD-slug>-design.md`, but the spec-scope journal is
+# keyed by the bare feature slug (`journals/specs/<slug>.md`). Own the suffix in
+# one place so the archive sweep and any journal reader agree (#417).
+_SPEC_FILENAME_SUFFIX = "-design"
+
+
+def spec_journal_slug(spec_stem: str) -> str:
+    """The spec-scope journal slug for a spec file's stem.
+
+    A spec `2026-07-24-x-design.md` (stem `2026-07-24-x-design`) owns the
+    journal `journals/specs/2026-07-24-x.md`, so strip a trailing ``-design``.
+    A stem without the suffix (an older or hand-named spec) maps to itself, so
+    the helper is safe to apply to every spec.
+    """
+    if spec_stem.endswith(_SPEC_FILENAME_SUFFIX):
+        return spec_stem[: -len(_SPEC_FILENAME_SUFFIX)]
+    return spec_stem
+
+
+class JournalParseError(Exception):
+    """Raised when a journal file cannot be parsed into entries."""
+
+
+class JournalEntry(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: JournalKind
+    scope: JournalScope
+    id: str
+    created: str  # ISO 8601; kept as a string for round-trip stability
+    phase: int | None = None
+    title: str
+    body: str = ""
+    # Present ONLY on `finding` entries (fixed | refuted | open).
+    state: FindingState | None = None
+    # A RESOLUTION RECORD names the finding it speaks about (spec §3.G.1). The
+    # journal is an audit log: `fr journal resolve` appends one of these rather
+    # than rewriting the finding, because a finding mutated in place erases
+    # that it was ever open. `effective_finding_states` folds them.
+    resolves: str | None = None
+    # A DEFERRAL: an `open` resolution record naming the issue that now carries
+    # a finding that is valid but not this change's to fix. The fold reads it as
+    # `deferred` (closed for the gate, never "refuted"). Header token
+    # `tracked_by=`, appended last — ignored by an fr that predates it, exactly
+    # as `resolves=` was (see test_a_header_token_this_fr_does_not_know_...).
+    tracked_by: str | None = None
+    # OUT OF SCOPE: an `open` resolution record saying the finding is true but
+    # not caused by this change (spec 2026-09-24 §A). Folds to `out-of-scope`;
+    # header token `out_of_scope=true`, serialized only when set.
+    out_of_scope: bool = False
+    # OPERATOR INPUT: a spec-scope `discovery` holding the operator's brief
+    # verbatim (after redaction), stored at brainstorm for the record (spec
+    # 2026-09-29-spec-is-the-contract §C, R3). Nothing after brainstorm reads
+    # it. Header token `input=true`, serialized only when set, so an older fr
+    # reads a plain discovery.
+    input: bool = False
+    # The REVIEWER's in/out tag, copied onto the finding when the orchestrator
+    # journals it. Kept beside the fold's verdict so a finding the reviewer
+    # called in-scope and the orchestrator moved out renders as reclassified.
+    review_scope: ReviewScope | None = None
+    # Who authorized this resolution — the run model's vocabulary, so a gate
+    # and a journal can never disagree about what "operator" means. Required
+    # (`operator`) on a `fixed` record that follows an effective out-of-scope:
+    # see `unauthorized_fixes`.
+    answered_by: AnsweredBy | None = None
+    # FILED: an `open` resolution record naming the issue an `owed` entry was
+    # filed as at archive (spec 2026-10-11-debt-engine §E). Still owed — the
+    # fold reads it as open. Header token `filed_as=`, appended last.
+    filed_as: str | None = None
+
+    @model_validator(mode="after")
+    def _finding_state_coupling(self) -> JournalEntry:
+        if self.kind == "finding" and self.state is None:
+            raise ValueError("a `finding` entry requires a `state` (fixed|refuted|open)")
+        if self.kind != "finding" and self.state is not None:
+            raise ValueError(f"`state` is only valid on `finding` entries, not `{self.kind}`")
+        if self.resolves is not None:
+            if self.kind != "finding":
+                raise ValueError(
+                    f"`resolves` is only valid on `finding` entries, not `{self.kind}` "
+                    "— a resolution record carries the state it resolves the finding to"
+                )
+            if any(c.isspace() for c in self.resolves) or not self.resolves:
+                raise ValueError(
+                    f"`resolves` must be a non-empty whitespace-free journal id, "
+                    f"got {self.resolves!r}"
+                )
+            if self.resolves == self.id:
+                raise ValueError(
+                    f"entry `{self.id}` cannot resolve itself — a resolution record is a "
+                    "SEPARATE entry naming the finding it closes"
+                )
+        if self.tracked_by is not None:
+            if self.resolves is None or self.state != "open":
+                raise ValueError(
+                    "`tracked_by` is only valid on an `open` resolution record (a "
+                    "deferral): it says the finding is still real, and where it went"
+                )
+            if not TRACKED_BY_RE.match(self.tracked_by):
+                raise ValueError(
+                    "`tracked_by` must name an issue — `#N`, `owner/repo#N` or an "
+                    f"http(s) URL — got {self.tracked_by!r}"
+                )
+        if self.filed_as is not None:
+            if (
+                self.resolves is None
+                or self.state != "open"
+                or self.tracked_by is not None
+                or self.out_of_scope
+            ):
+                raise ValueError(
+                    "`filed_as` is only valid on an `open` resolution record: it says "
+                    "the owed action it names is still owed, and where it was filed"
+                )
+            if not (
+                self.filed_as.isascii()
+                and self.filed_as.isprintable()
+                and TRACKED_BY_RE.match(self.filed_as)
+            ):
+                raise ValueError(
+                    "`filed_as` must name an issue — `#N`, `owner/repo#N` or an "
+                    f"http(s) URL — got {self.filed_as!r}"
+                )
+        if self.out_of_scope and (
+            self.resolves is None or self.state != "open" or self.tracked_by is not None
+        ):
+            raise ValueError(
+                "`out_of_scope` is only valid on an `open` resolution record that is not "
+                "a deferral: it says the finding is true but not this change's"
+            )
+        if self.input and (self.kind != "discovery" or self.scope != "spec"):
+            raise ValueError(
+                "`input` is only valid on a spec-scope `discovery` entry: it holds the "
+                "operator's input, which only a spec journal carries"
+            )
+        if self.review_scope is not None and (self.kind != "finding" or self.resolves):
+            raise ValueError(
+                "`review_scope` is only valid on a `finding` entry that is not a "
+                "resolution record — it is the reviewer's tag on what it raised"
+            )
+        if self.answered_by is not None and self.resolves is None:
+            raise ValueError(
+                "`answered_by` is only valid on a resolution record — it says who "
+                "authorized moving the finding it names"
+            )
+        # The delimiter header is space-delimited `key=value` tokens, so an id
+        # with whitespace would corrupt the round-trip (F3, review 2026-07-23).
+        if not self.id or any(c.isspace() for c in self.id):
+            raise ValueError(
+                f"journal id must be a non-empty whitespace-free token, got {self.id!r}"
+            )
+        return self
+
+
+def journal_path(repo_root: Path, scope: JournalScope, slug: str) -> Path:
+    """Active journal path: ``docs/superpowers/journals/<scope-dir>/<slug>.md``.
+
+    The scope names a subdirectory (``specs`` / ``plans`` / ``debug``) so the
+    tree is glanceable and a debug-slug can never be mistaken for a plan-slug.
+    """
+    return repo_root / JOURNALS_REL / SCOPE_DIRS[scope] / f"{slug}.md"
+
+
+def archived_journal_path(repo_root: Path, scope: JournalScope, slug: str) -> Path:
+    """Archived journal path (mirrors ``implemented/plans`` / ``implemented/specs``)."""
+    return repo_root / IMPLEMENTED_JOURNALS_REL / SCOPE_DIRS[scope] / f"{slug}.md"
+
+
+def resolve_journal_read_path(repo_root: Path, scope: JournalScope, slug: str) -> Path:
+    """Path to read a journal from: the active location if present, else the
+    archived one.
+
+    ``add`` always writes the active path, but a journal outlives its spec/plan:
+    once archived it lives under ``implemented/journals/<scope>/``. Reads
+    (``render`` / ``check``) resolve through here so they still find it. When
+    neither exists the active path is returned (callers treat a missing file as
+    an empty journal), keeping behaviour identical for never-written slugs.
+    """
+    active = journal_path(repo_root, scope, slug)
+    if active.exists():
+        return active
+    archived = archived_journal_path(repo_root, scope, slug)
+    if archived.exists():
+        return archived
+    return active
+
+
+# --- serialization -------------------------------------------------------
+
+_DELIM_PREFIX = "<!-- fr:journal "
+_DELIM_SUFFIX = " -->"
+# Header fields serialized into the delimiter comment, in a stable order.
+# `resolves` is appended LAST so every journal written before phase 7 keeps
+# the byte-for-byte header it already has; an fr that predates the field reads
+# the token and ignores it (`parse_journal` names the fields it wants), so an
+# older reader sees a resolution record as an ordinary fixed/refuted finding.
+_HEADER_FIELDS = (
+    "kind",
+    "scope",
+    "id",
+    "created",
+    "phase",
+    "state",
+    "resolves",
+    "tracked_by",
+    "out_of_scope",
+    "review_scope",
+    "answered_by",
+    "input",
+    "filed_as",
+)
+
+
+def serialize_entry(entry: JournalEntry) -> str:
+    """Render one entry as a delimiter comment + a Markdown body block."""
+    parts: list[str] = []
+    for field in _HEADER_FIELDS:
+        value = getattr(entry, field)
+        # `False` is the default of a boolean token: omitting it keeps every
+        # entry that does not set it byte-identical to what an older fr wrote.
+        if value is None or value is False:
+            continue
+        parts.append(f"{field}={'true' if value is True else value}")
+    header = _DELIM_PREFIX + " ".join(parts) + _DELIM_SUFFIX
+    phase_bit = f" (phase {entry.phase})" if entry.phase is not None else ""
+    state_bit = f" [{entry.state}]" if entry.state is not None else ""
+    if entry.tracked_by is not None:
+        state_bit = f" [deferred → {entry.tracked_by}]"
+    elif entry.filed_as is not None:
+        state_bit = f" [filed → {entry.filed_as}]"
+    elif entry.out_of_scope:
+        state_bit = " [out-of-scope]"
+    if entry.review_scope is not None:
+        state_bit += f" (reviewer: {_REVIEW_SCOPE_LABEL[entry.review_scope]})"
+    heading = f"### {entry.id} · {entry.kind}{state_bit} · {entry.title}{phase_bit}"
+    body = entry.body.rstrip("\n")
+    return f"{header}\n{heading}\n\n{body}\n" if body else f"{header}\n{heading}\n"
+
+
+def _parse_header(line: str) -> dict[str, str]:
+    inner = line[len(_DELIM_PREFIX) : -len(_DELIM_SUFFIX)].strip()
+    fields: dict[str, str] = {}
+    for token in inner.split(" "):
+        if not token:
+            continue
+        key, sep, value = token.partition("=")
+        if not sep:
+            raise JournalParseError(f"malformed journal header token: {token!r}")
+        fields[key] = value
+    return fields
+
+
+def parse_journal(text: str) -> list[JournalEntry]:
+    """Parse a journal file body into entries, in file order.
+
+    Content before the first delimiter (a title/preamble) is ignored, so a
+    journal can carry a human header. A delimiter with an unparseable header
+    raises ``JournalParseError``.
+    """
+    entries: list[JournalEntry] = []
+    entry_ids: set[str] = set()
+    lines = text.splitlines()
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        if not (line.startswith(_DELIM_PREFIX) and line.rstrip().endswith(_DELIM_SUFFIX)):
+            i += 1
+            continue
+        fields = _parse_header(line.rstrip())
+        # Body = the lines up to the next delimiter (or EOF), minus the
+        # auto-generated `### ...` heading and surrounding blank lines.
+        j = i + 1
+        block: list[str] = []
+        while j < n and not lines[j].startswith(_DELIM_PREFIX):
+            block.append(lines[j])
+            j += 1
+        # Drop the heading line (first non-blank) and blank padding.
+        while block and block[0].strip() == "":
+            block.pop(0)
+        if block and block[0].startswith("### "):
+            block.pop(0)
+        while block and block[0].strip() == "":
+            block.pop(0)
+        while block and block[-1].strip() == "":
+            block.pop()
+        # NAMED KEYS, NEVER `JournalEntry(**fields)` — this projection is
+        # load-bearing, not style. `JournalEntry` is `extra="forbid"` (like
+        # `RunState`), so splatting would make every future optional header
+        # token a BREAKING change: an older fr would raise on a journal it used
+        # to read. Because the fields are named here, an unknown token stays in
+        # `fields` and never reaches the model, which is why a real fr 4.4.0
+        # renders a journal full of `resolves=` records at exit 0 while the same
+        # test against the run kind fails loudly. `test_journal_model.py::
+        # test_a_header_token_this_fr_does_not_know_is_ignored_not_fatal` is the
+        # guard; a refactor to `**fields` fails it immediately.
+        try:
+            entry = JournalEntry(
+                kind=fields["kind"],  # type: ignore[arg-type]
+                scope=fields["scope"],  # type: ignore[arg-type]
+                id=fields["id"],
+                created=fields["created"],
+                phase=_phase_token(fields.get("phase")),
+                title=_title_from_heading(text, fields["id"]),
+                body="\n".join(block),
+                state=fields.get("state"),  # type: ignore[arg-type]
+                resolves=fields.get("resolves"),
+                tracked_by=fields.get("tracked_by"),
+                out_of_scope=fields.get("out_of_scope") == "true",
+                review_scope=_review_scope_token(fields.get("review_scope")),
+                answered_by=_answered_by_token(fields.get("answered_by")),
+                input=fields.get("input") == "true",
+                filed_as=fields.get("filed_as"),
+            )
+            if entry.id in entry_ids:
+                raise JournalParseError(f"duplicate journal entry id: {entry.id!r}")
+            entry_ids.add(entry.id)
+            entries.append(entry)
+        except KeyError as e:
+            raise JournalParseError(f"journal entry missing required field: {e}") from e
+        except ValueError as e:
+            # A hand edit bypasses the writers' checks, so a token invalid for
+            # its entry (`input=` on a plan entry, `phase=two`, ...) reaches the
+            # validator here; name the entry rather than let it escape raw (gh#763).
+            raise JournalParseError(
+                f"journal entry {fields.get('id', '?')!r}: {_validation_text(e)}"
+            ) from e
+        i = j
+    return entries
+
+
+def _phase_token(value: str | None) -> int | None:
+    if value is None:
+        return None
+    if not value.isdigit():
+        raise ValueError(f"`phase` must be a phase number, got {value!r}")
+    return int(value)
+
+
+def _validation_text(e: ValueError) -> str:
+    """The validator's own sentence(s), without pydantic's envelope."""
+    if isinstance(e, ValidationError):
+        return "; ".join(err["msg"].removeprefix("Value error, ") for err in e.errors())
+    return str(e)
+
+
+def _review_scope_token(value: str | None) -> ReviewScope | None:
+    """A `review_scope=` value this fr does not know is dropped, not fatal: the
+    tag is display-only, and one bad token must not make the whole journal (and
+    every gate reading it) unparseable."""
+    return "in" if value == "in" else "out" if value == "out" else None
+
+
+def _answered_by_token(value: str | None) -> AnsweredBy | None:
+    """An `answered_by=` value this fr does not know reads as ABSENT — which is
+    the fail-closed direction: whatever it claims, it is not `operator`."""
+    return "operator" if value == "operator" else "agent" if value == "agent" else None
+
+
+def journal_now() -> str:
+    """The `created` stamp for a new entry: UTC, second precision, WITH its
+    offset (`...+00:00`).
+
+    Every journal writer calls this. A naive stamp loses the writer's zone, and
+    the reader can only assume its own: a review written in a UTC container
+    and read on a UTC+9 host lands nine hours early (super-fr#625). The offset
+    is not a shape change, because `created` is a string and every released
+    reader already parses an aware value.
+    """
+    import datetime as _dt
+
+    return _dt.datetime.now(_dt.UTC).replace(microsecond=0).isoformat()
+
+
+def journal_stamp_as_utc(created: str) -> str:
+    """A journal `created` stamp as an aware UTC ISO string.
+
+    Stamps from `journal_now` carry their offset and convert exactly. Older
+    stamps are naive LOCAL wall-clock time. Those are read in THIS process's
+    zone, which is the best guess left and is correct only when the writer
+    shared it. `fr.run.telemetry.parse_timestamp` would read them as UTC
+    instead, so a record written at 21:00 in UTC+3 would open a question
+    window three hours late. An unparseable stamp is returned unchanged, so
+    the reader reports it as unreadable rather than guessing.
+    """
+    import datetime as _dt
+
+    try:
+        parsed = _dt.datetime.fromisoformat(created)
+    except ValueError:
+        return created
+    return parsed.astimezone(_dt.UTC).isoformat()
+
+
+def _title_from_heading(text: str, entry_id: str) -> str:
+    """Recover an entry's title from its ``### <id> · <kind>[ ...] · <title>`` heading."""
+    for line in text.splitlines():
+        if line.startswith(f"### {entry_id} · "):
+            # title is the segment after the last ' · ', minus any trailing
+            # ` (phase N)` suffix the serializer appended.
+            title = line.split(" · ", 2)[-1]
+            if title.endswith(")") and " (phase " in title:
+                title = title[: title.rindex(" (phase ")]
+            return title
+    return ""
+
+
+# --- effective finding state (the fold) ----------------------------------
+
+
+def _record_state(e: JournalEntry) -> EffectiveFindingState | None:
+    """What one resolution record says about the finding it names: the token
+    carried states first (they are written as `state=open`), then `state`."""
+    if e.tracked_by is not None:
+        return "deferred"
+    if e.out_of_scope:
+        return "out-of-scope"
+    return e.state
+
+
+def effective_finding_states(entries: list[JournalEntry]) -> dict[str, EffectiveFindingState]:
+    """Each finding id → the state its LAST record gives it (spec §3.G.1).
+
+    A *record* for a finding is either the finding entry itself or a later
+    resolution record naming it through `resolves`. Entries arrive in file
+    order, which for an append-only journal is chronological, so the fold is a
+    left-to-right overwrite: resolved, then re-opened by a later record, reads
+    open again.
+
+    A record carrying `resolves` speaks about the finding it names and NOT
+    about itself — otherwise resolving one finding would open a new one — so it
+    never contributes its own id to the map. A record naming an id that has no
+    entry still folds (a hand-spliced journal must not crash the gate);
+    `fr journal resolve` refuses to write one.
+
+    A journal with no resolution records — every journal written before this
+    existed — folds to exactly each finding's own `state`.
+
+    A deferral (an `open` record with `tracked_by`) folds to `deferred`: not
+    open, so the gate passes; not fixed or refuted, so nothing claims the work
+    was done or the finding was wrong. A later record still wins.
+    An out-of-scope record (an `open` record with `out_of_scope`) folds to
+    `out-of-scope` the same way, and for the same reasons.
+    """
+    return _fold(entries)[0]
+
+
+def finding_states_and_reopens(
+    entries: list[JournalEntry],
+) -> tuple[dict[str, EffectiveFindingState], list[str]]:
+    """`(effective states, ids re-opened along the way)` from the ONE fold: a
+    finding is re-opened when a record says `open` for a finding whose
+    effective state at that point was closed (fixed, refuted, deferred or
+    out-of-scope). In first-reopen order, each id once."""
+    states, _flagged, reopened = _fold_full(entries)
+    return states, reopened
+
+
+def _fold(
+    entries: list[JournalEntry],
+) -> tuple[dict[str, EffectiveFindingState], list[str]]:
+    states, flagged, _reopened = _fold_full(entries)
+    return states, flagged
+
+
+def _fold_full(
+    entries: list[JournalEntry],
+) -> tuple[dict[str, EffectiveFindingState], list[str], list[str]]:
+    """The ONE walk over a journal's finding records: (effective states,
+    unauthorized fixes). Both public readers are projections of it, so the
+    state a gate sees and the guard on how it got there cannot disagree about
+    which record came last. Every write path lands here equally — `fr journal
+    resolve`, `fr journal add --resolves`, or a hand edit.
+    """
+    states: dict[str, EffectiveFindingState] = {}
+    flagged: dict[str, None] = {}  # insertion-ordered set
+    reopened: dict[str, None] = {}
+    for e in entries:
+        if e.resolves is None:
+            if e.kind == "finding" and e.state is not None:
+                states[e.id] = e.state
+            continue
+        fid = e.resolves
+        new = _record_state(e)
+        if new is None:
+            continue
+        if new != "fixed" or e.answered_by == "operator":
+            flagged.pop(fid, None)
+        elif states.get(fid) == "out-of-scope":
+            flagged[fid] = None
+        if new == "open" and states.get(fid, "open") != "open":
+            reopened[fid] = None
+        states[fid] = new
+    return states, list(flagged), list(reopened)
+
+
+def unauthorized_fixes(entries: list[JournalEntry]) -> list[str]:
+    """Findings claimed `fixed` out of an effective `out-of-scope` without the
+    operator, in the order the claim was made (spec 2026-09-24 §A).
+
+    Out-of-scope says the orchestrator judged the work not this change's;
+    fixing it anyway puts that work back into the change — the scope ratchet
+    the state exists to stop — so only the operator may. The rule sits in the
+    FOLD, not the write path, because two verbs write resolution records
+    (`fr journal resolve` and `fr journal add --resolves`) and a hand edit is a
+    third; `fr journal check` and the review-phase findings gate both read it.
+
+    The journal is append-only, so an unauthorized fix is cured by a later
+    `fixed` record carrying `answered_by=operator`, and cleared by any record
+    that moves the finding off `fixed`.
+    """
+    return _fold(entries)[1]
+
+
+def open_finding_ids(entries: list[JournalEntry]) -> list[str]:
+    """Findings whose EFFECTIVE state is open, in first-appearance order.
+
+    First-appearance, not resolution order, so the gate's message stays stable
+    as records accumulate.
+    """
+    states = effective_finding_states(entries)
+    owed = _owed_ids(entries)
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for e in entries:
+        if e.kind != "finding":
+            continue
+        fid = e.resolves if e.resolves is not None else e.id
+        if fid in seen or fid in owed:
+            continue
+        seen.add(fid)
+        if states.get(fid) == "open":
+            ordered.append(fid)
+    return ordered
+
+
+def _owed_ids(entries: list[JournalEntry]) -> set[str]:
+    return {e.id for e in entries if e.kind == "owed"}
+
+
+def open_owed_ids(entries: list[JournalEntry]) -> list[str]:
+    """`owed` entries still owed, in file order (spec §E, R20).
+
+    The sibling of `open_finding_ids`, over the SAME fold: a resolution record
+    naming an owed entry speaks about it exactly as one naming a finding does,
+    so `fixed` (discharged) closes it and an `open` record carrying `filed_as`
+    leaves it owed. An owed entry no record names is owed.
+    """
+    states = effective_finding_states(entries)
+    return [
+        e.id
+        for e in entries
+        if e.kind == "owed" and e.resolves is None and states.get(e.id, "open") == "open"
+    ]
+
+
+def owed_filed_as(entries: list[JournalEntry]) -> dict[str, str]:
+    """Owed id -> the issue its LAST `filed_as` record names."""
+    owed = _owed_ids(entries)
+    refs: dict[str, str] = {}
+    for e in entries:
+        if e.resolves in owed and e.filed_as is not None:
+            refs[e.resolves] = e.filed_as
+    return refs
+
+
+def owed_body(*, what: str, why: str, how: str, key: str) -> str:
+    """The body of an `owed` entry — one `key: value` line per field. Raises
+    `ValueError` on a key that is not one of the four owed-key shapes."""
+    if not OWED_KEY_RE.match(key):
+        raise ValueError(
+            f"owed key {key!r} is not spec:<slug>#step<n>, plan:<name>#p<n>, row:<id> "
+            "or issue:<owner/repo#n>"
+        )
+    values = {"what": what, "why": why, "how": how, "owed_key": key}
+    return "\n".join(f"{name}: {' '.join(values[name].split())}" for name in OWED_FIELDS)
+
+
+def owed_fields(entry: JournalEntry) -> dict[str, str]:
+    """The `owed_body` fields of an entry (missing ones absent)."""
+    found: dict[str, str] = {}
+    for line in entry.body.splitlines():
+        name, sep, value = line.partition(": ")
+        if sep and name in OWED_FIELDS and name not in found:
+            found[name] = value.strip()
+    return found
+
+
+def owed_key(entry: JournalEntry) -> str | None:
+    """The entry's owed key when it is well-formed, else `None`."""
+    key = owed_fields(entry).get("owed_key")
+    return key if key and OWED_KEY_RE.match(key) else None
+
+
+def phase_finding_states(
+    entries: list[JournalEntry], phase: int
+) -> dict[str, EffectiveFindingState]:
+    """Every finding FILED AGAINST `phase` -> its effective state, in
+    first-appearance order.
+
+    The phase is the ORIGINAL entry's, never a resolution record's: a record
+    speaks about the finding it names, and `fr journal resolve` does not ask
+    for a phase. The state is the same fold `fr journal check` gates on
+    (`effective_finding_states`), so `fr run resolve`'s `findings` obligation
+    and the end-of-run gate cannot disagree about what "open" means — one rule,
+    two moments.
+
+    A finding filed with no phase (`--global`) belongs to no review, so it is
+    in no phase's map. It stays `fr journal check`'s business.
+    """
+    states = effective_finding_states(entries)
+    return {
+        e.id: states[e.id]
+        for e in entries
+        if e.kind == "finding" and e.resolves is None and e.phase == phase and e.id in states
+    }
+
+
+def append_journal_entry(path: Path, slug: str, entry: JournalEntry) -> None:
+    """The ONE writer — `fr journal add`, `fr journal resolve`, and any test
+    fixture built through `fr.test_support.build_plan_journal` all land here,
+    so none of them can disagree about separators, the file header, or the
+    serialized shape. A test fixture built by calling this (rather than
+    formatting Markdown by hand) is a CAPTURE of the real serializer's
+    output, not a guess that can drift from it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(appended_journal_text(path.read_text() if path.exists() else None, slug, entry))
+
+
+def appended_journal_text(prior: str | None, slug: str, entry: JournalEntry) -> str:
+    """The text a journal holds after `entry` is appended to `prior` (`None`
+    = no file yet) — the in-memory half of `append_journal_entry`, which the
+    step-record engine uses to build every write before any byte moves."""
+    block = serialize_entry(entry)
+    if prior is None:
+        return f"{journal_header(slug)}\n{block}"
+    if entry.kind == "owed":
+        prior = _at_owed_stamp(prior)
+    sep = "" if prior.endswith("\n\n") else ("\n" if prior.endswith("\n") else "\n\n")
+    return prior + sep + block
+
+
+def _at_owed_stamp(text: str) -> str:
+    """`text` stamped at the journal kind's current version when it is stamped
+    below it (review p3-r7): an `owed` entry needs journal schema 2, and an
+    archived journal is never migrated, so the write that adds one stamps it —
+    in the same write, never a second one."""
+    from fr.artifacts.registry import (
+        _journal_stamp_line,
+        _journal_stamp_match,
+        artifact_kind,
+    )
+
+    current = artifact_kind("journal").current_version
+    m = _journal_stamp_match(text)
+    if m is not None:
+        if int(m.group(1)) >= current:
+            return text
+        return text[: m.start()] + _journal_stamp_line(current) + text[m.end() :]
+    return _journal_stamp_line(current) + "\n" + text
+
+
+def journal_header(slug: str) -> str:
+    """A NEW journal's first lines: the stamp at the journal kind's current
+    version, then the title. A journal fr creates is written for the fr that
+    creates it — unstamped it would read as version 1 and be stale on arrival."""
+    from fr.artifacts.registry import artifact_kind
+
+    version = artifact_kind("journal").current_version
+    return f"<!-- fr:journal-schema={version} -->\n# Journal: {slug}\n"
+
+
+def resolution_record_id(finding_id: str, taken: set[str]) -> str:
+    """`<finding>-resolved`, then `-2`, `-3`… — predictable, and never a
+    duplicate id (which `fr validate artifacts` fails a journal for)."""
+    base = f"{finding_id}-resolved"
+    if base not in taken:
+        return base
+    n = 2
+    while f"{base}-{n}" in taken:
+        n += 1
+    return f"{base}-{n}"
+
+
+_CARRIED_OPEN = frozenset({"deferred", "out-of-scope"})
+"""Resolution states written `state=open` plus a header token, so an older fr
+reads the finding as open (fail closed) rather than failing to parse."""
+
+
+def resolution_entry(
+    *,
+    target: JournalEntry,
+    scope: JournalScope,
+    taken: set[str],
+    created: str,
+    state: str,
+    body: str,
+    phase: int | None = None,
+    tracked_by: str | None = None,
+    answered_by: AnsweredBy | None = None,
+    filed_as: str | None = None,
+) -> JournalEntry:
+    """The resolution record that closes `target` — THE one builder, used by
+    the step-record engine (`fr journal resolve`, `resolves:`) and by `fr
+    archive`'s write-back, so the two cannot drift. Raises `ValueError` when
+    the combination is not a valid entry."""
+    return JournalEntry(
+        kind="finding",
+        scope=scope,
+        id=resolution_record_id(target.id, taken),
+        created=created,
+        phase=phase,
+        title=f"resolves {target.id}: {target.title}",
+        body=body,
+        state="open" if state in _CARRIED_OPEN else state,  # type: ignore[arg-type]
+        resolves=target.id,
+        tracked_by=tracked_by,
+        out_of_scope=state == "out-of-scope",
+        answered_by=answered_by,
+        filed_as=filed_as,
+    )
+
+
+def reviews_phase(entry: JournalEntry, phase: int) -> bool:
+    """Is `entry` a recorded review OF `phase`? (spec §B)
+
+    **The one predicate, and there must never be a second.** Two gates read
+    it: gh#517's `fr journal check --require-reviews` (via `reviewed_phases`
+    below, for a plan with no run cursor) and the evidence gate on
+    `fr run resolve --state done` (for a plan that has one,
+    2026-09-20-unit-record-unification §4.E). A second spelling of "reviewed"
+    is how a `finding` comes to satisfy one gate and not the other — and then
+    "review skipped" and "review passed clean" are the same state again, with
+    extra steps, which is gh#430 verbatim.
+
+    An entry "names" a phase only through `phase=N`: a `review` entry with no
+    `phase` does not count toward ANY phase, and a non-`review` entry (a
+    `finding`, even one tagged with the same `phase=N`) does not count either,
+    however closely findings and reviews are related. This is deliberately
+    narrower than "any activity happened during phase N" — this repo's own
+    journals carry 5 unphased plan-scope `review` entries (spec §B, D2's
+    evidence), predating the `--phase` convention; treating them as blanket
+    cover would let one undated review satisfy every phase a plan ever grows,
+    which is the exact hole these gates exist to close.
+    """
+    return entry.kind == "review" and entry.phase == phase
+
+
+def reviewed_phases(entries: list[JournalEntry]) -> set[int]:
+    """Phase numbers that already have a recorded review (spec §B).
+
+    The fold of `reviews_phase` over `entries` — it holds no rule of its own,
+    so the gate that asks "which phases are reviewed?" and the gate that asks
+    "is THIS entry a review of phase N?" cannot answer differently.
+    """
+    return {e.phase for e in entries if e.phase is not None and reviews_phase(e, e.phase)}
+
+
+def _handoff_line(entry: JournalEntry, effective_state: str | None = None) -> str:
+    """One-line collapse of an entry: id, kind, state, title, phase.
+
+    `effective_state` overrides the entry's OWN state for display. A journal is
+    an append-only log, so each record correctly states what was true when it
+    was written and `serialize_entry` must keep printing that — but a handoff
+    reports CURRENT state, and a finding written `open` that a later record
+    closed is not open now. Showing the entry's own field there tells a phase-6
+    executor to chase ten bugs that no longer exist, which is the cost this
+    whole bound exists to remove (super-fr#464). Defaults to the entry's own
+    state so non-finding callers are unaffected.
+    """
+    state = entry.state if effective_state is None else effective_state
+    state_bit = f" [{state}]" if state is not None else ""
+    phase_bit = f" (phase {entry.phase})" if entry.phase is not None else " (unphased)"
+    return f"- {entry.id} · {entry.kind}{state_bit} · {entry.title}{phase_bit}"
+
+
+def compose_handoff(
+    entries: list[JournalEntry],
+    *,
+    phase: int,
+    scope: str,
+    slug: str,
+    depends_on: tuple[int, ...] = (),
+) -> str:
+    """Compose the curated executor handoff for `phase` from parsed `entries`.
+
+    **State first, then dependency** — a three-way decision, in this order:
+
+    1. a finding whose EFFECTIVE state is open renders in full, wherever it is
+       tagged: it is actionable anywhere;
+    2. any other finding — effectively `fixed` or `refuted` — collapses to one
+       line, *regardless of phase*: no phase relationship makes a closed bug
+       actionable again. A resolution record collapses with it, with ONE
+       exception: a record that RE-OPENS its target renders in full, because
+       there the "it is history" rationale is simply false and collapsing it
+       drops the only text saying why the finding is live again;
+    3. every non-finding kind (decisions, discoveries, reviews, and the
+       debug-scope kinds) keeps the dependency rule: it renders in full when
+       untagged or tagged to this phase or one it depends on, and collapses
+       otherwise.
+
+    Rule 2 running *ahead of* the dependency test is the bound. Before it, state
+    only routed a finding into `## Open findings`; past that, `{phase,
+    *depends_on}` decided, so a `fixed` finding on a dependency phase rendered
+    in full — and real plans depend on their predecessors, so the old
+    docstring's "a phase-10 executor stops re-reading 39 fixed findings in full"
+    held only for the non-dependency ones. Measured on a real SEVEN-phase
+    journal (the category breakdown is spec §5.A3; §2 has the size-by-phase
+    table), that left 38,020 chars across 30 closed findings inside phase 6's
+    83,132-char handoff, describing bugs that no longer existed — the measured
+    saving is 34,022. Now a closed entry costs O(1) characters however long its
+    body is.
+
+    The collapsed line reports the entry's EFFECTIVE state, not the state its
+    own record carries. The journal is an append-only log, so a record rightly
+    says what was true when it was written; a handoff reports what is true now.
+
+    Decisions and discoveries stay dependency-scoped deliberately: a decision is
+    never "closed" — it still constrains the phase that depends on it — and a
+    discovery is a trap paid for once. Only findings have a lifecycle that makes
+    them historical, so only findings collapse on state.
+
+    Handoff size still GROWS with phase number, and that is not a bug to fix
+    later (spec §5.A3): what remains is decisions and discoveries a later phase
+    genuinely needs, and dropping them is the one failure the handoff contract
+    ("missing anything → STOP, do not guess") exists to prevent.
+
+    Empty sections are omitted; the raw-render pointer is always present, so the
+    full file is one command away.
+
+    Pure — no I/O. `fr journal handoff` resolves the journal and the plan's
+    `depends_on`, then calls this.
+    """
+    relevant = {phase, *depends_on}
+    # EFFECTIVE state, not each entry's own: a finding resolved by a later
+    # record has stopped being actionable, and re-showing it in full is the
+    # noise the fold exists to remove. This is the same fold `fr journal check`
+    # gates on (`open_finding_ids`) — deliberately reused rather than
+    # reimplemented, so the handoff and the gate can never disagree about what
+    # is still open. The collapsed line keeps id, title, state and phase, so the
+    # handoff still says both what was found and what became of it.
+    still_open = set(open_finding_ids(entries))
+    # The FULL fold, not just its open subset: the collapsed line reports
+    # effective state, and `refuted` must survive as `refuted`. Reading
+    # `e.state` instead printed the record's own label, so a finding written
+    # `refuted` and later closed by a `fixed` resolution record still read
+    # `[refuted]` — the same defect the phase-2 review fixed in the
+    # open->fixed direction, which only looked fixed because the fallback
+    # happened to say `fixed`.
+    effective = effective_finding_states(entries)
+    open_findings: list[str] = []
+    context: list[str] = []
+    collapsed: list[str] = []
+    for e in entries:
+        section: list[str]
+        if e.kind == "finding":
+            # STATE first — this is the bound. An open finding is actionable
+            # anywhere; any other finding (fixed, refuted, or a resolution
+            # record) is history, and no phase relationship makes a closed bug
+            # actionable again. `relevant` is never consulted for a finding.
+            # A resolution record is history — UNLESS it re-opens. Re-opening
+            # is a first-class CLI path (`fr journal add --resolves <id>
+            # --state open`), and collapsing one drops the only text saying
+            # why the finding is actionable again, while the original report
+            # still renders in full labelled with its old state. So ask the
+            # fold about the finding this entry SPEAKS FOR: its target when it
+            # resolves one, itself otherwise. Still one fold, and still O(1)
+            # for closed entries, because a re-opened finding is by definition
+            # open.
+            speaks_for = e.resolves if e.resolves is not None else e.id
+            renders_full = speaks_for in still_open
+            section = open_findings
+        else:
+            # Dependency rule, deliberately unchanged: decisions and
+            # discoveries are never "closed" and carry forward value.
+            renders_full = e.phase is None or e.phase in relevant
+            section = context
+        if renders_full:
+            section.append(serialize_entry(e))
+        elif e.kind == "finding":
+            # Display the EFFECTIVE state: this entry reached the collapse
+            # branch, so the fold says it is closed whatever its own field
+            # reads. Ask the fold, never the record.
+            collapsed.append(_handoff_line(e, effective.get(e.id) or e.state))
+        else:
+            collapsed.append(_handoff_line(e))
+    parts = [f"# Handoff (phase {phase})"]
+    if open_findings:
+        parts.append("## Open findings\n\n" + "\n".join(open_findings))
+    if context:
+        parts.append("## Relevant context\n\n" + "\n".join(context))
+    if collapsed:
+        parts.append("## Earlier history\n\n" + "\n".join(collapsed))
+    parts.append(
+        f"## Full journal\n\nRaw render: `fr journal render --scope {scope} --slug {slug}`"
+    )
+    return "\n\n".join(parts) + "\n"

@@ -1,0 +1,760 @@
+"""Tests for vk.gh — subprocess wrappers for gh CLI operations.
+
+These are contract tests: they verify the correct gh invocations
+are constructed, using mocked subprocess calls.
+"""
+
+import os
+import subprocess
+import time
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+from fr import gh
+from fr.gh import (
+    GhError,
+    auth_status,
+    close_issue,
+    create_issue,
+    edit_issue_body,
+    ensure_label,
+)
+
+
+class TestCreateIssue:
+    def test_basic_creation(self) -> None:
+        with patch("fr.gh._run_gh", return_value="https://github.com/org/repo/issues/42") as mock:
+            url = create_issue(
+                repo="org/repo",
+                title="Phase 1: Setup",
+                body="Implementation plan body.",
+                labels=["fr:ready"],
+            )
+            assert url == "https://github.com/org/repo/issues/42"
+            mock.assert_called_once_with(
+                [
+                    "issue",
+                    "create",
+                    "--repo",
+                    "org/repo",
+                    "--title",
+                    "Phase 1: Setup",
+                    "--body",
+                    "Implementation plan body.",
+                    "--label",
+                    "fr:ready",
+                ]
+            )
+
+    def test_multiple_labels(self) -> None:
+        with patch("fr.gh._run_gh", return_value="https://github.com/org/repo/issues/43") as mock:
+            create_issue(
+                repo="org/repo",
+                title="Task",
+                body="Body.",
+                labels=["fr:ready", "manual"],
+            )
+            args = mock.call_args[0][0]
+            assert args.count("--label") == 2
+
+    def test_no_labels(self) -> None:
+        with patch("fr.gh._run_gh", return_value="url") as mock:
+            create_issue(repo="org/repo", title="T", body="B", labels=[])
+            args = mock.call_args[0][0]
+            assert "--label" not in args
+
+
+class TestCloseIssue:
+    def test_close(self) -> None:
+        with patch("fr.gh._run_gh") as mock:
+            close_issue(repo="org/repo", number=42)
+            mock.assert_called_once_with(
+                [
+                    "issue",
+                    "close",
+                    "--repo",
+                    "org/repo",
+                    "42",
+                ]
+            )
+
+
+class TestEditIssueBody:
+    def test_edit_body_calls_gh(self) -> None:
+        with patch("fr.gh._run_gh") as mock:
+            edit_issue_body(repo="org/repo", number=42, body="New body content.")
+            mock.assert_called_once_with(
+                ["issue", "edit", "42", "--repo", "org/repo", "--body", "New body content."]
+            )
+
+    def test_edit_body_propagates_gh_error(self) -> None:
+        with patch("fr.gh._run_gh", side_effect=GhError("rate limited")):
+            with pytest.raises(GhError, match="rate limited"):
+                edit_issue_body(repo="org/repo", number=42, body="body")
+
+
+class TestAuthStatus:
+    def test_authenticated(self) -> None:
+        with patch("fr.gh._run_gh", return_value="github.com\n  Logged in") as mock:
+            result = auth_status()
+            assert result is True
+            mock.assert_called_once_with(["auth", "status"])
+
+    def test_not_authenticated(self) -> None:
+        with patch(
+            "fr.gh._run_gh",
+            side_effect=GhError("not logged in"),
+        ):
+            result = auth_status()
+            assert result is False
+
+
+class TestRunGhError:
+    def test_subprocess_error_raises_gh_error(self) -> None:
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.CalledProcessError(1, "gh", stderr="fail"),
+        ):
+            with pytest.raises(GhError):
+                create_issue(repo="org/repo", title="T", body="B", labels=[])
+
+
+class TestEnsureLabel:
+    """`ensure_label` creates a label via `gh label create --force`, which
+    is idempotent: creates if missing, updates color/description if present.
+    Without this, `vk dispatch` fails hard on any repo that doesn't already
+    have `vk-ready`, `manual`, `plan:<slug>`, `phase:<n>` — which was the
+    silent-partial-dispatch failure mode on content-factory and kid-laptops.
+    """
+
+    def test_calls_gh_label_create_with_force(self) -> None:
+        with patch("fr.gh._run_gh") as mock:
+            ensure_label(repo="org/repo", name="fr:ready")
+            mock.assert_called_once()
+            args = mock.call_args[0][0]
+            assert args[:3] == ["label", "create", "fr:ready"]
+            assert "--force" in args
+            assert "--repo" in args
+            assert "org/repo" in args
+            assert "--color" in args  # a default color is always supplied
+
+    def test_includes_description_when_given(self) -> None:
+        with patch("fr.gh._run_gh") as mock:
+            ensure_label(
+                repo="org/repo",
+                name="fr:ready",
+                description="Ready for VK pickup",
+            )
+            args = mock.call_args[0][0]
+            assert "--description" in args
+            assert "Ready for VK pickup" in args
+
+    def test_omits_description_by_default(self) -> None:
+        with patch("fr.gh._run_gh") as mock:
+            ensure_label(repo="org/repo", name="fr:ready")
+            args = mock.call_args[0][0]
+            assert "--description" not in args
+
+    def test_propagates_gh_error(self) -> None:
+        with patch("fr.gh._run_gh", side_effect=GhError("permission denied")):
+            with pytest.raises(GhError, match="permission denied"):
+                ensure_label(repo="org/repo", name="fr:ready")
+
+
+class TestEnsureLabels:
+    def test_calls_ensure_label_per_def_with_color_and_desc(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fr.labels import LabelDef
+
+        captured: list[dict[str, str]] = []
+
+        def fake_ensure(
+            *, repo: str, name: str, color: str = "ededed", description: str = ""
+        ) -> None:
+            captured.append(
+                {"repo": repo, "name": name, "color": color, "description": description}
+            )
+
+        monkeypatch.setattr(gh, "ensure_label", fake_ensure)
+        defs = [
+            LabelDef("fr:ready", "0E8AE6", "queued"),
+            LabelDef("phase:1", "FBCA04", "phase 1"),
+        ]
+        gh.ensure_labels(repo="o/r", labels=defs)
+        assert captured == [
+            {"repo": "o/r", "name": "fr:ready", "color": "0E8AE6", "description": "queued"},
+            {"repo": "o/r", "name": "phase:1", "color": "FBCA04", "description": "phase 1"},
+        ]
+
+    def test_empty_list_is_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        called = {"n": 0}
+
+        def fake_ensure(**kw: object) -> None:
+            called["n"] += 1
+
+        monkeypatch.setattr(gh, "ensure_label", fake_ensure)
+        gh.ensure_labels(repo="o/r", labels=[])
+        assert called["n"] == 0
+
+    def test_first_failure_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from fr.labels import LabelDef
+
+        seen: list[str] = []
+
+        def fake_ensure(
+            *, repo: str, name: str, color: str = "ededed", description: str = ""
+        ) -> None:
+            seen.append(name)
+            if name == "phase:1":
+                raise gh.GhError("nope", stderr="", returncode=1)
+
+        monkeypatch.setattr(gh, "ensure_label", fake_ensure)
+        defs = [
+            LabelDef("fr:ready", "0E8AE6", ""),
+            LabelDef("phase:1", "FBCA04", ""),
+            LabelDef("phase:2", "FBCA04", ""),
+        ]
+        with pytest.raises(gh.GhError):
+            gh.ensure_labels(repo="o/r", labels=defs)
+        assert seen == ["fr:ready", "phase:1"]  # third never reached
+
+
+class TestGhErrorFields:
+    def test_default_stderr_and_returncode(self) -> None:
+        err = gh.GhError("boom")
+        assert err.stderr == ""
+        assert err.returncode == 0
+        assert str(err) == "boom"
+
+    def test_explicit_stderr_and_returncode(self) -> None:
+        err = gh.GhError("boom", stderr="HTTP 503\n", returncode=1)
+        assert err.stderr == "HTTP 503\n"
+        assert err.returncode == 1
+        assert str(err) == "boom"
+
+    def test_run_gh_populates_fields_on_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fake_run(*a, **kw):  # type: ignore[no-untyped-def]
+            raise subprocess.CalledProcessError(
+                returncode=1, cmd=["gh"], output="", stderr="HTTP 403\n"
+            )
+
+        monkeypatch.setattr(gh.subprocess, "run", fake_run)
+        with pytest.raises(gh.GhError) as exc_info:
+            gh._run_gh(["api", "user"])
+        assert exc_info.value.stderr == "HTTP 403\n"
+        assert exc_info.value.returncode == 1
+
+    def test_run_gh_falls_back_to_returncode_message_when_stderr_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # When the subprocess fails with empty stderr (e.g. crash, signal),
+        # _run_gh synthesises a message from the returncode and leaves
+        # GhError.stderr as "" rather than None.
+        def fake_run(*a, **kw):  # type: ignore[no-untyped-def]
+            raise subprocess.CalledProcessError(returncode=2, cmd=["gh"], output="", stderr=None)
+
+        monkeypatch.setattr(gh.subprocess, "run", fake_run)
+        with pytest.raises(gh.GhError) as exc_info:
+            gh._run_gh(["api", "user"])
+        assert str(exc_info.value) == "gh exited with code 2"
+        assert exc_info.value.stderr == ""
+        assert exc_info.value.returncode == 2
+
+
+class TestSwapIssueLabels:
+    def test_emits_add_and_remove_flags(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: list[list[str]] = []
+
+        def fake_run(args: list[str]) -> str:
+            captured.append(args)
+            return ""
+
+        monkeypatch.setattr(gh, "_run_gh", fake_run)
+        gh.swap_issue_labels(
+            repo="o/r",
+            number=42,
+            add=["pr-ready"],
+            remove=["in-progress", "fr:ready"],
+        )
+        assert captured == [
+            [
+                "issue",
+                "edit",
+                "42",
+                "--repo",
+                "o/r",
+                "--add-label",
+                "pr-ready",
+                "--remove-label",
+                "in-progress",
+                "--remove-label",
+                "fr:ready",
+            ]
+        ]
+
+    def test_empty_add_and_remove_is_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: list[list[str]] = []
+        monkeypatch.setattr(
+            gh,
+            "_run_gh",
+            lambda args: captured.append(args) or "",
+        )
+        gh.swap_issue_labels(repo="o/r", number=42, add=[], remove=[])
+        assert captured == []
+
+    def test_propagates_gh_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fake_run(args: list[str]) -> str:
+            raise gh.GhError("HTTP 404", stderr="HTTP 404\n", returncode=1)
+
+        monkeypatch.setattr(gh, "_run_gh", fake_run)
+        with pytest.raises(gh.GhError):
+            gh.swap_issue_labels(repo="o/r", number=42, add=["x"], remove=[])
+
+
+class TestListLabels:
+    def test_returns_parsed_label_objects(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import json
+
+        captured: list[list] = []
+
+        def fake(args: list) -> str:
+            captured.append(args)
+            return json.dumps(
+                [
+                    {"name": "fr:ready", "color": "0E8AE6", "description": "queued"},
+                    {"name": "bug", "color": "d73a4a", "description": "Something's wrong"},
+                ]
+            )
+
+        monkeypatch.setattr(gh, "_run_gh", fake)
+        labels = gh.list_labels(repo="o/r")
+        assert labels[0]["name"] == "fr:ready"
+        assert labels[0]["color"] == "0E8AE6"
+        assert labels[1]["name"] == "bug"
+        assert captured[0] == [
+            "label",
+            "list",
+            "--repo",
+            "o/r",
+            "--json",
+            "name,color,description",
+            "--limit",
+            "200",
+        ]
+
+
+class TestListRepos:
+    def test_returns_non_archived_repos(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import json
+
+        captured: list[list] = []
+
+        def fake(args: list) -> str:
+            captured.append(args)
+            return json.dumps(
+                [
+                    {"name": "frank", "isArchived": False},
+                    {"name": "old-repo", "isArchived": True},
+                    {"name": "willikins", "isArchived": False},
+                ]
+            )
+
+        monkeypatch.setattr(gh, "_run_gh", fake)
+        repos = gh.list_repos(owner="derio-net")
+        assert [r["name"] for r in repos] == ["frank", "willikins"]
+        assert captured[0] == [
+            "repo",
+            "list",
+            "derio-net",
+            "--json",
+            "name,isArchived,visibility",  # visibility: cloud-triage p3-r9
+            "--limit",
+            "200",
+        ]
+
+    def test_includes_repo_missing_is_archived_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Repos missing `isArchived` should be included (treated as non-archived)."""
+        import json
+
+        monkeypatch.setattr(gh, "_run_gh", lambda args: json.dumps([{"name": "mystery"}]))
+        repos = gh.list_repos(owner="derio-net")
+        assert [r["name"] for r in repos] == ["mystery"]
+
+    def test_limit_and_archived_are_selectable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """fr triage needs the RAW count to detect a full list (review r-p1-repo-cap)."""
+        import json
+
+        captured: list[list] = []
+
+        def fake(args: list) -> str:
+            captured.append(args)
+            return json.dumps(
+                [{"name": "a", "isArchived": False}, {"name": "b", "isArchived": True}]
+            )
+
+        monkeypatch.setattr(gh, "_run_gh", fake)
+        repos = gh.list_repos(owner="derio-net", limit=500, include_archived=True)
+        assert [r["name"] for r in repos] == ["a", "b"]
+        assert captured[0][-2:] == ["--limit", "500"]
+
+
+class TestViewIssue:
+    def test_asks_for_the_fields_a_closed_triage_row_needs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Shared --json list: fields are only ever ADDED (review r-p1-view-fields)."""
+        import json
+
+        captured: list[list] = []
+
+        def fake(args: list) -> str:
+            captured.append(args)
+            return json.dumps({"number": 7, "state": "CLOSED"})
+
+        monkeypatch.setattr(gh, "_run_gh", fake)
+        gh.view_issue("o/r", 7)
+        fields = set(captured[0][captured[0].index("--json") + 1].split(","))
+        assert {"title", "body", "labels", "state"} <= fields  # the original four stay
+        assert {"number", "url", "closedAt"} <= fields
+
+
+class TestDeleteLabel:
+    def test_emits_delete_yes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: list[list] = []
+        monkeypatch.setattr(gh, "_run_gh", lambda args: captured.append(args) or "")
+        gh.delete_label(repo="o/r", name="bug")
+        assert captured == [
+            [
+                "label",
+                "delete",
+                "bug",
+                "--repo",
+                "o/r",
+                "--yes",
+            ]
+        ]
+
+
+class TestIsTransient:
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            "HTTP 500: server error",
+            "HTTP 502 Bad Gateway",
+            "HTTP 503: temporarily unavailable",
+            "could not resolve host: api.github.com",
+            "connection reset by peer",
+            "connection refused",
+            "i/o timeout",
+        ],
+    )
+    def test_returns_true_for_transient(self, stderr: str) -> None:
+        err = gh.GhError("x", stderr=stderr, returncode=1)
+        assert gh.is_transient(err)
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            "HTTP 401: Bad credentials",
+            "HTTP 403: forbidden",
+            "HTTP 404: not found",
+            "validation failed",
+            "label already exists",
+            "",
+        ],
+    )
+    def test_returns_false_for_permanent(self, stderr: str) -> None:
+        err = gh.GhError("x", stderr=stderr, returncode=1)
+        assert not gh.is_transient(err)
+
+
+class TestWithRetry:
+    def test_succeeds_first_try(self) -> None:
+        calls = {"n": 0}
+
+        def op() -> str:
+            calls["n"] += 1
+            return "ok"
+
+        assert gh.with_retry(op) == "ok"
+        assert calls["n"] == 1
+
+    def test_retries_transient_then_succeeds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        slept: list[float] = []
+        monkeypatch.setattr(gh.time, "sleep", lambda s: slept.append(s))
+        attempts = {"n": 0}
+
+        def op() -> str:
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise gh.GhError("x", stderr="HTTP 503", returncode=1)
+            return "ok"
+
+        assert gh.with_retry(op) == "ok"
+        assert attempts["n"] == 3
+        assert slept == [1.0, 2.0]  # backoff before attempts 2 and 3
+
+    def test_gives_up_after_max_attempts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(gh.time, "sleep", lambda s: None)
+
+        def op() -> str:
+            raise gh.GhError("x", stderr="HTTP 503", returncode=1)
+
+        with pytest.raises(gh.GhError):
+            gh.with_retry(op)
+
+    def test_no_retry_on_permanent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        slept: list[float] = []
+        monkeypatch.setattr(gh.time, "sleep", lambda s: slept.append(s))
+        attempts = {"n": 0}
+
+        def op() -> str:
+            attempts["n"] += 1
+            raise gh.GhError("x", stderr="HTTP 403", returncode=1)
+
+        with pytest.raises(gh.GhError):
+            gh.with_retry(op)
+        assert attempts["n"] == 1
+        assert slept == []
+
+    def test_rejects_max_attempts_below_one(self) -> None:
+        with pytest.raises(ValueError, match="max_attempts must be >= 1"):
+            gh.with_retry(lambda: "x", max_attempts=0)
+
+    def test_rejects_backoff_shorter_than_required(self) -> None:
+        # max_attempts=4 needs at least 3 backoff entries; only 2 supplied.
+        with pytest.raises(ValueError, match="backoff_seconds has 2"):
+            gh.with_retry(lambda: "x", max_attempts=4, backoff_seconds=(1.0, 2.0))
+
+    def test_accepts_backoff_exactly_max_minus_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # max_attempts=3 with 2-entry backoff is the minimum-sized config.
+        monkeypatch.setattr(gh.time, "sleep", lambda s: None)
+        assert gh.with_retry(lambda: "ok", max_attempts=3, backoff_seconds=(1.0, 2.0)) == "ok"
+
+
+class TestCountIssuesWithLabel:
+    def test_returns_count(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import json
+
+        captured: list[list[str]] = []
+
+        def fake(args: list[str]) -> str:
+            captured.append(args)
+            return json.dumps([{"id": 1}, {"id": 2}, {"id": 3}])
+
+        monkeypatch.setattr(gh, "_run_gh", fake)
+        n = gh.count_issues_with_label(repo="o/r", name="bug")
+        assert n == 3
+        assert captured[0] == [
+            "issue",
+            "list",
+            "--repo",
+            "o/r",
+            "--label",
+            "bug",
+            "--state",
+            "all",
+            "--json",
+            "id",
+            "--limit",
+            "1000",
+        ]
+
+    def test_empty_returns_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(gh, "_run_gh", lambda args: "[]")
+        assert gh.count_issues_with_label(repo="o/r", name="bug") == 0
+
+
+class TestRunGhTimeout:
+    """gh#909: a stalled `gh` (a GraphQL call that never answers) must not block its
+    caller forever — the wave driver's loop sat 16 minutes on one."""
+
+    def test_a_stalled_gh_raises_a_transient_gh_error_within_the_timeout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stub = tmp_path / "gh"
+        stub.write_text("#!/bin/sh\nexec sleep 30\n", encoding="utf-8")
+        stub.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+        monkeypatch.setattr(gh, "GH_TIMEOUT_SECONDS", 0.5)
+        # A ten-page list gets more time (gh#1025), but the cap still bounds it.
+        monkeypatch.setattr(gh, "GH_LIST_TIMEOUT_CAP_SECONDS", 0.5)
+        started = time.monotonic()
+        with pytest.raises(gh.GhError) as exc_info:
+            gh._run_gh(["issue", "list", "--limit", "1000"])
+        assert time.monotonic() - started < 10
+        assert "timed out" in str(exc_info.value)
+        assert "gh issue list" in str(exc_info.value)
+        assert gh.is_transient(exc_info.value)
+
+    def test_every_call_is_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen: list[object] = []
+
+        def fake_run(*a, **kw):  # type: ignore[no-untyped-def]
+            seen.append(kw.get("timeout"))
+            return subprocess.CompletedProcess(a[0], 0, stdout="ok\n", stderr="")
+
+        monkeypatch.setattr(gh.subprocess, "run", fake_run)
+        assert gh._run_gh(["api", "user"]) == "ok"
+        assert seen == [gh.GH_TIMEOUT_SECONDS]
+        assert 0 < gh.GH_TIMEOUT_SECONDS <= 600
+
+    @pytest.mark.parametrize(
+        ("call", "kw"),
+        [
+            (gh.list_issues, {"repo": "o/r", "state": "all", "limit": 1000}),
+            (gh.list_prs, {"repo": "o/r", "state": "all", "limit": 1000}),
+            (gh.list_open_prs, {"repo": "o/r", "limit": 1000}),
+            (gh.list_repos, {"owner": "o", "limit": 1000}),
+        ],
+        ids=["issues", "prs", "open-prs", "repos"],
+    )
+    def test_a_big_paginated_list_gets_time_for_its_pages(
+        self, monkeypatch: pytest.MonkeyPatch, call: Any, kw: dict[str, Any]
+    ) -> None:
+        """gh#1025 (4): one `--limit 1000` call fetches ten pages; the single-call
+        bound would fail a list that is slow but legitimate on every pass."""
+        seen: list[object] = []
+
+        def fake_run(*a, **k):  # type: ignore[no-untyped-def]
+            seen.append(k.get("timeout"))
+            return subprocess.CompletedProcess(a[0], 0, stdout="[]\n", stderr="")
+
+        monkeypatch.setattr(gh.subprocess, "run", fake_run)
+        call(**kw)
+        (timeout,) = seen
+        assert isinstance(timeout, float)
+        assert gh.GH_TIMEOUT_SECONDS < timeout <= gh.GH_LIST_TIMEOUT_CAP_SECONDS
+
+    def test_a_small_list_keeps_the_one_call_bound(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen: list[object] = []
+
+        def fake_run(*a, **k):  # type: ignore[no-untyped-def]
+            seen.append(k.get("timeout"))
+            return subprocess.CompletedProcess(a[0], 0, stdout="[]\n", stderr="")
+
+        monkeypatch.setattr(gh.subprocess, "run", fake_run)
+        gh.list_issues(repo="o/r", state="open", limit=100)
+        assert seen == [gh.GH_TIMEOUT_SECONDS]
+
+    def test_the_list_bound_is_capped(self) -> None:
+        assert gh.list_timeout(10**6) == gh.GH_LIST_TIMEOUT_CAP_SECONDS <= 600
+
+
+# ---------------------------------------------------- conditional visibility (quota-pacing R12)
+
+_VIS_200 = (
+    'HTTP/2.0 200 OK\nContent-Type: application/json\nEtag: W/"v1"\n\n{"visibility": "private"}'
+)
+_VIS_304 = 'HTTP/2.0 304 Not Modified\nEtag: W/"v1"\n'
+
+
+class TestConditionalVisibility:
+    def _runner(self, answers):
+        seen: list[list[str]] = []
+
+        def run(argv: list[str]) -> str:
+            seen.append(argv)
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        return run, seen
+
+    def test_the_second_read_sends_the_first_etag_and_a_304_returns_its_answer(self):
+        from fr import gh
+
+        run, seen = self._runner([_VIS_200, GhError("gh: HTTP 304", stdout=_VIS_304, returncode=1)])
+        assert gh.repo_visibility(run, None, "o/r") == "private"
+        assert gh.repo_visibility(run, None, "o/r") == "private"
+        assert seen[0] == ["api", "-i", "repos/o/r"]
+        assert seen[1] == ["api", "-i", "-H", 'If-None-Match: W/"v1"', "repos/o/r"]
+
+    def test_a_200_updates_the_cached_answer(self):
+        from fr import gh
+
+        new = 'HTTP/2.0 200 OK\nEtag: W/"v2"\n\n{"private": false}'
+        run, seen = self._runner([_VIS_200, new, GhError("x", stdout=_VIS_304, returncode=1)])
+        assert gh.repo_visibility(run, None, "o/r") == "private"
+        assert gh.repo_visibility(run, None, "o/r") == "public"
+        assert gh.repo_visibility(run, None, "o/r") == "public"
+        assert seen[2][3] == 'If-None-Match: W/"v2"'
+
+    def test_an_error_raises_and_a_304_with_no_cache_raises(self):
+        from fr import gh
+
+        run, _ = self._runner([GhError("HTTP 500", stdout="HTTP/2.0 500 x\n", returncode=1)])
+        with pytest.raises(GhError):
+            gh.repo_visibility(run, None, "o/r")
+        run, _ = self._runner([GhError("x", stdout=_VIS_304, returncode=1)])
+        with pytest.raises(GhError):
+            gh.repo_visibility(run, None, "o/r")
+
+    def test_the_map_is_keyed_by_host_and_repo(self):
+        from fr import gh
+
+        run, seen = self._runner([_VIS_200, _VIS_200])
+        gh.repo_visibility(run, None, "o/r")
+        gh.repo_visibility(run, "ghe.example.com", "o/r")
+        assert seen[1] == ["api", "-i", "repos/o/r"]  # no ETag from the other host
+
+    def test_a_cached_etag_with_a_non_304_error_raises_and_keeps_the_entry(self):
+        from fr import gh
+
+        run, seen = self._runner(
+            [_VIS_200, GhError("HTTP 500", stdout="HTTP/2.0 500 x\n", returncode=1), _VIS_200]
+        )
+        gh.repo_visibility(run, None, "o/r")
+        with pytest.raises(GhError):
+            gh.repo_visibility(run, None, "o/r")
+        gh.repo_visibility(run, None, "o/r")
+        assert seen[2][3] == 'If-None-Match: W/"v1"'  # the entry survived the failure
+
+    def test_an_exit_0_304_with_a_cache_raises(self):
+        from fr import gh
+
+        run, _ = self._runner([_VIS_200, _VIS_304])
+        gh.repo_visibility(run, None, "o/r")
+        with pytest.raises(GhError):
+            gh.repo_visibility(run, None, "o/r")
+
+    @pytest.mark.parametrize(
+        "body", ["not json", '{"name": "x"}', '["visibility"]', '{"visibility": ""}']
+    )
+    def test_a_200_without_a_usable_visibility_raises(self, body):
+        from fr import gh
+
+        run, _ = self._runner([f'HTTP/2.0 200 OK\nEtag: W/"v1"\n\n{body}'])
+        with pytest.raises(GhError):
+            gh.repo_visibility(run, None, "o/r")
+
+    def test_a_200_with_no_etag_drops_the_entry_and_the_next_read_is_unconditional(self):
+        from fr import gh
+
+        bare = 'HTTP/2.0 200 OK\n\n{"visibility": "public"}'
+        run, seen = self._runner([_VIS_200, bare, _VIS_200])
+        gh.repo_visibility(run, None, "o/r")
+        assert gh.repo_visibility(run, None, "o/r") == "public"
+        gh.repo_visibility(run, None, "o/r")
+        assert seen[1][3] == 'If-None-Match: W/"v1"'
+        assert seen[2] == ["api", "-i", "repos/o/r"]
+
+    def test_a_status_less_body_answers_and_caches_nothing(self):
+        from fr import gh
+
+        run, seen = self._runner(['{"visibility": "internal"}', '{"visibility": "internal"}'])
+        assert gh.repo_visibility(run, None, "o/r") == "internal"
+        assert gh.repo_visibility(run, None, "o/r") == "internal"
+        assert seen[1] == ["api", "-i", "repos/o/r"]
+
+    def test_another_repo_on_the_same_host_carries_no_etag(self):
+        from fr import gh
+
+        run, seen = self._runner([_VIS_200, _VIS_200])
+        gh.repo_visibility(run, None, "o/r")
+        gh.repo_visibility(run, None, "o/other")
+        assert seen[1] == ["api", "-i", "repos/o/other"]

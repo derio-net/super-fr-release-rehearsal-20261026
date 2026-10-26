@@ -1,0 +1,219 @@
+"""Canonical label registry — single source of truth for label colors,
+descriptions, and dynamic templates. Consumed by `fr apply` (which calls
+`ensure_labels` on the target repo before it touches Issues).
+
+Color scheme (lifecycle gradient, board reads visually as a progression):
+  vk-ready     blue    queued for an agent to pick up
+  in-progress  orange  agent is actively working
+  pr-ready     green   PR is open, awaiting review
+
+manual is gray (human-only). vk-synced is olive (system metadata, set by
+the vk-issue-bridge). plan:<slug> is dark red (already in the wild,
+preserved for compat). phase:<n> is yellow (attribute, not state).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from dataclasses import dataclass
+
+_HEX_COLOR_RE = re.compile(r"^[0-9A-Fa-f]{6}$")
+
+# GitHub rejects label names longer than this with a 422 at create time (#249).
+MAX_LABEL_NAME_LEN = 50
+
+# Date prefix + ALL dashes that follow it. Frank's slug convention is
+# `YYYY-MM-DD--<layer>--<topic>` (double dash before the layer segment), so
+# stripping the date plus exactly one dash left a leading `-` on the label
+# (`spec:-auto--…`). Matching `-+` covers both single- and double-dash forms.
+_DATE_PREFIX_DASHES_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-+")
+
+
+def normalize_label_slug(slug: str) -> str:
+    """Strip a leading `YYYY-MM-DD-` date prefix (plus any extra dashes).
+
+    Single normalization point for slug-derived label names — both
+    `plan_label` and `spec_label` call it, so every consumer (renderer,
+    self-review lints) sees the same date-free, dash-clean shape:
+    `2026-05-27--auto--awx-deployment` → `auto--awx-deployment`. Slugs
+    without a date prefix pass through unchanged.
+    """
+    return _DATE_PREFIX_DASHES_RE.sub("", slug)
+
+
+@dataclass(frozen=True)
+class LabelDef:
+    name: str  # the GitHub label string
+    color: str  # 6-char hex without leading #
+    description: str  # surfaces in the GitHub UI
+
+    def __post_init__(self) -> None:
+        if not _HEX_COLOR_RE.match(self.color):
+            msg = f"LabelDef({self.name!r}): color {self.color!r} is not a 6-char hex string"
+            raise ValueError(msg)
+        # GitHub caps label names at 50 chars; a longer name 422s at
+        # `gh label create`. Fail loud here rather than at dispatch (#249).
+        # Slug-derived labels go through `_bounded_label_name`, so this guard
+        # only trips on a bug that bypasses it.
+        if len(self.name) > MAX_LABEL_NAME_LEN:
+            msg = (
+                f"LabelDef: name {self.name!r} is {len(self.name)} chars "
+                f"(max {MAX_LABEL_NAME_LEN}). Use _bounded_label_name for slug-derived labels."
+            )
+            raise ValueError(msg)
+
+
+def _bounded_label_name(prefix: str, value: str) -> str:
+    """Return `<prefix><value>` capped at GitHub's 50-char label limit.
+
+    When the full name fits, it's returned verbatim (no behavior change for
+    short slugs). When it would overflow, the value is truncated and a short
+    deterministic hash of the *full* value is appended so distinct long values
+    don't collide. The label is an opaque routing key for the bridge, so a
+    stable shortened form is fine — stable across runs because the hash is
+    content-derived (#249).
+    """
+    name = f"{prefix}{value}"
+    if len(name) <= MAX_LABEL_NAME_LEN:
+        return name
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:6]
+    # `max(0, …)` guards a pathologically long prefix making `keep` negative —
+    # `value[:negative]` slices from the END, silently producing an over-length
+    # label. Today only the 5-char `plan:`/`spec:` prefixes call this; the
+    # LabelDef.__post_init__ length guard is the loud backstop otherwise.
+    keep = max(0, MAX_LABEL_NAME_LEN - len(prefix) - 1 - len(digest))  # room for "-" + hash
+    # Final clamp makes the ≤50 invariant hold for ANY prefix (a no-op for the
+    # 5-char `plan:`/`spec:` callers, where the build is already exactly 50).
+    return f"{prefix}{value[:keep]}-{digest}"[:MAX_LABEL_NAME_LEN]
+
+
+# Queue lifecycle states (mutually exclusive — at most one on a given Issue).
+# v3 taxonomy (super-fr split): protocol-owned `fr:*` labels, projected ONLY
+# for phases that entered a runner queue (`fr apply --to <runner>`); plain
+# tracking issues carry no lifecycle label.
+FR_READY = LabelDef("fr:ready", "0E8AE6", "Queued for a runner to pick up")
+FR_BLOCKED = LabelDef(
+    "fr:blocked",
+    "aaaaaa",
+    "Blocked on dependency — waiting for predecessor phase(s) to complete",
+)
+MANUAL = LabelDef("manual", "BFBFBF", "Human-only; not routable to an agent")
+FR_IN_PROGRESS = LabelDef("fr:in-progress", "D93F0B", "An agent is actively working on this")
+FR_PR_READY = LabelDef("fr:pr-ready", "0E8A16", "PR is open; awaiting review")
+
+# A triage scope's claim on an issue (spec 2026-10-06-triage-claims §3.C): the label
+# beside a hidden marker comment naming the signer. Not a queue marker: it says which
+# scope may act on the issue, not that a runner holds it.
+FR_CLAIMED = LabelDef("fr:claimed", "5319E7", "Claimed by a triage scope; others keep hands off")
+
+# Protocol-owned idempotency marker — set after the runner accepted the
+# phase ("already handed to a runner, don't re-dispatch").
+FR_SYNCED = LabelDef("fr:synced", "6A630D", "Handed to the runner")
+
+# An issue whose fix has merged but whose post-merge acceptance row still waits
+# for its walk (spec 2026-10-06-verification-strategies §F, R17). Not a queue
+# marker: triage keeps it out of the ranked backlog, nothing dispatches on it.
+FR_AWAITING_LIVE = LabelDef(
+    "fr:awaiting-live",
+    "FBCA04",
+    "Merged; a post-merge acceptance row still awaits its live walk",
+)
+
+# An operator action that is owed (spec 2026-10-11-debt-engine R16, R21): a Test
+# Plan step recorded `owed`, or a manual phase holding a plan. Filed by `fr
+# archive`, closed by `fr journal resolve --state fixed`. Not a queue marker:
+# triage keeps it out of the ranked backlog, nothing dispatches on it.
+FR_OWED = LabelDef("fr:owed", "C5DEF5", "An operator action is owed (fr archive filed it)")
+
+# The operator's merge approval on a batch PR (spec 2026-10-11-merge-train-safety §A, R1):
+# every fr merge path merges only a PR carrying it at a head fr recorded. Never set by fr
+# or an agent session; fr only creates the label and removes a voided one.
+APPROVED_FR = LabelDef(
+    "approved-fr",
+    "0E8A16",
+    "Operator approval: fr may merge this PR at its approved head",
+)
+
+RUNNER_LABEL_COLOR = "1D76DB"
+
+
+def runner_label(name: str) -> LabelDef:
+    """`runner:<name>` — which registry runner a queued phase belongs to.
+
+    Bounded like the other dynamic templates (#249)."""
+    return LabelDef(
+        _bounded_label_name("runner:", name)
+        if len(f"runner:{name}") > MAX_LABEL_NAME_LEN
+        else f"runner:{name}",
+        RUNNER_LABEL_COLOR,
+        f"Queued to the {name} runner",
+    )
+
+
+# The transitional dual-read of legacy vk-* spellings (LEGACY_QUEUE_ALIASES)
+# was removed in migration step 7: the 2026-06 fleet sweep renamed every
+# label GitHub-side, so old spellings no longer exist as live data. A stray
+# legacy label is foreign data now — neither a queue marker nor managed.
+
+# Templated label colors (name is dynamic)
+SPEC_LABEL_COLOR = "5319E7"
+PLAN_LABEL_COLOR = "B60205"
+PHASE_LABEL_COLOR = "FBCA04"
+
+
+def spec_label(slug: str) -> LabelDef:
+    """Return the LabelDef for `spec:<slug>` — slug normalized (date prefix
+    stripped), then capped at 50 chars (#249). Description keeps the raw slug."""
+    return LabelDef(
+        _bounded_label_name("spec:", normalize_label_slug(slug)),
+        SPEC_LABEL_COLOR,
+        f"Spec {slug}",
+    )
+
+
+def plan_label(slug: str) -> LabelDef:
+    """Return the LabelDef for `plan:<slug>` — slug normalized (date prefix
+    stripped), then capped at 50 chars (#249). Description keeps the raw slug."""
+    return LabelDef(
+        _bounded_label_name("plan:", normalize_label_slug(slug)),
+        PLAN_LABEL_COLOR,
+        f"Part of plan {slug}",
+    )
+
+
+def phase_label(n: int) -> LabelDef:
+    """Return the LabelDef for `phase:<n>`."""
+    return LabelDef(f"phase:{n}", PHASE_LABEL_COLOR, f"Plan phase {n}")
+
+
+# Role-name → LabelDef map. Keys are the lifecycle slot names (snake_case);
+# `.name` on each LabelDef is the GitHub label string (kebab-case). The
+# diff/render projection looks up entries by GitHub name when computing
+# label transitions.
+LIFECYCLE: dict[str, LabelDef] = {
+    "fr_ready": FR_READY,
+    "fr_blocked": FR_BLOCKED,
+    "manual": MANUAL,
+    "in_progress": FR_IN_PROGRESS,
+    "pr_ready": FR_PR_READY,
+}
+
+# Every name that marks a phase as queue-participating.
+QUEUE_MARKER_NAMES: frozenset[str] = frozenset(
+    {
+        FR_READY.name,
+        FR_BLOCKED.name,
+        FR_IN_PROGRESS.name,
+        FR_PR_READY.name,
+        FR_SYNCED.name,
+    }
+)
+
+
+def is_queued(observed_labels: frozenset[str] | set[str]) -> bool:
+    """True iff the observed label set says this Issue entered a runner
+    queue — any queue lifecycle label or a `runner:<name>` attribute."""
+    return any(
+        label in QUEUE_MARKER_NAMES or label.startswith("runner:") for label in observed_labels
+    )

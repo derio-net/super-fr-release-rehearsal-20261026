@@ -1,0 +1,528 @@
+"""The batch verbs' git seam, `fr.triage.gitseam` (spec 2026-09-25-triage-batches
+§3.F, §3.I), against real throwaway repos.
+
+Each test pins one thing merge's scratch worktree must never do with git:
+commit an untracked artifact (review r3-f7), destroy a kept worktree holding
+local changes (r3-f6), or let the operator's rerere resolve a conflict for it
+(r3-f12).
+"""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import pytest
+from fr.triage import gitseam
+from fr.triage.gitseam import Checkout, GitError
+
+
+def _git(cwd: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+    ).stdout
+
+
+def _repo(tmp_path: Path) -> Checkout:
+    """A clone of a bare origin with one commit on main."""
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "--quiet", "--bare", "--initial-branch=main", str(origin))
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "--quiet", str(origin), str(clone))
+    for k, v in (("user.name", "t"), ("user.email", "t@example.com"), ("commit.gpgsign", "false")):
+        _git(clone, "config", k, v)
+    _git(clone, "checkout", "--quiet", "-b", "main")
+    (clone / "pyproject.toml").write_text('[project]\nversion = "1.0.0"\n')
+    (clone / "a.txt").write_text("a\n")
+    _git(clone, "add", ".")
+    _git(clone, "commit", "--quiet", "-m", "seed")
+    _git(clone, "push", "--quiet", "origin", "main")
+    return Checkout(clone)
+
+
+def test_commit_all_stages_tracked_changes_and_version_files_only(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    wt = checkout.add_worktree(tmp_path / "scratch", "HEAD")
+    (wt.path / "pyproject.toml").write_text('[project]\nversion = "1.0.1"\n')
+    (wt.path / "packages").mkdir()
+    (wt.path / "packages" / "new.json").write_text('{"version": "1.0.1"}\n')
+    (wt.path / "build").mkdir()
+    (wt.path / "build" / "artifact.bin").write_text("built by set\n")
+
+    head = wt.commit_all("chore: re-slot", ["pyproject.toml", "packages/*.json"])
+
+    assert head is not None
+    committed = _git(wt.path, "show", "--name-only", "--format=", "HEAD").split()
+    assert sorted(committed) == ["packages/new.json", "pyproject.toml"]
+    assert "build/artifact.bin" in _git(wt.path, "status", "--porcelain", "--untracked-files=all")
+
+
+def test_a_kept_worktree_with_local_changes_is_refused_by_name(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    where = tmp_path / "state" / "merge" / "feat" / "batch-x"
+    wt = checkout.add_worktree(where, "HEAD")
+    (wt.path / "a.txt").write_text("a manual fix\n")
+
+    with pytest.raises(GitError) as info:
+        checkout.add_worktree(where, "HEAD")
+
+    message = str(info.value)
+    assert str(where) in message
+    assert f"git worktree remove --force {where}" in message
+    assert (where / "a.txt").read_text() == "a manual fix\n"  # nothing destroyed
+
+
+def test_a_kept_worktree_with_an_untracked_file_is_refused(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    where = tmp_path / "scratch"
+    checkout.add_worktree(where, "HEAD")
+    (where / "notes.txt").write_text("what I tried\n")
+
+    with pytest.raises(GitError, match="local changes"):
+        checkout.add_worktree(where, "HEAD")
+    assert (where / "notes.txt").exists()
+
+
+def test_a_clean_kept_worktree_is_replaced(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    where = tmp_path / "scratch"
+    checkout.add_worktree(where, "HEAD")
+
+    again = checkout.add_worktree(where, "HEAD")
+
+    assert again.path == where and (where / "a.txt").read_text() == "a\n"
+
+
+def test_a_directory_that_is_not_a_worktree_is_refused(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    where = tmp_path / "scratch"
+    where.mkdir()
+    (where / "leftover").write_text("x\n")
+
+    with pytest.raises(GitError, match="not a git worktree"):
+        checkout.add_worktree(where, "HEAD")
+    assert (where / "leftover").exists()
+
+
+def test_the_scratch_merge_disables_rerere(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review r3-f12: an operator's `rerere.enabled` would replay a recorded
+    resolution of a non-version conflict, so merge would see no conflict."""
+    seen: list[list[str]] = []
+
+    class _Done:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _run(argv: list[str], **kw: Any) -> _Done:
+        seen.append(list(argv))
+        return _Done()
+
+    monkeypatch.setattr(gitseam.subprocess, "run", _run)
+
+    gitseam.Worktree(tmp_path).merge("origin/main")
+
+    merge = next(a for a in seen if "merge" in a)
+    assert merge[0] == "git"
+    assert merge[1:3] == ["-c", "rerere.enabled=false"]
+    assert merge[-1] == "origin/main"
+
+
+def test_an_archive_that_empties_a_live_directory_is_not_a_rename(tmp_path: Path) -> None:
+    """gh#800: a close-out archive moves the LAST file out of `runs/` into
+    `implemented/runs/`; git's directory-rename detection then calls the live
+    directory renamed and moves the PR's new cursor after it — a conflict on
+    paths that exist on neither side. fr's artifact directories are never
+    renamed as a whole, so the scratch merge must not infer it, whatever the
+    operator's own `merge.directoryRenames` says."""
+    checkout = _repo(tmp_path)
+    clone = checkout.path
+    _git(clone, "config", "merge.directoryRenames", "conflict")  # git's own default
+    live = clone / "docs" / "runs"
+    live.mkdir(parents=True)
+    (live / "old.yaml").write_text("old\n")
+    _git(clone, "add", ".")
+    _git(clone, "commit", "--quiet", "-m", "a live cursor")
+    _git(clone, "push", "--quiet", "origin", "main")
+    # The PR adds a new cursor to the live directory ...
+    wt = checkout.add_worktree(tmp_path / "scratch", "HEAD")
+    (wt.path / "docs" / "runs" / "new.yaml").write_text("new\n")
+    _git(wt.path, "add", ".")
+    _git(wt.path, "commit", "--quiet", "-m", "pr cursor")
+    # ... while main archives the last one, emptying it.
+    (clone / "docs" / "implemented").mkdir(parents=True)
+    _git(clone, "mv", "docs/runs", "docs/implemented/runs")
+    _git(clone, "commit", "--quiet", "-m", "close-out")
+    _git(clone, "push", "--quiet", "origin", "main")
+    _git(wt.path, "fetch", "--quiet", "origin")
+
+    assert wt.merge("origin/main") == []
+    assert (wt.path / "docs" / "runs" / "new.yaml").read_text() == "new\n"
+    assert not (wt.path / "docs" / "implemented" / "runs" / "new.yaml").exists()
+
+
+def test_merge_base_and_show_read_the_pr_side(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    seed = _git(checkout.path, "rev-parse", "HEAD").strip()
+    wt = checkout.add_worktree(tmp_path / "scratch", "HEAD")
+    (wt.path / "a.txt").write_text("pr\n")
+    _git(wt.path, "commit", "--quiet", "-am", "pr")
+
+    assert wt.merge_base("origin/main") == seed
+    assert wt.show("HEAD", "a.txt") == "pr\n"
+    assert wt.show(seed, "a.txt") == "a\n"
+    assert wt.show(seed, "absent.txt") is None
+
+
+# ------------------------------------------------- the wave driver (§B, R14)
+
+
+def _pushed_elsewhere(tmp_path: Path, checkout: Checkout, message: str) -> None:
+    """A second clone pushes a commit to main, as a merge or a release would."""
+    other = tmp_path / "other"
+    _git(tmp_path, "clone", "--quiet", str(tmp_path / "origin.git"), str(other))
+    for k, v in (("user.name", "t"), ("user.email", "t@example.com"), ("commit.gpgsign", "false")):
+        _git(other, "config", k, v)
+    (other / "b.txt").write_text(message + "\n")
+    _git(other, "add", ".")
+    _git(other, "commit", "--quiet", "-m", message)
+    _git(other, "push", "--quiet", "origin", "main")
+
+
+def test_fast_forward_brings_the_default_branch_up_to_origin(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    _git(checkout.path, "remote", "set-head", "origin", "main")
+    _pushed_elsewhere(tmp_path, checkout, "merged batch")
+    checkout.fast_forward()
+    assert (checkout.path / "b.txt").read_text() == "merged batch\n"
+
+
+def test_fast_forward_refuses_a_checkout_on_another_branch(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    _git(checkout.path, "remote", "set-head", "origin", "main")
+    _git(checkout.path, "checkout", "--quiet", "-b", "work")
+    with pytest.raises(GitError, match="work"):
+        checkout.fast_forward()
+
+
+def test_the_default_branch_is_resolved_when_origin_head_is_unset(tmp_path: Path) -> None:
+    """gh#1100: a cloud session's clone has no `origin/HEAD`; fr asks origin itself
+    (`git remote set-head origin --auto`) instead of refusing the first drive pass."""
+    checkout = _repo(tmp_path)  # cloned while origin was empty: no origin/HEAD
+    _git(tmp_path / "origin.git", "symbolic-ref", "HEAD", "refs/heads/main")
+    assert checkout.default_branch() == "main"
+    assert _git(checkout.path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD").strip() == (
+        "origin/main"
+    )
+
+
+def test_an_unresolvable_default_branch_still_refuses_with_the_remedy(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    _git(checkout.path, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+    with pytest.raises(GitError, match="origin/HEAD is unset"):
+        checkout.default_branch()
+
+
+def test_fast_forward_with_switch_takes_a_detached_clone_onto_the_default_branch(
+    tmp_path: Path,
+) -> None:
+    """gh#1100: the cloud driver's own clone is detached (at a release commit); with
+    `switch` it is checked out on the default branch, then fast-forwarded."""
+    checkout = _repo(tmp_path)
+    _git(checkout.path, "remote", "set-head", "origin", "main")
+    _git(checkout.path, "checkout", "--quiet", "--detach")
+    _pushed_elsewhere(tmp_path, checkout, "merged batch")
+    checkout.fast_forward(switch=True)
+    assert _git(checkout.path, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
+    assert (checkout.path / "b.txt").read_text() == "merged batch\n"
+
+
+def test_fast_forward_with_switch_never_moves_a_dirty_clone(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    _git(checkout.path, "remote", "set-head", "origin", "main")
+    _git(checkout.path, "checkout", "--quiet", "-b", "work")
+    (checkout.path / "a.txt").write_text("unsaved\n")
+    with pytest.raises(GitError, match="local changes"):
+        checkout.fast_forward(switch=True)
+    assert _git(checkout.path, "rev-parse", "--abbrev-ref", "HEAD").strip() == "work"
+
+
+def _head(tmp_path: Path) -> str:
+    return _git(tmp_path / "other", "rev-parse", "HEAD").strip()
+
+
+def _push_more(tmp_path: Path, message: str) -> str:
+    other = tmp_path / "other"
+    _git(other, "pull", "--quiet", "--ff-only", "origin", "main")
+    (other / "c.txt").write_text(message + "\n")
+    _git(other, "add", ".")
+    _git(other, "commit", "--quiet", "-m", message)
+    _git(other, "push", "--quiet", "origin", "main")
+    return _head(tmp_path)
+
+
+def test_released_after_reads_a_release_commit_that_follows_the_merge(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    _git(checkout.path, "remote", "set-head", "origin", "main")
+    _pushed_elsewhere(tmp_path, checkout, "feat: the batch (#7)")
+    merge = _head(tmp_path)
+    checkout.fetch()
+    assert not checkout.released_after(merge)
+    _push_more(tmp_path, "release: v9.9.9")
+    checkout.fetch()
+    assert checkout.released_after(merge)
+
+
+def test_an_earlier_release_does_not_release_a_later_merge(tmp_path: Path) -> None:
+    """rg-9: a release cut before the batch merged is not its release, however
+    recent its commit time."""
+    checkout = _repo(tmp_path)
+    _git(checkout.path, "remote", "set-head", "origin", "main")
+    _pushed_elsewhere(tmp_path, checkout, "release: v9.9.8")
+    merge = _push_more(tmp_path, "feat: the batch (#7)")
+    checkout.fetch()
+    assert not checkout.released_after(merge)
+
+
+def test_an_unknown_merge_commit_is_not_released(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    _git(checkout.path, "remote", "set-head", "origin", "main")
+    _pushed_elsewhere(tmp_path, checkout, "release: v9.9.8")
+    checkout.fetch()
+    assert not checkout.released_after("")
+    assert not checkout.released_after("0" * 40)
+
+
+def test_snapshot_paths_copies_the_default_branch_not_the_working_tree(tmp_path: Path) -> None:
+    """rg-5: the services declaration is read from origin/<default>."""
+    checkout = _repo(tmp_path)
+    _git(checkout.path, "remote", "set-head", "origin", "main")
+    _pushed_elsewhere(tmp_path, checkout, "ci")  # b.txt on origin/main
+    checkout.fetch()
+    (checkout.path / ".devcontainer").mkdir()
+    (checkout.path / ".devcontainer" / "fr-profiles.yaml").write_text("ci: {type: none}\n")
+    dest = tmp_path / "snap"
+    dest.mkdir()
+    checkout.snapshot_paths("origin/main", (".devcontainer/fr-profiles.yaml", "b.txt"), dest)
+    assert (dest / "b.txt").read_text() == "ci\n"
+    assert not (dest / ".devcontainer").exists()
+    assert _git(dest, "remote", "get-url", "origin").strip() == str(tmp_path / "origin.git")
+
+
+def test_run_command_runs_an_argument_list_in_the_checkout(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    checkout.run_command(["git", "tag", "post-merge-ran"])
+    assert "post-merge-ran" in _git(checkout.path, "tag")
+    with pytest.raises(GitError, match="exit|failed"):
+        checkout.run_command(["git", "no-such-subcommand"])
+    with pytest.raises(GitError, match="empty"):
+        checkout.run_command([])
+
+
+def test_added_paths_lists_what_a_merge_commit_added_and_exists_at_reads_origin(
+    tmp_path: Path,
+) -> None:
+    """The driver's "already archived" evidence (debug 2026-10-03): the paths a
+    batch's merge commit added, and whether each is still on origin/<default>."""
+    checkout = _repo(tmp_path)
+    _git(checkout.path, "remote", "set-head", "origin", "main")
+    _pushed_elsewhere(tmp_path, checkout, "feat: the batch (#7)")  # adds b.txt
+    merge = _head(tmp_path)
+    other = tmp_path / "other"
+    _git(other, "rm", "--quiet", "b.txt")
+    _git(other, "commit", "--quiet", "-m", "chore: archive")
+    _git(other, "push", "--quiet", "origin", "main")
+    checkout.fetch()
+    assert checkout.added_paths(merge) == ("b.txt",)
+    assert not checkout.exists_at("origin/main", "b.txt")
+    assert checkout.exists_at("origin/main", "a.txt")
+
+
+def test_an_unknown_merge_commit_added_nothing(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    assert checkout.added_paths("") == ()
+    assert checkout.added_paths("0" * 40) == ()
+
+
+# ------------------------------------- the driver's state export (pages-goal §I)
+
+
+def test_commit_paths_stages_untracked_files_under_the_path_only(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    wt = checkout.add_worktree(tmp_path / "export", "origin/main")
+    (wt.path / "docs" / "triage" / "scope" / "board").mkdir(parents=True)
+    (wt.path / "docs" / "triage" / "scope" / "judgements.yaml").write_text("schema: 4\n")
+    (wt.path / "docs" / "triage" / "scope" / "board" / "manifest.yaml").write_text("x\n")
+    (wt.path / "docs" / "triage" / "other.txt").write_text("not mine\n")
+    (wt.path / "a.txt").write_text("changed, not mine\n")
+
+    head = wt.commit_paths(["docs/triage/scope"], "chore(triage): export")
+
+    assert head is not None
+    committed = _git(wt.path, "show", "--name-only", "--format=", "HEAD").split()
+    assert sorted(committed) == [
+        "docs/triage/scope/board/manifest.yaml",
+        "docs/triage/scope/judgements.yaml",
+    ]
+    status = _git(wt.path, "status", "--porcelain", "--untracked-files=all")
+    assert "a.txt" in status and "docs/triage/other.txt" in status
+
+
+def test_commit_paths_returns_none_when_nothing_changed(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    wt = checkout.add_worktree(tmp_path / "export", "origin/main")
+    (wt.path / "docs").mkdir()
+    (wt.path / "a.txt").write_text("changed, not mine\n")
+
+    assert wt.commit_paths(["docs"], "chore(triage): export") is None
+    assert _git(wt.path, "rev-parse", "HEAD") == _git(checkout.path, "rev-parse", "origin/main")
+
+
+def test_push_force_overwrites_a_diverged_remote_branch(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    first = checkout.add_worktree(tmp_path / "one", "origin/main")
+    (first.path / "x.txt").write_text("first\n")
+    first.commit_paths(["x.txt"], "first")
+    first.push("chore/triage-state-wave-1")
+    second = checkout.add_worktree(tmp_path / "two", "origin/main")
+    (second.path / "x.txt").write_text("second\n")
+    head = second.commit_paths(["x.txt"], "second")
+
+    with pytest.raises(GitError):
+        second.push("chore/triage-state-wave-1")
+    second.push("chore/triage-state-wave-1", force=True)
+
+    remote = _git(checkout.path, "ls-remote", "origin", "refs/heads/chore/triage-state-wave-1")
+    assert remote.split()[0] == head
+
+
+def test_commit_paths_never_forces_past_gitignore_and_ignored_names_what_it_left(
+    tmp_path: Path,
+) -> None:
+    """p4-r9: a target repo's .gitignore says what must never be committed; the export
+    respects it and reports what it left out instead."""
+    checkout = _repo(tmp_path)
+    (checkout.path / ".gitignore").write_text("snapshots/\n*.env\n")
+    _git(checkout.path, "add", ".gitignore")
+    _git(checkout.path, "commit", "--quiet", "-m", "ignore")
+    _git(checkout.path, "push", "--quiet", "origin", "main")
+    _git(checkout.path, "fetch", "--quiet", "origin")
+    wt = checkout.add_worktree(tmp_path / "export", "origin/main")
+    root = wt.path / "docs" / "triage" / "scope"
+    (root / "snapshots").mkdir(parents=True)
+    (root / "snapshots" / "s.json").write_text("{}\n")
+    (root / "secret.env").write_text("TOKEN=x\n")
+    (root / "judgements.yaml").write_text("schema: 4\n")
+
+    head = wt.commit_paths(["docs/triage/scope"], "export")
+
+    assert head is not None
+    committed = _git(wt.path, "show", "--name-only", "--format=", "HEAD").split()
+    assert committed == ["docs/triage/scope/judgements.yaml"]
+    asked = ["docs/triage/scope/snapshots/s.json", "docs/triage/scope/secret.env",
+             "docs/triage/scope/judgements.yaml"]  # fmt: skip
+    assert wt.ignored(asked) == (
+        "docs/triage/scope/secret.env",
+        "docs/triage/scope/snapshots/s.json",
+    )
+    assert wt.ignored([]) == ()
+
+
+# ------------------------------------------- batch adopt (spec 2026-10-06 §A.4, §C)
+
+
+def test_publish_branch_pushes_it_and_sets_its_upstream(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    _git(checkout.path, "branch", "feat/batch-x")
+    assert not checkout.remote_branch_exists("feat/batch-x")
+
+    checkout.publish_branch("feat/batch-x")
+
+    assert checkout.remote_branch_exists("feat/batch-x")
+    upstream = _git(checkout.path, "rev-parse", "--abbrev-ref", "feat/batch-x@{upstream}")
+    assert upstream.strip() == "origin/feat/batch-x"
+
+
+def test_worktree_of_finds_the_worktree_a_branch_is_checked_out_in(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    where = tmp_path / "wt"
+    _git(checkout.path, "worktree", "add", "--quiet", str(where), "-b", "feat/hand")
+
+    assert checkout.worktree_of("feat/hand") == where.resolve()
+    assert checkout.worktree_of("main") == checkout.path.resolve()
+    assert checkout.worktree_of("feat/nowhere") is None
+
+
+def test_has_branch_reads_local_refs(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    assert checkout.has_branch("main")
+    assert not checkout.has_branch("feat/none")
+
+
+def test_main_worktree_is_the_primary_checkout_even_from_a_linked_one(tmp_path: Path) -> None:
+    """Batch adopt refuses a branch checked out in the main worktree (p1-r3)."""
+    checkout = _repo(tmp_path)
+    linked = tmp_path / "linked"
+    _git(checkout.path, "worktree", "add", "--quiet", "-b", "feat/x", str(linked))
+    assert checkout.main_worktree() == checkout.path.resolve()
+    assert Checkout(linked).main_worktree() == checkout.path.resolve()
+
+
+def test_dirty_paths_lists_the_main_worktrees_uncommitted_paths(tmp_path: Path) -> None:
+    """Default-branch adopt refuses a dirty base clone and names its paths (R7)."""
+    checkout = _repo(tmp_path)
+    linked = tmp_path / "linked"
+    _git(checkout.path, "worktree", "add", "--quiet", "-b", "feat/x", str(linked))
+    assert checkout.dirty_paths() == ()
+    (checkout.path / "a.txt").write_text("changed\n")
+    (checkout.path / "new.txt").write_text("new\n")
+    (linked / "only-linked.txt").write_text("x\n")
+    # read from the linked worktree: still the MAIN worktree's paths
+    assert Checkout(linked).dirty_paths() == ("a.txt", "new.txt")
+
+
+def test_unpushed_lists_local_commits_origin_lacks(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    assert checkout.unpushed("main") == ()
+    (checkout.path / "a.txt").write_text("local\n")
+    _git(checkout.path, "commit", "--quiet", "-am", "local only")
+    sha = _git(checkout.path, "rev-parse", "--short", "HEAD").strip()
+    assert checkout.unpushed("main") == (f"{sha} local only",)
+
+
+def test_ahead_counts_the_commits_ref_has_beyond_base(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    _git(checkout.path, "branch", "feat/batch-x", "origin/main")
+    assert checkout.ahead("feat/batch-x", "origin/main") == 0
+    _git(checkout.path, "checkout", "--quiet", "feat/batch-x")
+    (checkout.path / "a.txt").write_text("one\n")
+    _git(checkout.path, "commit", "--quiet", "-am", "one")
+    (checkout.path / "a.txt").write_text("two\n")
+    _git(checkout.path, "commit", "--quiet", "-am", "two")
+    assert checkout.ahead("feat/batch-x", "origin/main") == 2
+
+
+def test_current_branch_reads_the_main_worktree_and_none_when_detached(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    linked = tmp_path / "linked"
+    _git(checkout.path, "worktree", "add", "--quiet", "-b", "feat/x", str(linked))
+    assert Checkout(linked).current_branch() == "main"
+    _git(checkout.path, "checkout", "--quiet", "--detach")
+    assert checkout.current_branch() is None
+
+
+def test_current_branch_is_the_branch_name_even_when_a_tag_shares_it(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    _git(checkout.path, "tag", "main")  # `rev-parse --abbrev-ref` would say `heads/main`
+    assert checkout.current_branch() == "main"
+
+
+def test_head_branch_reads_this_worktree_and_none_when_detached(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path)
+    linked = tmp_path / "linked"
+    _git(checkout.path, "worktree", "add", "--quiet", "-b", "feat/x", str(linked))
+    assert Checkout(linked).head_branch() == "feat/x"
+    assert checkout.head_branch() == "main"
+    _git(linked, "checkout", "--quiet", "--detach")
+    assert Checkout(linked).head_branch() is None

@@ -1,0 +1,11 @@
+plan:
+  filename: "YYYY-MM-DD-{name}.md"
+
+header:
+  required:
+    - Spec
+    - Status
+  status_values:
+    - Not Started
+    - In Progress
+    - Complete

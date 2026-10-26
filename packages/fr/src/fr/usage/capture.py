@@ -1,0 +1,308 @@
+"""Capture a run's usage into `docs/superpowers/usage/<run-id>.yaml` (spec §5.B.3).
+
+Three capture points, all riding calls that already happen and costing no
+inference: `fr run resolve --step deliver`, the first `fr run resolve` on a
+host that has no capture yet, and `fr archive` (the closeout session, before
+the file moves with the plan). The caller commits the file with the cursor.
+
+**Capture never fails its step.** A reader that raises is recorded as that
+session's `unavailable`; a usage file that cannot be read is left untouched
+and reported on stderr; anything else is swallowed the same way. A step's
+outcome is never hostage to observability.
+
+A re-capture on the same host merges into that host's entry: its event is
+appended to the entry's `at` list (spec §5.B.1/3, p2-r29) — and a session the
+earlier capture READ and this one cannot (a pruned transcript) keeps its
+earlier figures: replacing a measurement with an absence would lose the one
+thing the file exists to keep.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import socket
+import sys
+from collections.abc import Mapping
+from pathlib import Path
+
+from fr.run.model import RunState
+from fr.usage.file import (
+    NO_SESSION_FOUND,
+    Capture,
+    Mode,
+    SessionEntry,
+    UsageFile,
+    UsageFileError,
+    current_usage_schema_version,
+    dump_usage,
+    host_label,
+    load_usage,
+    session_entry,
+    unit_index,
+    upsert_capture,
+    usage_path,
+)
+from fr.usage.model import unavailable
+from fr.usage.rollup import windows_from_cursor
+from fr.usage.sources import read_session, sessions_of
+
+HOSTNAME_ENV = "FR_HOSTNAME"
+"""Overrides the hostname the host label hashes — tests, and a pod whose
+hostname changes per restart but is one host for this purpose."""
+
+_BINDING_TO_HARNESS: Mapping[str, str] = {
+    "claude": "claude-code",
+    "claude-code": "claude-code",
+    "unknown": "claude-code",
+    "opencode": "opencode",
+    "hermes": "hermes",
+}
+"""A workspace binding's harness word -> the reader key. `unknown` is Claude
+Code's, as in `fr.run.telemetry._BINDING_HARNESSES`."""
+
+
+def hostname(env: Mapping[str, str]) -> str:
+    return env.get(HOSTNAME_ENV) or socket.gethostname()
+
+
+def this_host(run_id: str, env: Mapping[str, str]) -> str:
+    return host_label(run_id, hostname(env))
+
+
+def isolation_mode(repo_root: Path, state: RunState, previous: Mode | None = None) -> Mode:
+    """The run's isolation mode, from its workspace record — else `previous`,
+    the mode this host's earlier capture recorded, else `host-worktree` (fr
+    then runs where the harness runs).
+
+    `previous` matters at closeout (gh#756): `fr isolation gc` may already
+    have reaped the merged workspace, and without it a devcontainer run's
+    closeout relabelled its capture `host-worktree`."""
+    try:
+        from fr.isolation.types import load_state, recorded_mode
+
+        workspace = load_state(repo_root, state.branch)
+    except Exception:  # noqa: BLE001 — observability degrades, never raises
+        workspace = None
+    if workspace is None:
+        if _external_marker(repo_root):
+            return "external"
+        return previous or "host-worktree"
+    mode = recorded_mode(workspace)
+    return "host-worktree" if mode == "worktree" else mode
+
+
+def _external_marker(repo_root: Path) -> bool:
+    import json
+
+    try:
+        data = json.loads((repo_root / ".fr-isolation").read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get("mode") == "external"
+
+
+def evidenced_sessions(state: RunState, repo_root: Path) -> list[tuple[str, str]]:
+    """`(harness, session)` pairs a run has POSITIVE evidence for, first-seen
+    order: every session the cursor records on an attempt, and every session
+    bound to the run's workspace — each with its own recorded harness (spec
+    2026-10-02-opencode-observe-2 §C, R3). Never the calling process's."""
+    found: list[tuple[str, str]] = list(sessions_of(state.model_dump(mode="json")))
+    try:
+        from fr.isolation.types import load_state
+
+        workspace = load_state(repo_root, state.branch)
+    except Exception:  # noqa: BLE001
+        workspace = None
+    for binding in workspace.sessions if workspace is not None else ():
+        found.append(
+            (_BINDING_TO_HARNESS.get(binding.harness, binding.harness), binding.session_id)
+        )
+    return list(dict.fromkeys(found))
+
+
+def candidates(
+    state: RunState, env: Mapping[str, str], repo_root: Path, *, ambient: bool
+) -> list[tuple[str, str]]:
+    """`evidenced_sessions`, plus — only when `ambient` — the run session of
+    the calling process (`run_session`).
+
+    `ambient=True` is for the run's own step resolves, whose caller IS the
+    orchestrator; the post-hoc paths (`fr run cost --recompute`, `fr archive`)
+    pass `False`, because whoever runs them is not evidence of anything
+    (#848: an operator's own Claude Code session charged to an OpenCode run).
+    No default, so the type checker names every caller."""
+    from fr.harness.detect import detect_harness
+    from fr.run.telemetry import run_session
+
+    found = evidenced_sessions(state, repo_root)
+    current = run_session(env) if ambient else None
+    if current:
+        try:
+            harness = detect_harness(env) or "claude-code"
+        except Exception:  # noqa: BLE001 — a mistyped FR_HARNESS must not fail a step
+            harness = "claude-code"
+        found.append((harness, current))
+    return list(dict.fromkeys(found))
+
+
+def _merge(previous: Capture | None, entries: list[SessionEntry]) -> list[SessionEntry]:
+    if previous is None:
+        return entries
+    fresh = {e.session: e for e in entries}
+    for old in previous.sessions:
+        if old.session == "" and old.unavailable == NO_SESSION_FOUND:
+            continue  # an earlier "found nothing" placeholder never outlives a later capture
+        new = fresh.get(old.session)
+        if new is None:
+            entries.append(old)
+        elif new.unavailable is not None and old.unavailable is None:
+            entries[entries.index(new)] = old
+    return entries
+
+
+def unpriced_sessions(capture: Capture) -> list[str]:
+    """Sessions `capture` read tokens for but no dollars (gh#756).
+
+    A harness may write a session's cost only when the session exits (Claude
+    Code's `cost-state`), so a capture taken while it is still open records
+    `usd: null`. The closeout names these, and `fr usage backfill` prices
+    them once the dollars exist."""
+    return [
+        s.session
+        for s in capture.sessions
+        if s.unavailable is None and s.models and all(m.usd is None for m in s.models.values())
+    ]
+
+
+def needs_capture(repo_root: Path, state: RunState, env: Mapping[str, str]) -> bool:
+    """True when this host has no capture of the run yet (spec §5.B.3 row 3)."""
+    try:
+        existing = load_usage(usage_path(repo_root, state.run))
+    except (OSError, UsageFileError):
+        return False
+    return existing is None or existing.host(this_host(state.run, env)) is None
+
+
+def build_capture(
+    repo_root: Path,
+    state: RunState,
+    at: str,
+    env: Mapping[str, str],
+    existing: UsageFile,
+    *,
+    ambient: bool,
+    require_sessions: bool = False,
+) -> Capture | None:
+    """This host's capture of `state`'s run, merged over its entry in
+    `existing` — built in memory, written nowhere. `None` when
+    `require_sessions` and there is no session at all. May raise: `capture`
+    is the never-raising writer, `live_usage` the never-raising reader."""
+    pairs = candidates(state, env, repo_root, ambient=ambient)
+    if require_sessions and not pairs:
+        return None
+    windows = windows_from_cursor(
+        {"started": state.started, "steps": {k: {"at": v.at} for k, v in state.steps.items()}}
+    )
+    index = unit_index(state.model_dump(mode="json"))
+    entries: list[SessionEntry] = []
+    for harness, session in pairs:
+        try:
+            record = read_session(harness, session, env)
+        except Exception as e:  # noqa: BLE001 — a reader must not fail a step
+            record = unavailable(session, harness, f"reader failed: {type(e).__name__}")
+        entries.append(session_entry(record, windows, index))
+    label = this_host(state.run, env)
+    previous = existing.host(label)
+    events = previous.at if previous is not None else ()
+    if at not in events:
+        events = (*events, at)
+    try:
+        from fr.harness.detect import detect_harness
+
+        harness_now = detect_harness(env) or (pairs[-1][0] if pairs else "unknown")
+    except Exception:  # noqa: BLE001
+        harness_now = "unknown"
+    merged = _merge(previous, entries)
+    if not merged:
+        merged = [session_entry(unavailable("", harness_now, NO_SESSION_FOUND), windows, index)]
+    return Capture(
+        host=label,
+        harness=harness_now,
+        mode=isolation_mode(repo_root, state, previous.mode if previous is not None else None),
+        captured_at=_dt.datetime.now(_dt.UTC).replace(microsecond=0).isoformat(),
+        at=events,
+        sessions=tuple(merged),
+    )
+
+
+def live_usage(
+    repo_root: Path,
+    state: RunState,
+    at: str,
+    env: Mapping[str, str],
+    file: UsageFile | None,
+    *,
+    ambient: bool,
+) -> UsageFile:
+    """`file` with this host's capture replaced by a fresh reading, in memory
+    (gh#680): what a capture here would write NOW. `deliver` renders its PR
+    body before its own capture runs, so the file alone holds only what the
+    last capture on this host saw. `at` is the capture event this reading
+    stands in for (the closed `Capture.at` vocabulary). Never raises; a failed
+    reading leaves `file` as it was."""
+    base = file or UsageFile(schema_version=current_usage_schema_version(), run=state.run)
+    try:
+        live = build_capture(
+            repo_root, state, at, env, base, ambient=ambient, require_sessions=True
+        )
+    except Exception:  # noqa: BLE001 — a render is not hostage to observability
+        return base
+    return base if live is None else upsert_capture(base, live)
+
+
+def capture(
+    repo_root: Path,
+    state: RunState,
+    at: str,
+    env: Mapping[str, str],
+    *,
+    ambient: bool,
+    path: Path | None = None,
+    require_sessions: bool = False,
+) -> Path | None:
+    """Write this host's capture of `state`'s run; the path written, or `None`.
+
+    `require_sessions` skips the write when there is no session at all to
+    record (a new host's first resolve with nothing to read is not a capture).
+    Never raises."""
+    target = path or usage_path(repo_root, state.run)
+    try:
+        existing = load_usage(target) or UsageFile(
+            schema_version=current_usage_schema_version(), run=state.run
+        )
+        new = build_capture(
+            repo_root, state, at, env, existing, ambient=ambient, require_sessions=require_sessions
+        )
+        if new is None:
+            return None
+        from fr.artifacts.atomic import write_text_atomic
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(target, dump_usage(upsert_capture(existing, new)))
+        return target
+    except Exception as e:  # noqa: BLE001 — capture never fails its step
+        print(f"fr: usage not captured ({target.name}): {e}", file=sys.stderr)
+        return None
+
+
+__all__ = [
+    "HOSTNAME_ENV",
+    "build_capture",
+    "candidates",
+    "capture",
+    "hostname",
+    "isolation_mode",
+    "live_usage",
+    "needs_capture",
+    "unpriced_sessions",
+]

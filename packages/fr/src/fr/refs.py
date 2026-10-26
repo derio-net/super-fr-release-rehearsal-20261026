@@ -1,0 +1,187 @@
+"""Lifecycle-independent plan/spec ref normalization + resolution.
+
+The canonical ref form is the bare slug (a plan's folder name, a spec's
+filename) — it cannot go stale when `fr archive` / `fr migrate dirs`
+relocate the underlying directory. The read side accepts every
+historical form forever: bare slug, active path, `implemented/` path,
+legacy `archived-plans/` path, and backticked/annotated spec-table
+cells (2026-06-06 spec-path-repair design).
+
+Resolution order is documented and stable: the ACTIVE root wins; all
+matches are surfaced on `RefResolution.matches` so callers can warn on
+ambiguity, and `RefResolution.tried` carries every candidate for loud
+not-found reporting.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+_PLACEHOLDERS = ("—", "-", "")
+
+# Roots tried in order — active first, canonical archive, legacy archive.
+PLAN_ROOTS = ("plans", "implemented/plans", "archived-plans")
+SPEC_ROOTS = ("specs", "implemented/specs", "archived-specs")
+
+_BACKTICK_RE = re.compile(r"`([^`]*)`")
+
+# A File cell whose first whitespace-delimited token is exactly `pending`/`tbd`
+# marks a decided-but-unbuilt slice (no plan folder yet). The archive sweep,
+# `fr migrate dirs`, and `fr repair` all treat such a row as intentional — held,
+# not resolved, not rewritten (#351, #359). A hyphen/slash continuation
+# ("pending-cleanup") is a real slug, so it must NOT match; likewise "pendingish".
+_PENDING_PLACEHOLDER_RE = re.compile(r"^(pending|tbd)(\s|$)", re.IGNORECASE)
+
+
+def is_pending_placeholder(cell: str) -> bool:
+    """True when a spec table's File cell marks a decided-but-unbuilt slice.
+
+    The rule is "the first whitespace-delimited token is exactly
+    `pending`/`tbd`". Only *outer* backticks are stripped (a raw table cell like
+    `` `pending` `` from repair vs. an already-stripped cell from parse_spec via
+    migrate) — NOT `_token`, whose backtick-span precedence would let a trailing
+    `` `path` `` in the note steal the token (`` pending — see `x` ``) and wrongly
+    return False (review #359).
+    """
+    s = cell.strip()
+    if len(s) >= 2 and s[0] == "`" and s[-1] == "`":
+        s = s[1:-1].strip()
+    return bool(_PENDING_PLACEHOLDER_RE.match(s))
+
+
+@dataclass(frozen=True)
+class RefResolution:
+    """Outcome of resolving one ref against the lifecycle roots."""
+
+    slug: str
+    path: Path | None  # first match in root order; None when absent
+    tried: tuple[Path, ...]  # every candidate, in order
+    matches: tuple[Path, ...]  # all roots that matched (ambiguity signal)
+
+
+def _token(ref: str) -> str:
+    """Extract the path token from a raw cell/field value.
+
+    A backticked span wins (annotated cells: `` `path` (note) ``);
+    otherwise the first whitespace-delimited token.
+    """
+    s = ref.strip()
+    m = _BACKTICK_RE.search(s)
+    if m:
+        return m.group(1).strip()
+    return s.split()[0] if s.split() else ""
+
+
+def plan_slug(ref: str) -> str:
+    """Normalize any historical ref form to the bare slug.
+
+    Strips backticks/annotations, trailing slashes, and any directory
+    prefix — the slug is always the last path segment. Placeholders
+    (`—`, `-`, empty) normalize to the empty string.
+    """
+    token = _token(ref)
+    if token in _PLACEHOLDERS:
+        return ""
+    return token.rstrip("/").rsplit("/", 1)[-1]
+
+
+def _resolve(
+    ref: str, repo_root: Path, roots: tuple[str, ...], *, is_dir: bool, suffix: str = ""
+) -> RefResolution:
+    slug = plan_slug(ref)
+    if not slug:
+        return RefResolution(slug="", path=None, tried=(), matches=())
+    if suffix and not slug.endswith(suffix):
+        slug += suffix
+    sp = repo_root / "docs" / "superpowers"
+    tried = tuple(sp.joinpath(*root.split("/")) / slug for root in roots)
+    exists = Path.is_dir if is_dir else Path.is_file
+    matches = tuple(p for p in tried if exists(p))
+    return RefResolution(
+        slug=slug,
+        path=matches[0] if matches else None,
+        tried=tried,
+        matches=matches,
+    )
+
+
+def resolve_plan_ref(ref: str, repo_root: Path) -> RefResolution:
+    """Resolve a plan ref (any form) to its directory, active root first."""
+    return _resolve(ref, repo_root, PLAN_ROOTS, is_dir=True)
+
+
+def resolve_spec_ref(ref: str, repo_root: Path) -> RefResolution:
+    """Resolve a spec ref (any form) to its file, active root first.
+
+    Forgiving on the extension: a bare name without `.md` gets it
+    appended (the canonical form keeps the extension).
+    """
+    return _resolve(ref, repo_root, SPEC_ROOTS, is_dir=False, suffix=".md")
+
+
+def keeps_spec_ref_verbatim(value: str, repo_root: Path, res: RefResolution | None = None) -> bool:
+    """True when `canonical_spec_ref` leaves `value` as written.
+
+    The one verbatim-vs-rewrite decision, named so a caller can ask it BEFORE
+    reporting on the resolution — `repair._repair_meta` warns about ambiguity
+    only when a rewrite is on the table (#749). A ref is kept verbatim when it
+    is cross-repo notation, when it lexically escapes the repo
+    (`os.path.normpath(repo_root / token)` is not under `repo_root` — this
+    judges what the operator *wrote*, so a symlinked `docs/` inside the repo
+    still canonicalizes), when it does not resolve, or when it names an
+    existing file OUTSIDE the spec lifecycle roots (`SPEC_ROOTS`): readers
+    resolve by slug either way, so shortening such a path would erase the only
+    visible sign that the operator pointed somewhere else.
+
+    Every test reads the path token (`_token`), the same one resolution reads:
+    a backtick-annotated value would otherwise keep its backtick through
+    `normpath` — `` `.. `` is a directory name, not a parent step — and pass the
+    escape test while resolution strips it and finds a same-slug local spec
+    (#750). `res` lets a caller that already resolved the ref skip a lookup.
+    """
+    from fr._urls import is_cross_repo_spec
+
+    token = _token(value)
+    if is_cross_repo_spec(token):
+        return True
+    # abspath, not bare normpath: commonpath refuses to mix a relative root
+    # with an absolute ref.
+    root = os.path.abspath(repo_root)
+    target = os.path.abspath(os.path.join(root, token))
+    if os.path.commonpath([root, target]) != root:
+        return True
+    if res is None:
+        res = resolve_spec_ref(value, repo_root)
+    if res.path is None:
+        return True
+    candidate = (repo_root / token).resolve()
+    if candidate.is_file() and candidate != res.path.resolve():
+        sp = (repo_root / "docs" / "superpowers").resolve()
+        roots = [(sp / r) for r in SPEC_ROOTS]
+        if not any(candidate.is_relative_to(r) for r in roots):
+            return True
+    return False
+
+
+def canonical_spec_ref(value: str, repo_root: Path, res: RefResolution | None = None) -> str:
+    """The one definition of the canonical `spec:` value: the bare filename.
+
+    Lifecycle-independent (it still resolves once the spec moves to
+    `implemented/specs/`), unlike a full path. Every `spec:` writer —
+    `plan_ops.create`, `plan_ops.rework_create`, `repair._repair_meta`, the
+    v1->v2 migration (`migrate._migrate_one`) — calls it, so they cannot
+    drift (#686, #711). A ref is left verbatim exactly when
+    `keeps_spec_ref_verbatim` says so. A path inside a lifecycle root —
+    including one whose spec has since moved, or one that is ambiguous
+    across roots — canonicalizes by slug, as repair always has. `res` lets a
+    caller that already resolved the ref skip a second lookup.
+    """
+    if res is None:
+        res = resolve_spec_ref(value, repo_root)
+    if keeps_spec_ref_verbatim(value, repo_root, res):
+        return value
+    assert res.path is not None  # keeps_spec_ref_verbatim is True for an unresolved ref
+    return res.path.name

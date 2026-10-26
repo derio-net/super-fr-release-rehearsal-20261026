@@ -1,0 +1,98 @@
+"""Artifact stamps, the kind registry, and the migration runner.
+
+Import both from here; `fr.artifacts.registry` is the only module that
+enumerates artifact kinds, and `fr.artifacts.runner` holds `MIGRATIONS`, the
+one registry of migrations. Importing this package registers the built-in
+migrations (`fr.artifacts.fr_version`) into `MIGRATIONS` — a migration nobody
+imported is a migration that silently never runs, so registration rides on the
+package import rather than on every caller remembering.
+"""
+
+from fr.artifacts.registry import (
+    ARTIFACT_KINDS,
+    PRE_FRAMEWORK_VERSION,
+    ArtifactError,
+    ArtifactKind,
+    ArtifactStampError,
+    UnknownArtifactKindError,
+    artifact_kind,
+    iter_all_artifacts,
+    iter_artifact_paths,
+    iter_paths_of,
+    read_version,
+    write_version,
+)
+from fr.artifacts.runner import (
+    MIGRATIONS,
+    ArtifactMigrationError,
+    DuplicateMigrationError,
+    FailedAction,
+    MigrationChainError,
+    MigrationRegistry,
+    MigrationReport,
+    PlannedAction,
+    Repair,
+    SchemaMigration,
+    is_stale,
+    plan_migrations,
+    run_migrations,
+)
+
+# Imported last and for their registration side effect; they import `runner`,
+# so they cannot come before it. EVERY registered migration is reached from
+# here — one that nobody imports silently never runs.
+from fr.artifacts import fr_version as _fr_version  # noqa: F401  (isort: skip)
+from fr.artifacts import run_provenance as _run_provenance  # noqa: F401  (isort: skip)
+from fr.artifacts import run_telemetry as _run_telemetry  # noqa: F401  (isort: skip)
+from fr.artifacts import run_dispatch_holder as _run_dispatch_holder  # noqa: F401  (isort: skip)
+from fr.artifacts import run_unit_record as _run_unit_record  # noqa: F401  (isort: skip)
+from fr.artifacts import run_main_session as _run_main_session  # noqa: F401  (isort: skip)
+from fr.artifacts import run_usage_split as _run_usage_split  # noqa: F401  (isort: skip)
+from fr.artifacts import run_driver as _run_driver  # noqa: F401  (isort: skip)
+from fr.artifacts import run_bound_model as _run_bound_model  # noqa: F401  (isort: skip)
+from fr.artifacts import run_fr_version as _run_fr_version  # noqa: F401  (isort: skip)
+from fr.artifacts import usage_split_v2 as _usage_split_v2  # noqa: F401  (isort: skip)
+from fr.artifacts import record_questions as _record_questions  # noqa: F401  (isort: skip)
+from fr.artifacts import record_input_unconfirmed as _record_input_unconfirmed  # noqa: F401  (isort: skip)
+from fr.artifacts import record_visual as _record_visual  # noqa: F401  (isort: skip)
+from fr.artifacts import record_delegated as _record_delegated  # noqa: F401  (isort: skip)
+from fr.artifacts import record_shape as _record_shape  # noqa: F401  (isort: skip)
+from fr.artifacts import record_contract as _record_contract  # noqa: F401  (isort: skip)
+from fr.artifacts import record_strategies as _record_strategies  # noqa: F401  (isort: skip)
+from fr.artifacts import record_status_split as _record_status_split  # noqa: F401  (isort: skip)
+from fr.artifacts import matrix_verify as _matrix_verify  # noqa: F401  (isort: skip)
+from fr.artifacts import matrix_visual as _matrix_visual  # noqa: F401  (isort: skip)
+from fr.artifacts import matrix_strategies as _matrix_strategies  # noqa: F401  (isort: skip)
+from fr.artifacts import matrix_status_split as _matrix_status_split  # noqa: F401  (isort: skip)
+from fr.artifacts import matrix_anchors as _matrix_anchors  # noqa: F401  (isort: skip)
+from fr.artifacts import profiles_services as _profiles_services  # noqa: F401  (isort: skip)
+from fr.artifacts import agents_kind as _agents_kind  # noqa: F401  (isort: skip)
+from fr.artifacts import journal_owed as _journal_owed  # noqa: F401  (isort: skip)
+
+__all__ = [
+    "ARTIFACT_KINDS",
+    "MIGRATIONS",
+    "PRE_FRAMEWORK_VERSION",
+    "ArtifactError",
+    "ArtifactKind",
+    "ArtifactMigrationError",
+    "ArtifactStampError",
+    "DuplicateMigrationError",
+    "FailedAction",
+    "MigrationChainError",
+    "MigrationRegistry",
+    "MigrationReport",
+    "PlannedAction",
+    "Repair",
+    "SchemaMigration",
+    "UnknownArtifactKindError",
+    "artifact_kind",
+    "is_stale",
+    "iter_all_artifacts",
+    "iter_artifact_paths",
+    "iter_paths_of",
+    "plan_migrations",
+    "read_version",
+    "run_migrations",
+    "write_version",
+]

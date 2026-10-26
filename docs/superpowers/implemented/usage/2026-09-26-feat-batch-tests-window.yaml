@@ -1,0 +1,107 @@
+schema_version: 1
+run: 2026-09-26-feat-batch-tests-window
+captures:
+- host: h-090ee2a2
+  harness: claude-code
+  mode: host-worktree
+  captured_at: '2026-10-04T05:15:23+00:00'
+  at:
+  - resolve:brainstorm
+  - deliver
+  - closeout
+  - backfill
+  sessions:
+  - session: 7a118265-cd9c-4a47-a464-08497a2f3b87
+    role: main
+    models:
+      claude-sonnet-5:
+        input: 464
+        cache_write: 1030980
+        cache_read: 36993398
+        output: 86070
+        usd: 13.668205700000014
+        usd_source: exact
+      claude-opus-5-5:
+        input: 74
+        cache_write: 168449
+        cache_read: 2862251
+        output: 3064
+        usd: 2.490824400000001
+        usd_source: exact
+      claude-haiku-4-5-20251001:
+        input: 0
+        cache_write: 0
+        cache_read: 0
+        output: 0
+        usd: 0.001991
+        usd_source: exact
+    activity:
+      implementation:
+        usd: 3.6533627967095654
+        turns: 76
+      other:
+        usd: 8.937605416986715
+        turns: 121
+      paperwork:
+        usd: 3.570052886303736
+        turns: 58
+    steps:
+      (outside run):
+        usd: 5.063116814967179
+        turns: 53
+      brainstorm:
+        usd: 0.6406809721219446
+        turns: 15
+      spec-review:
+        usd: 0.4663323767595342
+        turns: 12
+      plan:
+        usd: 0.25146819795180275
+        turns: 5
+      implement:
+        usd: 1.3084813149861676
+        turns: 27
+      journal-check:
+        usd: 0.04839460803606384
+        turns: 1
+      deliver:
+        usd: 8.38254681517732
+        turns: 136
+    briefs:
+      abfa7921b8a4c11fb: 971
+      phase/1/implement-phase: 2855
+      af94f054d5c0bb13d: 1715
+      a238c5d3a9f9c36c0: 1183
+      a5d182fc33b6777d7: 1843
+      a903c6144fdcf2aff: 5812
+  - session: dfebcfa4-3fa8-4ad8-b662-22166c9cde21
+    role: main
+    models:
+      claude-opus-5-5:
+        input: 76
+        cache_write: 108895
+        cache_read: 3799012
+        output: 17716
+        usd: 1.9477334000000004
+        usd_source: exact
+      claude-haiku-4-5-20251001:
+        input: 0
+        cache_write: 0
+        cache_read: 0
+        output: 0
+        usd: 0.0011610000000000001
+        usd_source: exact
+    activity:
+      implementation:
+        usd: 0.11186082731090041
+        turns: 3
+      other:
+        usd: 0.6581345674603177
+        turns: 14
+      paperwork:
+        usd: 1.1788990052287827
+        turns: 20
+    steps:
+      (outside run):
+        usd: 1.9488944000000008
+        turns: 37

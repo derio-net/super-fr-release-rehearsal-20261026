@@ -1,0 +1,911 @@
+"""Batches: identity, derived stage, the open-batch rule, and the one writer
+(spec 2026-09-25-triage-batches §3.A).
+
+Pure over `fr.triage.model` — judgements and facts in, answers out — except
+`save_batches`, the ONLY code that writes `judgements.yaml`. No forge call and
+no runner lives here: the verbs that touch the forge take a `GhClient` in the
+command layer (§3.J), and nothing in `fr.triage` imports `fr_dispatch`.
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import re
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from itertools import permutations
+from pathlib import Path
+from typing import Literal
+
+import yaml
+from pydantic import ValidationError
+
+from fr.artifacts.atomic import write_text_atomic
+from fr.labels import FR_AWAITING_LIVE
+from fr.triage.errors import TriageError
+from fr.triage.model import (
+    JUDGEMENTS_READS,
+    JUDGEMENTS_SCHEMA,
+    Batch,
+    CancelEvent,
+    DispatchEvent,
+    Export,
+    Facts,
+    Issue,
+    Judgement,
+    Judgements,
+    Launch,
+    PullRequest,
+    TriageConfig,
+    _check_schema,
+    batch_marker,
+    claim_trusted,
+    trusted_logins,
+    withdrawn_marker,
+)
+
+BatchStage = Literal[
+    "proposed", "cancelled", "dispatched", "pr-open", "merged", "partial", "abandoned"
+]
+BATCH_STAGES: tuple[BatchStage, ...] = (
+    "proposed",
+    "cancelled",
+    "dispatched",
+    "pr-open",
+    "merged",
+    "partial",
+    "abandoned",
+)
+# A batch at one of these no longer holds its members (spec §3.A): `partial` and
+# `abandoned` are terminal and release their still-open members, like a cancel.
+CLOSED_OUT: frozenset[BatchStage] = frozenset({"cancelled", "merged", "partial", "abandoned"})
+
+BRANCH_PREFIX = "feat/batch-"
+FIX_BRANCH_PREFIX = "fix/batch-"
+
+# The workflow each skill dispatches (spec 2026-09-27-triage-batch-launch §B).
+_WORKFLOW_BY_SKILL: dict[str, str] = {"goal": "fr-goal", "debug": "fr-debugging"}
+
+
+class BatchConflictError(TriageError):
+    """One issue key in two open batches (the open-batch rule, spec §3.A)."""
+
+
+# ---------------------------------------------------------------- identity
+
+
+def batch_branch(batch: Batch) -> str:
+    """The branch a batch's run works on: `feat/batch-<id>`, or `fix/batch-<id>`
+    for a debug batch (spec 2026-09-27-triage-batch-launch §B)."""
+    prefix = FIX_BRANCH_PREFIX if batch.skill == "debug" else BRANCH_PREFIX
+    return f"{prefix}{batch.id}"
+
+
+def batch_workflow(batch: Batch) -> str:
+    """The workflow *batch*'s run dispatches: `fr-goal` or `fr-debugging`, by
+    its skill (spec 2026-09-27-triage-batch-launch §B)."""
+    return _WORKFLOW_BY_SKILL[batch.skill]
+
+
+def batch_item_id(repo: str, batch_id: str) -> str:
+    """The run item id `<owner>/<repo>/run/batch-<id>` (spec §3.C Identity).
+
+    Spelled here rather than imported: `fr.triage` never imports `fr_dispatch`.
+    It equals `fr_dispatch.work_item.run_item_id(repo, "batch-<id>")`, which a
+    test pins.
+    """
+    return f"{repo}/run/batch-{batch_id}"
+
+
+def batch_repo(batch: Batch, facts: Facts) -> str | None:
+    """The `OWNER/REPO` the batch's members live in, among the scope's repos."""
+    return next(
+        (r for r in facts.repos if r.split("/", 1)[1].lower() == batch.repo_name),
+        None,
+    )
+
+
+def last_dispatch(batch: Batch) -> DispatchEvent | None:
+    """The batch's most recent dispatch event, if any."""
+    for event in reversed(batch.events):
+        if isinstance(event, DispatchEvent):
+            return event
+    return None
+
+
+def recorded_branch(batch: Batch) -> str:
+    """The branch *batch*'s work is on: its last dispatch's recorded branch, else
+    `batch_branch` (spec 2026-10-06-triage-batch-adopt §F, R14). Readers take the
+    branch from here, never recompute it: an adopted session's branch is the one
+    the event recorded."""
+    event = last_dispatch(batch)
+    return event.branch if event is not None else batch_branch(batch)
+
+
+_LABEL_REF = re.compile(r"(?<![\w./-])([A-Za-z0-9][\w.-]*)#(\d+)\b")
+
+
+def label_refs(label: str) -> list[str]:
+    """The `<repo>#<n>` issue refs in a session label, in order (`batch adopt --list`,
+    spec 2026-10-06-triage-batch-adopt R12). A bare `#<n>` names no repo, so it is
+    not one: a runner's labels stay raw, and reading them is triage's vocabulary."""
+    return [f"{m[1]}#{m[2]}" for m in _LABEL_REF.finditer(label)]
+
+
+_REF_NAME = r"[A-Za-z0-9](?:[\w.-]*\w)?"
+# A named ref starts clear of a word, path or hyphen; its name ends in a word
+# character, so `feat-#12` is a bare `#12` after a hyphen, never a repo `feat-`
+# (review p3-r1). A bare ref only needs no word, `.` or `/` right before its `#`.
+_ANY_REF = re.compile(
+    rf"(?:(?<![\w./-])(?P<a>{_REF_NAME})(?:/(?P<b>{_REF_NAME}))?|(?<![\w./]))#(?P<n>\d+)\b"
+)
+
+
+@dataclass(frozen=True)
+class LabelRef:
+    """One issue or PR reference in a session label: `owner/name#n` (both set),
+    `name#n` (name only) or a bare `#n` (neither)."""
+
+    owner: str | None
+    name: str | None
+    number: int
+
+    def text(self) -> str:
+        head = f"{self.owner}/{self.name}" if self.owner else (self.name or "")
+        return f"{head}#{self.number}"
+
+
+def parse_refs(label: str) -> list[LabelRef]:
+    """Every reference in *label*, each once and in order (`adopt --list`, spec
+    2026-10-11-batch-adopt-safety-2 §D). `owner/name#n` is one match, never also a
+    bare `#n`."""
+    out: list[LabelRef] = []
+    for m in _ANY_REF.finditer(label):
+        if m["b"] is not None:
+            out.append(LabelRef(m["a"], m["b"], int(m["n"])))
+        else:
+            out.append(LabelRef(None, m["a"], int(m["n"])))
+    return out
+
+
+def resolve_ref(ref: LabelRef, repo: str | None) -> str | None:
+    """The `owner/name` *ref* names, against the agent's own *repo* (R16): written in
+    full, or by a name matching *repo*'s, or bare. None when it cannot be told."""
+    if ref.owner is not None and ref.name is not None:
+        return f"{ref.owner}/{ref.name}"
+    if repo is None:
+        return None
+    if ref.name is None or ref.name == repo.split("/", 1)[-1]:
+        return repo
+    return None
+
+
+def session_state(
+    *, has_agent: bool, label: str, toplevel: object | None, branch: str | None, default: str | None
+) -> str:
+    """The listing's state for one session, the first that applies (R12)."""
+    if not has_agent:
+        return "no agent"
+    if "/run/batch-" in label:
+        return "batch"
+    if toplevel is None or default is None:
+        return "unknown"
+    if branch == default:
+        return "on default branch"
+    if branch is None:
+        return "detached"
+    return "adoptable"
+
+
+# ------------------------------------------------------------------- stage
+
+
+def _members(batch: Batch, facts: Facts) -> list[Issue]:
+    found = {i.key: i for i in facts.issues}
+    return [found[k] for k in batch.ids if k in found]
+
+
+def _parse_time(stamp: str | None) -> datetime | None:
+    """An aware datetime from a forge timestamp; None when absent or unreadable."""
+    if not stamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def of_dispatch(pr: PullRequest, event: DispatchEvent) -> bool:
+    """Whether *pr* can belong to the dispatch *event* (review r2p-f1).
+
+    A PR opened before the dispatch belongs to an earlier one — an abandoned
+    PR must not make a redispatch read `abandoned`. A PR whose creation time
+    is unknown (facts collected before `createdAt` was read) is kept: it cannot
+    be shown to predate the dispatch.
+    """
+    created = _parse_time(pr.created_at)
+    return created is None or created >= event.at
+
+
+def allowed_authors(repo: str, facts: Facts) -> frozenset[str]:
+    """The logins whose PRs may be *repo*'s batch PRs, lowercased (gh#936): the
+    repo's `.fr/triage.yaml` `pr_authors` when it lists any, else the user
+    `collect` ran as. Empty when neither is known, so nothing is trusted. Claims use
+    `claim_authors`, which never drops the viewer."""
+    return trusted_logins(facts.config_for(repo), facts.viewer)
+
+
+def claim_authors(repo: str, facts: Facts) -> frozenset[str]:
+    """The logins whose claim markers on *repo* count, lowercased (triage-claims R17):
+    the user `collect` ran as and the repo's `pr_authors`. Markers by the repo's owner,
+    members and collaborators count too, decided per comment by association."""
+    return claim_trusted(facts.config_for(repo), facts.viewer)
+
+
+def distrust(author: str | None, cross_repo: bool | None, allowed: frozenset[str]) -> str | None:
+    """Why a PR is not trusted to be a batch's, or None when it is (gh#936).
+
+    A head branch NAME is chosen by whoever opens the PR, a fork included, so it
+    never attributes a PR alone: the PR must come from the repository itself, by
+    an allowed author. An identity never read is not trusted either.
+    """
+    if cross_repo is None or author is None:
+        return "its author and origin were never read; re-collect"
+    if cross_repo:
+        return "opened from a fork"
+    if author.lower() not in allowed:
+        return f"by {author}, not an allowed author"
+    return None
+
+
+@dataclass(frozen=True)
+class ForeignPr:
+    """An open PR on a batch's dispatch branch that is not the batch's (gh#936)."""
+
+    pr: PullRequest
+    reason: str
+
+    @property
+    def key(self) -> str:
+        """What a driver remembers having reported it by."""
+        return f"foreign:{self.pr.repo}#{self.pr.number}"
+
+
+def _branch_prs(batch: Batch, facts: Facts) -> list[PullRequest]:
+    """Every PR on the batch's dispatch branch, in its repo, opened at or after its
+    LAST dispatch, whoever opened it. Candidates are the members' linked PRs, the
+    unlinked open PRs and the head-branch lookups (`Facts.batch_prs`) — the last is
+    how a merged PR whose body lost every Closes line is still found (spec §3.A)."""
+    event = last_dispatch(batch)
+    repo = batch_repo(batch, facts)
+    if event is None or repo is None:
+        return []
+    pool = [p for issue in _members(batch, facts) for p in issue.prs]
+    pool += [*facts.prs, *facts.batch_prs]
+    seen: set[int] = set()
+    out: list[PullRequest] = []
+    for p in pool:
+        if p.repo == repo and p.head_ref == event.branch and of_dispatch(p, event):
+            if p.number not in seen:
+                seen.add(p.number)
+                out.append(p)
+    return out
+
+
+def batch_pr(batch: Batch, facts: Facts) -> PullRequest | None:
+    """The batch's PR: on its dispatch branch, in its repo, opened at or after
+    its LAST dispatch, from the repo itself by an allowed author (gh#936);
+    highest number wins."""
+    allowed = allowed_authors(batch_repo(batch, facts) or "", facts)
+    matches = [
+        p for p in _branch_prs(batch, facts) if distrust(p.author, p.cross_repo, allowed) is None
+    ]
+    return max(matches, key=lambda p: p.number, default=None)
+
+
+def foreign_batch_prs(batch: Batch, facts: Facts) -> list[ForeignPr]:
+    """The OPEN PRs on the batch's dispatch branch that `batch_pr` refuses, each with
+    why: never merged, and reported to the operator (gh#936)."""
+    allowed = allowed_authors(batch_repo(batch, facts) or "", facts)
+    return [
+        ForeignPr(pr=p, reason=why)
+        for p in sorted(_branch_prs(batch, facts), key=lambda p: p.number)
+        if p.state == "OPEN" and (why := distrust(p.author, p.cross_repo, allowed)) is not None
+    ]
+
+
+def lifecycle_events(batch: Batch) -> list[DispatchEvent | CancelEvent]:
+    """Only real dispatch/cancel events change ownership; operation audits do not."""
+    return [e for e in batch.events if isinstance(e, (DispatchEvent, CancelEvent))]
+
+
+def derive_batch_stage(batch: Batch, facts: Facts) -> BatchStage:
+    """The spec §3.A stage table, from the last event and the facts. Never stored."""
+    events = lifecycle_events(batch)
+    if not events:
+        return "proposed"
+    if events[-1].kind == "cancel":
+        return "cancelled"
+    pr = batch_pr(batch, facts)
+    if pr is None:
+        return "dispatched"
+    if pr.state == "OPEN":
+        return "pr-open"
+    if pr.state == "CLOSED":
+        return "abandoned"
+    found = {i.key: i for i in facts.issues}
+    # A member missing from the facts is not known to be closed. One that awaits its
+    # live walk counts as closed: a Refs PR merged its fix and left it open on purpose
+    # (spec 2026-10-06-verification-strategies §F, R17), so the batch is done.
+    all_closed = all(
+        k in found and (found[k].state == "closed" or FR_AWAITING_LIVE.name in found[k].labels)
+        for k in batch.ids
+    )
+    return "merged" if all_closed else "partial"
+
+
+def is_open(batch: Batch, facts: Facts) -> bool:
+    """Open unless cancelled, merged, partial or abandoned (spec §3.A)."""
+    return derive_batch_stage(batch, facts) not in CLOSED_OUT
+
+
+def check_open_membership(batches: Sequence[Batch], facts: Facts) -> None:
+    """Refuse when any issue key belongs to two open batches."""
+    holders: dict[str, list[str]] = {}
+    for batch in batches:
+        if is_open(batch, facts):
+            for key in batch.ids:
+                holders.setdefault(key, []).append(batch.id)
+    clashes = {k: ids for k, ids in holders.items() if len(ids) > 1}
+    if clashes:
+        detail = "; ".join(f"{k} is in {', '.join(ids)}" for k, ids in sorted(clashes.items()))
+        raise BatchConflictError(f"an issue may be in only one open batch: {detail}")
+
+
+DependencyState = Literal["satisfied", "waiting", "unsatisfiable", "unknown"]
+
+UNSATISFIABLE: frozenset[BatchStage] = frozenset({"cancelled", "abandoned", "partial"})
+"""A dependency that can never become `merged`: withdrawn, closed unmerged, or merged
+with members still open (wave-driver §A). The dependent is blocked, never dispatched."""
+
+
+def check_dependencies(batches: Sequence[Batch]) -> None:
+    """Refuse an `after` that names an unknown batch, the batch itself, or closes a cycle."""
+    ids = {b.id for b in batches}
+    for batch in batches:
+        if batch.id in batch.after:
+            raise BatchConflictError(f"batch {batch.id!r} cannot come after itself")
+        unknown = [a for a in batch.after if a not in ids]
+        if unknown:
+            raise BatchConflictError(
+                f"batch {batch.id!r} comes after unknown batch(es) {', '.join(unknown)}"
+            )
+    graph = {b.id: list(b.after) for b in batches}
+    done: set[str] = set()
+
+    def visit(node: str, path: list[str]) -> None:
+        if node in path:
+            ring = [*path[path.index(node) :], node]
+            raise BatchConflictError(f"batch dependencies form a cycle: {' -> '.join(ring)}")
+        if node in done:
+            return
+        for dep in graph[node]:
+            visit(dep, [*path, node])
+        done.add(node)
+
+    for node in graph:
+        visit(node, [])
+
+
+def dependency_state(dep_id: str, batches: Sequence[Batch], facts: Facts) -> DependencyState:
+    """What waiting on batch *dep_id* means now: only stage `merged` satisfies it."""
+    dep = next((b for b in batches if b.id == dep_id), None)
+    if dep is None:
+        return "unknown"
+    stage = derive_batch_stage(dep, facts)
+    if stage == "merged":
+        return "satisfied"
+    return "unsatisfiable" if stage in UNSATISFIABLE else "waiting"
+
+
+CloseoutState = Literal["none", "started", "archived"]
+
+
+def closeout_state(batch: Batch) -> CloseoutState:
+    """The close-out column of `batch list`: not a stage. `started` once a `closeout`
+    event exists, `archived` once one records the archive PR as merged.
+
+    The events alone: `facts.prs` holds open PRs only, so a merged archive PR is never
+    there (gh#882). The driver records `archived` whoever merged it, the first pass
+    that sees it merged."""
+    if not any(e.kind == "closeout" for e in batch.events):
+        return "none"
+    if any(getattr(e, "archived", None) is not None for e in batch.events):
+        return "archived"
+    return "started"
+
+
+# ------------------------------------------------------------------ writer
+
+# A top-level key, plain or quoted (`batches:`, `"batches":`, `'batches':`) —
+# all three are the same YAML key, so all three are replaced (review r2p-f6).
+_TOP_KEY = re.compile(r"^(?P<q>[\"']?)(?P<key>[A-Za-z_][A-Za-z0-9_]*)(?P=q)\s*:")
+_DOC_START = re.compile(r"^---(\s|$)")
+_DOC_END = re.compile(r"^\.\.\.(\s|$)")
+
+
+def _dump_batches(batches: Iterable[Batch]) -> str:
+    """The `batches:` block, in field order, storing only what was set.
+
+    `exclude_defaults` is what keeps a launch value that was never given out of
+    the file, so dispatch can still resolve it from the repo defaults (§3.B).
+    """
+    docs = [b.model_dump(mode="json", by_alias=True, exclude_defaults=True) for b in batches]
+    return yaml.safe_dump({"batches": docs}, sort_keys=False, allow_unicode=True, width=100)
+
+
+def _top_level_span(lines: list[str], key: str) -> tuple[int, int] | None:
+    """[start, end) of the top-level *key*'s block, trailing blank lines excluded."""
+    start = next(
+        (i for i, ln in enumerate(lines) if (m := _TOP_KEY.match(ln)) and m["key"] == key),
+        None,
+    )
+    if start is None:
+        return None
+    end = start + 1
+    while end < len(lines):
+        ln = lines[end]
+        if ln.strip() and not ln[0].isspace() and not ln.startswith("-"):
+            break
+        end += 1
+    while end > start + 1 and not lines[end - 1].strip():
+        end -= 1
+    return start, end
+
+
+def _body_bounds(lines: list[str]) -> tuple[int, int]:
+    """[start, end) of the document body: after a leading `---` (and any
+    directives or comments before it), before a trailing `...`. Inserting
+    outside these bounds would make the file two documents (review r2p-f6)."""
+    start = next((i + 1 for i, ln in enumerate(lines) if _DOC_START.match(ln)), 0)
+    if any(
+        ln.strip() and not ln.lstrip().startswith(("#", "%")) for ln in lines[: max(start - 1, 0)]
+    ):
+        start = 0  # content before the `---`: that marker is not the document start
+    end = len(lines)
+    while end > start and not lines[end - 1].strip():
+        end -= 1
+    if end > start and _DOC_END.match(lines[end - 1]):
+        return start, end - 1
+    return start, len(lines)
+
+
+def _replace_top_level(text: str, key: str, block: str, *, prepend: bool) -> str:
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    span = _top_level_span(lines, key)
+    new = block.splitlines(keepends=True)
+    start, end = _body_bounds(lines)
+    if span is not None:
+        lines[span[0] : span[1]] = new
+    elif prepend:
+        lines[start:start] = new
+    else:
+        lines[end:end] = new
+    return "".join(lines)
+
+
+def _rewrite(
+    path: Path,
+    key: str,
+    block: str,
+    *,
+    unchanged: Callable[[Judgements], bool],
+    dry_run: bool = False,
+) -> Judgements:
+    """Replace `path`'s top-level *key* section with *block* and stamp the current
+    schema; every other byte (comments and layout included) is kept.
+
+    The one refuse-or-write discipline of the engine's writers: the file must load and
+    *unchanged* must hold for what it holds NOW (another writer may have changed it
+    since the caller read it), and the new text must load through the loader's own
+    model, all BEFORE a byte is written, so a refused write leaves the file
+    byte-identical. The write itself is atomic. *dry_run* checks everything and
+    writes nothing."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise TriageError(f"{path}: cannot read judgements: {exc}") from exc
+    try:
+        current = Judgements.model_validate(
+            _check_schema(path, yaml.safe_load(text), JUDGEMENTS_READS)
+        )
+    except (yaml.YAMLError, ValidationError) as exc:
+        raise TriageError(f"{path}: cannot read judgements: {exc}") from exc
+    if not unchanged(current):
+        raise TriageError(f"{path}: judgements.yaml changed since it was read; re-run")
+    text = _replace_top_level(text, "schema", f"schema: {JUDGEMENTS_SCHEMA}\n", prepend=True)
+    text = _replace_top_level(text, key, block, prepend=False)
+    try:
+        data = _check_schema(path, yaml.safe_load(text), JUDGEMENTS_READS)
+        judgements = Judgements.model_validate(data)
+    except (yaml.YAMLError, ValidationError) as exc:
+        raise TriageError(f"{path}: refusing to write invalid judgements: {exc}") from exc
+    if not dry_run:
+        write_text_atomic(path, text)
+    return judgements
+
+
+def save_batches(
+    path: Path, batches: Sequence[Batch], *, read: Sequence[Batch], dry_run: bool = False
+) -> Judgements:
+    """Write *batches* as `path`'s `batches:` section and stamp the current schema.
+
+    Only the `schema:` line and the `batches:` section change: the rest of the
+    agent-owned file (its comments and layout included) is kept byte for byte.
+    The new text is validated through the loader's own model BEFORE anything is
+    written, so every load-time rule also holds on write; a refused write leaves
+    the file untouched. Returns the judgements as they now load.
+
+    *read* is the batches the caller loaded and based *batches* on. The file's
+    CURRENT batches are compared with it first (review r2p-f7): if another
+    writer changed them in between, the write is refused rather than silently
+    dropping their change.
+
+    *dry_run* runs every one of those checks and writes nothing: `dispatch`
+    holds them before it launches a runner, whose launch cannot be undone
+    (review r3-f1).
+    """
+    return _rewrite(
+        path,
+        "batches",
+        _dump_batches(batches),
+        unchanged=lambda now: list(now.batches) == list(read),
+        dry_run=dry_run,
+    )
+
+
+def _dump_exports(exports: Iterable[Export]) -> str:
+    """The `exports:` block, in field order, storing only what was set."""
+    docs = [e.model_dump(mode="json", exclude_defaults=True) for e in exports]
+    return yaml.safe_dump({"exports": docs}, sort_keys=False, allow_unicode=True, width=100)
+
+
+def save_exports(path: Path, exports: Sequence[Export], *, read: Sequence[Export]) -> Judgements:
+    """Write *exports* as `path`'s `exports:` section and stamp the current schema
+    (spec 2026-10-05-triage-pages-goal §G): the sibling of `save_batches`, under the
+    same refuse-or-write discipline (`_rewrite`). *read* is the exports the caller
+    loaded; a file whose exports changed since is refused."""
+    return _rewrite(
+        path,
+        "exports",
+        _dump_exports(exports),
+        unchanged=lambda now: list(now.exports) == list(read),
+    )
+
+
+# ------------------------------------------------------------------ launch
+
+HARNESS_ALIASES: dict[str, str] = {"claude": "claude-code"}
+"""A runner's name for a harness -> fr's harness id (d2-harness-alias). herdr
+calls Claude Code's launcher `claude`; `fr models` keys everything by
+`claude-code`. Every other name (`opencode`, `hermes`, ...) passes through."""
+
+
+def fr_harness(name: str) -> str:
+    """The fr harness id for *name*, the runner's own vocabulary."""
+    return HARNESS_ALIASES.get(name, name)
+
+
+ModelSource = Literal["batch", "defaults.launch", "orchestrator binding"]
+
+
+@dataclass(frozen=True)
+class ResolvedLaunch:
+    """A resolved `Launch` plus which rung of the precedence supplied its model
+    (spec 2026-09-27-triage-batch-launch §A) — the one function that knows the
+    order is also the one that reports which rung won."""
+
+    launch: Launch
+    model_source: ModelSource
+
+
+def resolve_launch(
+    batch: Batch,
+    config: TriageConfig,
+    *,
+    orchestrator: Callable[[str], str | None] | None = None,
+) -> ResolvedLaunch:
+    """The batch's launch, each unset field taken from `defaults.launch` (§3.B).
+
+    Resolved at dispatch, never at create: fr never picks a runner, harness or
+    model itself, so a field set in neither place is refused. `model` has a
+    third rung: the ORCHESTRATOR binding for the batch's harness (mapped
+    through `fr_harness`), consulted only once the harness is known and only
+    when neither the batch nor `defaults.launch` gave a model. `resolve_launch`
+    stays pure otherwise: it never reads a file itself, the callable does.
+    """
+    defaults = config.defaults.launch
+    runner = batch.launch.runner or defaults.runner
+    harness = batch.launch.harness or defaults.harness
+    model = batch.launch.model or defaults.model
+    model_source: ModelSource = "batch" if batch.launch.model else "defaults.launch"
+    if model is None and harness is not None and orchestrator is not None:
+        model = orchestrator(fr_harness(harness))
+        model_source = "orchestrator binding"
+    resolved = Launch(runner=runner, harness=harness, model=model)
+    missing = [f for f in ("runner", "harness", "model") if getattr(resolved, f) is None]
+    if missing:
+        message = (
+            f"batch {batch.id!r} has no {', '.join(missing)} to launch with: give "
+            f"{' '.join('--' + f for f in missing)} on the batch, or set defaults.launch "
+            "in the repo's .fr/triage.yaml"
+        )
+        if missing == ["model"] and harness is not None:
+            message += (
+                f", or bind one: fr models set --harness {fr_harness(harness)} "
+                "--tier orchestrator --model <model>"
+            )
+        raise TriageError(message)
+    return ResolvedLaunch(launch=resolved, model_source=model_source)
+
+
+def theme_key(theme: str) -> str:
+    """The one point where two `Judgement.theme` values are compared (gh#724).
+
+    A theme is free text an agent types, so `Docs`, `docs` and `docs ` name one
+    theme: compare casefolded, with the ends trimmed. Only the comparison
+    normalises; the stored spelling is what a caller shows, and judgements.yaml
+    is never rewritten. A blank theme keys to `""`, which means no theme.
+    """
+    return theme.strip().casefold()
+
+
+def _by_theme(keys: Iterable[str], judgements: Judgements) -> list[tuple[str, list[str]]]:
+    """*keys* grouped by `theme_key`, sorted by it, blank themes left out.
+
+    Each group is shown as its first member's stored spelling.
+    """
+    groups: dict[str, tuple[str, list[str]]] = {}
+    for k in keys:
+        theme = judgements.issues[k].theme
+        if key := theme_key(theme):
+            groups.setdefault(key, (theme, []))[1].append(k)
+    return [groups[key] for key in sorted(groups)]
+
+
+def mixed_themes(batch: Batch, judgements: Judgements) -> list[str]:
+    """The distinct non-blank themes of *batch*'s members, compared by `theme_key`
+    and sorted by it (spec 2026-09-27-triage-batch-launch §C, decision d3).
+
+    Only a `debug` batch names a single root cause, so this is meaningful for
+    one: it returns fewer than two entries — nothing to warn about — for a
+    `goal` batch, a batch whose members share one theme, or members with no
+    theme at all.
+    """
+    if batch.skill != "debug":
+        return []
+    groups = _by_theme((k for k in batch.ids if k in judgements.issues), judgements)
+    return [theme for theme, _ in groups] if len(groups) >= 2 else []
+
+
+# ----------------------------------------------------------------- markers
+
+
+def latest_marker(
+    comments: Iterable[dict[str, object]], item_id: str
+) -> Literal["dispatch", "withdrawn"] | None:
+    """The kind of the newest fr-batch marker for *item_id* (comments oldest first).
+
+    The two prefixes never match each other (decision p2-withdrawn-marker), so
+    a withdrawal after a dispatch reads `withdrawn`, and a redispatch after it
+    reads `dispatch` again.
+    """
+    latest: Literal["dispatch", "withdrawn"] | None = None
+    for c in comments:
+        body = str(c.get("body") or "").lstrip()
+        if body.startswith(withdrawn_marker(item_id)):
+            latest = "withdrawn"
+        elif body.startswith(batch_marker(item_id)):
+            latest = "dispatch"
+    return latest
+
+
+def withdrawn_already(comments: Iterable[dict[str, object]], item_id: str) -> bool:
+    """True when the latest fr-batch marker for *item_id* is a withdrawal.
+
+    Makes `batch cancel` idempotent: a re-run after a partial forge failure
+    posts a withdrawal only where none is current.
+    """
+    return latest_marker(comments, item_id) == "withdrawn"
+
+
+def withdrawal_body(batch: Batch, item_id: str, reason: str) -> str:
+    """The cancel comment: marker first, then plain words. No handle, no host."""
+    text = f"{withdrawn_marker(item_id)}\nbatch `{batch.id}` withdrawn."
+    return f"{text} Reason: {reason}" if reason else text
+
+
+# ----------------------------------------------------------------- suggest
+
+_URL = re.compile(r"https?://\S+")
+_PATH = re.compile(r"[\w.-]+(?:/[\w.-]+)+|[\w-]+\.(?:py|md|ts|js|sh|yaml|yml|json|toml|lock|txt)\b")
+
+
+@dataclass(frozen=True)
+class Suggestion:
+    signal: Literal["file", "theme", "pattern"]
+    label: str
+    keys: list[str]
+
+
+def cited_paths(text: str) -> set[str]:
+    """File paths a judgement's `detail` cites: tokens with a `/` or a file extension."""
+    return {m.strip(".,;:") for m in _PATH.findall(_URL.sub(" ", text))}
+
+
+def _same_file(a: str, b: str) -> bool:
+    """Two citations name one file when one is a path suffix of the other."""
+    return a == b or a.endswith("/" + b) or b.endswith("/" + a)
+
+
+def suggest(judgements: Judgements, facts: Facts) -> list[Suggestion]:
+    """Candidate groupings of open judged issues in no open batch (§3.B).
+
+    Signals in order: a cited file path, then a theme, then a pattern. Each
+    group has two or more members. Pure and model-free: the agent accepts one
+    with `create` or ignores it.
+    """
+    held = {k for b in judgements.batches if is_open(b, facts) for k in b.ids}
+    open_keys = {i.key for i in facts.issues if i.state == "open"}
+    free = [k for k in judgements.issues if k in open_keys and k not in held]
+    out: list[Suggestion] = []
+
+    cites = {k: cited_paths(judgements.issues[k].detail) for k in free}
+    groups: dict[frozenset[str], str] = {}
+    for path in sorted({p for ps in cites.values() for p in ps}):
+        members = frozenset(k for k in free if any(_same_file(path, q) for q in cites[k]))
+        if len(members) > 1 and len(path) > len(groups.get(members, "")):
+            groups[members] = path
+    out += [
+        Suggestion("file", label, [k for k in free if k in members])
+        for members, label in sorted(groups.items(), key=lambda kv: kv[1])
+    ]
+
+    out += [Suggestion("theme", t, ks) for t, ks in _by_theme(free, judgements) if len(ks) > 1]
+
+    for p in judgements.patterns:
+        ks = [k for k in p.ids if k in free]
+        if len(ks) > 1:
+            out.append(Suggestion("pattern", p.title, ks))
+    return out
+
+
+# ------------------------------------------------------------- merge order
+
+# Exhaustive search over the unordered batches up to this many; a greedy pass
+# beyond it (a queue that long is already a planning problem of its own).
+_EXACT_ORDER_LIMIT = 8
+_NO_TIER = 10**6
+
+
+@dataclass(frozen=True)
+class QueueEntry:
+    """A `pr-open` batch with its PR and its lowest member tier (§3.F Order)."""
+
+    batch: Batch
+    pr: PullRequest
+    tier: int = _NO_TIER
+    # The PR's files minus the repo's declared version files, which every batch
+    # PR touches and merge resolves itself; None means all of `pr.files`.
+    files: tuple[str, ...] | None = None
+
+    @property
+    def touched(self) -> tuple[str, ...]:
+        return self.files if self.files is not None else tuple(self.pr.files)
+
+
+def _shares(a: QueueEntry, b: QueueEntry) -> bool:
+    return bool(set(a.touched) & set(b.touched))
+
+
+def merge_order(entries: Sequence[QueueEntry]) -> list[QueueEntry]:
+    """The spec §3.F merge order.
+
+    Explicit `order` values are hard constraints and go first, in order (then
+    id). The rest are arranged so that batches sharing files are not adjacent
+    where avoidable, then by fewest overlaps, then by lowest member tier, then
+    by batch id: among the arrangements with the fewest adjacent overlaps, the
+    one whose per-position keys `(overlaps, tier, id)` sort first. Pure and
+    deterministic: input order never matters.
+    """
+    fixed = sorted(
+        (e for e in entries if e.batch.order is not None),
+        key=lambda e: (e.batch.order, e.batch.id),
+    )
+    free = sorted((e for e in entries if e.batch.order is None), key=lambda e: e.batch.id)
+    overlaps = {e.batch.id: sum(_shares(e, o) for o in entries if o is not e) for e in entries}
+
+    def key(e: QueueEntry) -> tuple[int, int, str]:
+        return (overlaps[e.batch.id], e.tier, e.batch.id)
+
+    def adjacent(seq: Sequence[QueueEntry]) -> int:
+        return sum(_shares(x, y) for x, y in zip(seq, seq[1:], strict=False))
+
+    if len(free) <= _EXACT_ORDER_LIMIT:
+        best = min(
+            (list(p) for p in permutations(free)),
+            key=lambda p: (adjacent([*fixed[-1:], *p]), [key(e) for e in p]),
+        )
+        return [*fixed, *best]
+    out = list(fixed)
+    left = sorted(free, key=key)
+    while left:
+        pick = next((e for e in left if not (out and _shares(out[-1], e))), left[0])
+        out.append(pick)
+        left.remove(pick)
+    return out
+
+
+def lowest_tier(batch: Batch, issues: Mapping[str, Judgement]) -> int:
+    """The most urgent (lowest) tier among the batch's judged members."""
+    return min((issues[k].tier for k in batch.ids if k in issues), default=_NO_TIER)
+
+
+def pr_open_queue(
+    batches: Sequence[Batch], facts: Facts, issues: Mapping[str, Judgement]
+) -> list[QueueEntry]:
+    """Every `pr-open` batch with its PR, in batch-file order.
+
+    Files matching the repo's declared `version.files` are left out of the
+    overlap and the forecast: every batch PR bumps them, and merge resolves
+    exactly those conflicts itself (§3.F step 3).
+    """
+    out: list[QueueEntry] = []
+    for b in batches:
+        if derive_batch_stage(b, facts) != "pr-open" or (pr := batch_pr(b, facts)) is None:
+            continue
+        version = facts.config_for(pr.repo).version
+        globs = version.files if version else []
+        files = tuple(f for f in pr.files if not any(fnmatch.fnmatch(f, g) for g in globs))
+        out.append(QueueEntry(batch=b, pr=pr, tier=lowest_tier(b, issues), files=files))
+    return out
+
+
+@dataclass(frozen=True)
+class MergeStep:
+    batch: Batch
+    pr: PullRequest
+    reserved_version: str | None
+    shared: list[str]  # files this PR shares with a LATER step: the conflict forecast
+
+
+def with_forecast(ordered: Sequence[QueueEntry]) -> list[MergeStep]:
+    """Each step with its reservation and the files it shares with later steps."""
+    steps: list[MergeStep] = []
+    for i, e in enumerate(ordered):
+        later = {f for o in ordered[i + 1 :] for f in o.touched}
+        event = last_dispatch(e.batch)
+        steps.append(
+            MergeStep(
+                batch=e.batch,
+                pr=e.pr,
+                reserved_version=event.reserved_version if event else None,
+                shared=sorted(set(e.touched) & later),
+            )
+        )
+    return steps
+
+
+def planned_merge_order(
+    batches: Sequence[Batch], facts: Facts, issues: Mapping[str, Judgement] | None = None
+) -> list[MergeStep]:
+    """The `pr-open` batches in the spec §3.F order, with the conflict forecast.
+
+    The board (§3.G) and `batch merge` share this order; merge re-reads each PR
+    from the forge before acting on it.
+    """
+    return with_forecast(merge_order(pr_open_queue(batches, facts, issues or {})))

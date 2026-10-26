@@ -1,0 +1,2375 @@
+"""Library functions for v2 plan editing.
+
+These are the writers — every other v2 module is a reader (parse,
+render, observe) or a mutator-of-GitHub (diff, apply). Plan-file
+writes happen here.
+
+Conventions:
+  - All writers stage via `git add` after the file write but do NOT
+    commit. The caller (CLI) decides commit cadence.
+  - All writers re-parse after writing to confirm the file still
+    passes schema validation.
+  - `vk.plan.create` and `vk.plan.rework_create` additionally append
+    a row to the spec's Implementation Plans table; the spec edit is
+    staged in the same change so it lands in the same PR.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import logging
+import re
+import subprocess
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal, TypedDict
+
+import yaml
+
+from fr import refs
+from fr._urls import is_cross_repo_spec
+from fr.journal.model import JournalEntry, journal_header, journal_path
+from fr.labels import MAX_LABEL_NAME_LEN, normalize_label_slug
+from fr.parser import Plan, PlanSchemaError, parse
+from fr.plan_validator_wrapper import (
+    ValidatorWrapperError,
+    ensure_validator_wrapper,
+    validator_wrapper_path,
+)
+from fr.render import plan_locally_complete
+from fr.types import PHASE_TIERS, PhaseDoc, Step
+from fr.version_floor import CEILING_VERSION, admits
+
+
+class StepSpec(TypedDict):
+    """Shape of a single step within a `PhaseSpec.tasks[*]['steps']` list."""
+
+    id: str
+    text: str
+
+
+class TaskSpec(TypedDict):
+    """Shape of an entry in `PhaseSpec.tasks` — a task with its step list."""
+
+    number: int
+    title: str
+    steps: list[StepSpec]
+
+
+class PlanEditError(Exception):
+    """Raised when an editing operation can't proceed."""
+
+
+# ---------------------------------------------------------------------------
+# helpers
+
+
+def _stage(repo_root: Path | None, paths: list[Path]) -> None:
+    """git add the paths if we're in a git repo."""
+    if repo_root is None:
+        return
+    rels = [str(p.resolve().relative_to(repo_root)) for p in paths]
+    subprocess.run(
+        ["git", "-C", str(repo_root), "add", *rels],
+        check=False,
+        capture_output=True,
+    )
+
+
+def _now_iso() -> str:
+    return _dt.datetime.now(tz=_dt.UTC).isoformat(timespec="seconds")
+
+
+def _coerce_step_texts(d: dict[str, Any]) -> dict[str, Any]:
+    """Wrap step text values in LiteralStr so they always emit as `|-`.
+
+    Called before every _yaml_dump so round-tripped phase files (loaded via
+    yaml.safe_load and mutated for state updates) keep the same consistent
+    block-scalar style as freshly-created plans.
+    """
+    from fr._yaml import LiteralStr
+
+    for task in d.get("tasks", []):
+        for step in task.get("steps", []):
+            if "text" in step and not isinstance(step["text"], LiteralStr):
+                step["text"] = LiteralStr(step["text"])
+    return d
+
+
+def _yaml_dump(d: dict[str, Any]) -> str:
+    """Delegate to the shared plan-yaml dumper (literal block scalars for
+    multi-line strings, preserved key order, unicode-as-is)."""
+    from fr._yaml import dump_plan_yaml
+
+    return dump_plan_yaml(_coerce_step_texts(d))
+
+
+_TOP_LEVEL_KEY = re.compile(r"^([A-Za-z_][\w-]*):(?:\s|$)")
+
+
+def _splice_block(text: str, key: str, value: Any) -> str | None:
+    """`text` with the top-level `key:` block re-serialised, every other byte
+    kept — or None when the block cannot be found exactly once."""
+    lines = text.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if _TOP_LEVEL_KEY.match(line)]
+    owned = [i for i in starts if _TOP_LEVEL_KEY.match(lines[i]).group(1) == key]  # type: ignore[union-attr]
+    if len(owned) != 1:
+        return None
+    start = owned[0]
+    end = next((i for i in starts if i > start), len(lines))
+    # A blank or column-0 comment line just above the next key belongs to it.
+    while end > start + 1 and (not lines[end - 1].strip() or lines[end - 1].startswith("#")):
+        end -= 1
+    block = _yaml_dump({key: value})
+    if end < len(lines) and not block.endswith("\n"):
+        block += "\n"
+    return "".join(lines[:start]) + block + "".join(lines[end:])
+
+
+def rewrite_phase_text(original: str, raw: dict[str, Any], *keys: str) -> str:
+    """The phase-file text for `raw`, re-serialising only the top-level
+    `keys` blocks the caller changed and keeping every other byte of
+    `original` (gh#502).
+
+    A phase file is a review artifact: a tick that re-dumps the whole file
+    restyles every hand-edited scalar and buries the one-line change in the
+    PR's plan diff. The splice is trusted only when the result parses back to
+    exactly `raw`; anything else (a duplicated key, a shape the line scan
+    misreads) falls back to the whole-file dump this replaced.
+    """
+    text: str | None = original
+    for key in keys:
+        text = _splice_block(text, key, raw[key]) if text is not None else None
+    try:
+        faithful = text is not None and yaml.safe_load(text) == raw
+    except yaml.YAMLError:  # e.g. an alias whose anchor sat in the replaced block
+        faithful = False
+    return text if faithful and text is not None else _yaml_dump(raw)
+
+
+# ---------------------------------------------------------------------------
+# vk.plan.create
+
+
+@dataclass(frozen=True)
+class PhaseSpec:
+    """Lightweight phase shape for `create()` callers."""
+
+    number: int
+    title: str
+    tag: Literal["agentic", "manual"] = "agentic"
+    depends_on: tuple[int, ...] = ()
+    tasks: tuple[TaskSpec, ...] = ()
+    # Acceptance-matrix row ids (2026-07-04 spec) — emitted only when set.
+    acceptance: tuple[str, ...] = ()
+    # Walking-skeleton marker — emitted only when set (same byte-stability
+    # rule as `acceptance`).
+    skeleton: bool = False
+    # Harness-neutral complexity hint (2026-07-22 fr-goal-subagent-execution
+    # spec §B.2) — emitted only when set (same byte-stability rule as
+    # `acceptance`/`skeleton`). Validated against `fr.types.PHASE_TIERS` in
+    # `create()`'s pre-flight loop, not left to `PhaseHeader`'s Literal at the
+    # post-write re-parse (#133: that would strand a half-built folder).
+    tier: Literal["mechanical", "standard", "hard"] | None = None
+    # Proportionality inputs (2026-09-24 spec §C) — emitted only when set.
+    files: tuple[str, ...] = ()
+    estimate_lines: int | None = None
+
+    @property
+    def declares_scope(self) -> bool:
+        """Does this phase use a field that needs fr >= 4.20.0 to parse?"""
+        return bool(self.files) or self.estimate_lines is not None
+
+
+def _preflight_fr_version_error(fr_version: str) -> str | None:
+    """Why the plan's own re-parse would refuse `fr_version`, or `None`.
+
+    An explicit `--fr-version` was checked only for admitting an fr that is too
+    OLD, never the one running, so a constraint excluding it wrote the plan and
+    then failed the post-write parse, stranding the folder, its journal and the
+    validator wrapper (gh#855). Same doctrine as the phase pre-flight: refuse
+    before the first byte. `fr.parser.INSTALLED_FR_VERSION` is read here, not
+    imported by name, so it is the value the re-parse will enforce.
+    """
+    from packaging.specifiers import InvalidSpecifier
+
+    from fr import parser
+
+    installed = parser.INSTALLED_FR_VERSION
+    try:
+        if admits(fr_version, installed):
+            return None
+    except InvalidSpecifier as e:
+        return f"invalid fr_version {fr_version!r}: {e}"
+    return (
+        f"fr_version {fr_version!r} excludes the installed fr {installed}, so the plan "
+        f"would fail its own parse; nothing was written. Pass an fr_version that admits "
+        f"{installed}, or omit --fr-version for the default."
+    )
+
+
+def _preflight_phase_error(ps: PhaseSpec) -> str | None:
+    """The first pre-flight validation error for `ps`, or None.
+
+    Each check here mirrors a `PhaseHeader` schema gate that would otherwise
+    only reject at `create()`'s post-write re-parse, stranding a half-built
+    plan folder (#133). One function per phase keeps `create()`'s loop a
+    single readable rule ("for each phase, raise the first pre-flight
+    error") instead of a growing set of inline `if`s.
+    """
+    if ps.number < 1:
+        return f"phase {ps.number} ({ps.title!r}): phase numbering starts at 1, not 0"
+    if ps.tier is not None and ps.tier not in PHASE_TIERS:
+        return (
+            f"phase {ps.number} ({ps.title!r}): tier {ps.tier!r} is not valid, "
+            f"must be one of {list(PHASE_TIERS)}"
+        )
+    if ps.estimate_lines is not None and ps.estimate_lines < 0:
+        return (
+            f"phase {ps.number} ({ps.title!r}): estimate_lines must be >= 0, "
+            f"got {ps.estimate_lines}"
+        )
+    return None
+
+
+def create(
+    *,
+    repo_root: Path,
+    slug: str,
+    spec: Path | str | None,
+    target_repo: str,
+    fr_version: str,
+    phases: list[PhaseSpec],
+    prose: str,
+    plans_dir: Path | None = None,
+    workflow: str | None = None,
+    warn: Callable[[str], None] | None = None,
+) -> Plan:
+    """Scaffold a new v2 plan folder + append spec row.
+
+    `warn` receives non-fatal notes (a foreign validator wrapper left in
+    place). The CLI passes its stderr printer; library callers default to
+    this module's logger.
+
+    `workflow` is the shape the plan dispatches at (spec §4.A.1). It is
+    written ONLY when given — a `workflow: null` line in every new plan
+    would be a gratuitous diff against every plan written before the field
+    existed, and absence is meaningful (it resolves the default shape).
+    Callers that pass one own flooring `fr_version` at `>=4.0.0`; see
+    `fr.commands.plan_cmd` (`PlanMeta` is extra="forbid", so older fr
+    cannot parse the key at all).
+
+    Returns the parsed Plan. Raises PlanEditError on collisions.
+    """
+    if plans_dir is None:
+        plans_dir = repo_root / "docs" / "superpowers" / "plans"
+    folder = plans_dir / slug
+
+    spec_str = str(spec) if spec is not None else None
+
+    # Pre-flight: validate every external precondition BEFORE mutating the
+    # filesystem. A spec whose '## Implementation Plans' table is malformed
+    # must fail loud here — not after the folder is half-built — so a re-run
+    # after fixing it isn't blocked by a stranded folder (#133). (A spec with
+    # no section at all is fine: `create` writes it below.) Mirrors how
+    # `fr apply` validates the diff before `--yes` touches GitHub. Same
+    # doctrine for phase numbering and tier below: their schema gates
+    # (PhaseHeader's `ge=1` and `Literal`) would only reject at the post-write
+    # re-parse, stranding the folder (#434 spec-review finding for tier).
+    for ps in phases:
+        error = _preflight_phase_error(ps)
+        if error is not None:
+            raise PlanEditError(error)
+    error = _preflight_fr_version_error(fr_version)
+    if error is not None:
+        raise PlanEditError(error)
+    spec_path: Path | None = None
+    if spec_str:
+        candidate = (repo_root / spec_str).resolve()
+        if candidate.exists():
+            _validate_spec_section(candidate)
+            spec_path = candidate
+        # If the spec file doesn't exist yet, we skip the row — the operator
+        # can add it by hand when they create the spec file.
+
+    # Build the expected folder contents in memory (no side effects yet).
+    meta: dict[str, Any] = {
+        "schema_version": 2,
+        "plan": slug,
+        "spec": refs.canonical_spec_ref(spec_str, repo_root) if spec_str else spec_str,
+        "target_repo": target_repo,
+        "fr_version": fr_version,
+        "created": _dt.date.today().isoformat(),
+    }
+    if workflow is not None:
+        # Last, mirroring `PlanMeta`'s field order — an existing plan's
+        # bytes are unaffected and a shaped plan reads bottom-up as
+        # "…and this one dispatches at <shape>".
+        meta["workflow"] = workflow
+    meta_text = _yaml_dump(meta)
+    prose_text = prose if prose.endswith("\n") else prose + "\n"
+    phase_files = {f"{ps.number:02d}.yaml": _yaml_dump(_build_phase_doc(ps)) for ps in phases}
+
+    written: list[Path] = []
+    if folder.exists():
+        # Idempotent repair (#133): a prior run may have created the folder but
+        # failed before appending the spec row. If the on-disk content matches
+        # what we would write, finish the job (append the row below) instead of
+        # dead-ending at "already exists". Mismatched content — a slug reused
+        # for a different plan — is a real collision and still rejected.
+        if not _folder_matches(
+            folder,
+            meta_text=meta_text,
+            prose_text=prose_text,
+            phase_files=phase_files,
+            repo_root=repo_root,
+        ):
+            raise PlanEditError(f"plan folder already exists: {folder}")
+        # A match may still differ in how `spec:` is spelled: a first run
+        # before the spec existed stored it verbatim, and it canonicalizes
+        # now that it resolves. Converge on the canonical form, keeping the
+        # original scaffold date.
+        meta_p = folder / "_meta.yaml"
+        on_disk_meta = meta_p.read_text()
+        if _strip_created(on_disk_meta) != _strip_created(meta_text):
+            created = [ln for ln in on_disk_meta.splitlines() if ln.startswith("created:")]
+            meta_p.write_text(
+                "".join(
+                    created[0] + "\n" if ln.startswith("created:") and created else ln
+                    for ln in meta_text.splitlines(keepends=True)
+                )
+            )
+            written.append(meta_p)
+    else:
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        folder.mkdir()
+        (folder / "_meta.yaml").write_text(meta_text)
+        (folder / "_prose.md").write_text(prose_text)
+        for name, text in phase_files.items():
+            (folder / name).write_text(text)
+        written.extend([folder / "_meta.yaml", folder / "_prose.md"])
+        written.extend(folder / name for name in phase_files)
+
+        # Initialize the plan journal (2026-07-22 fr-goal-subagent-execution
+        # spec §A). A plan-scoped journal is a sibling of the plan folder under
+        # docs/superpowers/journals/; it holds per-phase discoveries and review
+        # findings written during execution. Only created here (not repaired),
+        # so a hand-deleted journal on an existing folder stays absent —
+        # parsing a plan never depends on its journal (back-compat).
+        journal_p = journal_path(repo_root, "plan", slug)
+        if not journal_p.exists():
+            journal_p.parent.mkdir(parents=True, exist_ok=True)
+            journal_p.write_text(journal_header(slug))
+            written.append(journal_p)
+
+    if spec_path is not None:
+        spec_text = spec_path.read_text()
+        if not _SPEC_TABLE_HEADER_RE.search(spec_text):
+            spec_path.write_text(_ensure_section_text(spec_text))
+        _append_spec_row(
+            spec_path,
+            plan_name=slug,
+            repo=target_repo,
+            # Canonical lifecycle-independent form (2026-06-06
+            # spec-path-repair): the bare slug cannot go stale on archive.
+            file=slug,
+            depends_on="—",
+        )
+        written.append(spec_path)
+
+    # A repo scaffolded before its first plan never got a tracked
+    # scripts/validate-plans.sh (`fr init scaffold` only writes one when
+    # docs/superpowers/plans/ already exists at scaffold time). Installing it
+    # here means the wrapper lands in the SAME commit as this plan, so the
+    # first-plan PR carries it to the default branch and a later `fr
+    # isolation up --base origin/<default>` is never refused over it
+    # (2026-09-25 fr-goal-closeout-defects spec §3.B). A foreign file there
+    # is left untouched — the same refusal `ensure_validator_wrapper`
+    # already makes elsewhere — reported as a warning, not a failure: a
+    # plan is still worth creating even when the wrapper can't be.
+    if (repo_root / ".git").exists():
+        try:
+            if ensure_validator_wrapper(repo_root):
+                written.append(validator_wrapper_path(repo_root))
+        except ValidatorWrapperError as err:
+            (warn or logging.getLogger(__name__).warning)(
+                f"plan {slug}: could not install scripts/validate-plans.sh: {err}"
+            )
+
+    if written:
+        _stage(repo_root, written)
+
+    # Re-parse to confirm schema integrity
+    return parse(folder)
+
+
+def _folder_matches(
+    folder: Path,
+    *,
+    meta_text: str,
+    prose_text: str,
+    phase_files: dict[str, str],
+    repo_root: Path,
+) -> bool:
+    """True iff `folder` already holds exactly the content `create()` would write.
+
+    Used to distinguish a repairable partial-success state (re-run with the same
+    inputs) from a genuine slug collision. `_meta.yaml`'s `created:` date is
+    ignored so a repair the next day still matches, and `spec:` is compared by
+    the spec it names rather than by spelling: its canonical form depends on
+    whether the spec resolves yet, so the same inputs can spell it two ways.
+    """
+    meta_p = folder / "_meta.yaml"
+    if not meta_p.exists():
+        return False
+    on_disk = meta_p.read_text()
+    if _strip_meta_line(on_disk, "spec") != _strip_meta_line(meta_text, "spec"):
+        return False
+    try:
+        on_disk_doc = yaml.safe_load(on_disk)
+    except yaml.YAMLError:
+        return False  # a hand-corrupted meta is a mismatch, as the byte compare was
+    if not isinstance(on_disk_doc, dict):
+        return False
+    if not _same_spec(on_disk_doc.get("spec"), yaml.safe_load(meta_text).get("spec"), repo_root):
+        return False
+    prose_p = folder / "_prose.md"
+    if not prose_p.exists() or prose_p.read_text() != prose_text:
+        return False
+    # The on-disk phase files must be EXACTLY the expected set — not just a
+    # superset. A re-run that drops a phase would otherwise "repair" the folder
+    # while leaving the removed phase's `NN.yaml` behind as a silent orphan.
+    if {p.name for p in folder.glob("[0-9]*.yaml")} != set(phase_files):
+        return False
+    for name, text in phase_files.items():
+        p = folder / name
+        if not p.exists() or p.read_text() != text:
+            return False
+    return True
+
+
+def _strip_created(meta_text: str) -> str:
+    """Drop the `created:` line so meta comparison ignores the scaffold date."""
+    return "\n".join(line for line in meta_text.splitlines() if not line.startswith("created:"))
+
+
+def _strip_meta_line(meta_text: str, key: str) -> str:
+    """`_strip_created`, also dropping the top-level `key:` line."""
+    return "\n".join(
+        line for line in _strip_created(meta_text).splitlines() if not line.startswith(f"{key}:")
+    )
+
+
+def _same_spec(a: object, b: object, repo_root: Path) -> bool:
+    """True iff two `spec:` values name the same spec (#697 regression)."""
+    if a == b:
+        return True
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    return refs.canonical_spec_ref(a, repo_root) == refs.canonical_spec_ref(b, repo_root)
+
+
+def _build_phase_doc(ps: PhaseSpec) -> dict[str, Any]:
+    """Convert a PhaseSpec into the yaml-shaped phase doc dict."""
+    tasks: list[dict[str, Any]] = []
+    state_steps: dict[str, dict[str, Any]] = {}
+    for t in ps.tasks:
+        steps_out: list[dict[str, Any]] = []
+        for s in t["steps"]:
+            steps_out.append({"id": s["id"], "text": s["text"]})
+            state_steps[s["id"]] = {"state": " ", "ticked_at": None, "note": None}
+        tasks.append({"number": t["number"], "title": t["title"], "steps": steps_out})
+    phase_header: dict[str, Any] = {
+        "number": ps.number,
+        "title": ps.title,
+        "tag": ps.tag,
+        "depends_on": list(ps.depends_on),
+        "tracking_issue": None,
+    }
+    # Optional header fields are emitted only when set, so plans written
+    # before each field existed stay byte-stable and parse on older readers.
+    if ps.acceptance:
+        phase_header["acceptance"] = list(ps.acceptance)
+    if ps.skeleton:
+        phase_header["skeleton"] = True
+    if ps.tier is not None:
+        phase_header["tier"] = ps.tier
+    if ps.files:
+        phase_header["files"] = list(ps.files)
+    if ps.estimate_lines is not None:
+        phase_header["estimate_lines"] = ps.estimate_lines
+    return {
+        "schema_version": 2,
+        "phase": phase_header,
+        "tasks": tasks,
+        "state": {
+            "steps": state_steps,
+            "completion": {"at": None, "note": None, "observed_prs": []},
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# spec table editing
+
+
+_SPEC_TABLE_HEADER_RE = re.compile(r"^## Implementation Plans\s*$", re.MULTILINE)
+
+# `_append_spec_row` writes `| name | \`repo\` | \`file\` | depends_on |` into
+# columns 2-4 unconditionally — it never reads the header text. A table whose
+# header labels those columns differently (e.g. a hand-authored spec with
+# `Phases | Status | Created`) still accepts the append silently, producing a
+# table that lies about what each column holds. Both entry points below check
+# the header names against this contract before writing.
+_CANONICAL_HEADER_LINE = "| Plan | Repo | File | Depends on |"
+_CANONICAL_HEADER_CELLS = tuple(
+    c.strip().lower() for c in _CANONICAL_HEADER_LINE.strip("|").split("|")
+)
+_CANONICAL_HEADER_SEPARATOR = (
+    "|" + "|".join("-" * (len(c) + 2) for c in _CANONICAL_HEADER_CELLS) + "|"
+)
+
+
+def _header_hint() -> str:
+    """The one phrase every table error uses to name the header it wants."""
+    return f"expected '{_CANONICAL_HEADER_LINE}' followed by its separator row"
+
+
+def _first_table_line(text: str, m: re.Match[str]) -> str | None:
+    """First pipe-delimited line after the heading match, or None."""
+    after = text[m.end() :]
+    for line in after.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("|"):
+            return stripped
+    return None
+
+
+def _check_table_header(spec_path: Path, text: str, m: re.Match[str]) -> None:
+    header_line = _first_table_line(text, m)
+    if header_line is None:
+        raise PlanEditError(
+            f"{spec_path}: '## Implementation Plans' has no table to append to; {_header_hint()}."
+        )
+    cells = tuple(c.strip().lower() for c in header_line.strip("|").split("|"))
+    if cells != _CANONICAL_HEADER_CELLS:
+        raise PlanEditError(
+            f"{spec_path}: '## Implementation Plans' table header is {header_line!r}, "
+            f"{_header_hint()}. fr plan create appends rows "
+            f"assuming those exact column semantics — a differently-labeled header would "
+            f"silently mislabel the row it writes. Fix the header before scaffolding a plan."
+        )
+
+
+def _ensure_section_text(text: str) -> str:
+    """Return `text` with the canonical `## Implementation Plans` header appended.
+
+    Pure. Blank-line separated from any prose; the caller must only use it when
+    the section is absent. `fr.migrate._ensure_spec_plan_row` shares it.
+    """
+    sep = "" if text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
+    return (
+        f"{text}{sep}## Implementation Plans\n\n"
+        f"{_CANONICAL_HEADER_LINE}\n{_CANONICAL_HEADER_SEPARATOR}\n"
+    )
+
+
+def _validate_spec_section(spec_path: Path) -> None:
+    """Pre-flight: confirm an existing Implementation Plans table is appendable.
+
+    Read-only. A missing section is accepted — `create` writes it right before
+    appending the row. A present-but-malformed table raises the same errors
+    `_append_spec_row` would, BEFORE any folder is created (#133).
+    """
+    text = spec_path.read_text()
+    m = _SPEC_TABLE_HEADER_RE.search(text)
+    if not m:
+        return
+    _check_table_header(spec_path, text, m)
+
+
+def _append_spec_row(
+    spec_path: Path,
+    *,
+    plan_name: str,
+    repo: str,
+    file: str,
+    depends_on: str,
+) -> None:
+    """Append a row to the spec's `## Implementation Plans` table.
+
+    Idempotent: if a row with `file == file` already exists, no-op.
+    """
+    text = spec_path.read_text()
+    m = _SPEC_TABLE_HEADER_RE.search(text)
+    if not m:
+        raise PlanEditError(
+            f"{spec_path}: no '## Implementation Plans' section found. "
+            f"Add the section with a table header; {_header_hint()}."
+        )
+    _check_table_header(spec_path, text, m)
+
+    # Find end of the table (last consecutive "|" line after the header).
+    after = text[m.end() :]
+    lines = after.splitlines(keepends=True)
+    abs_offset = m.end()
+    saw_pipe = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("|"):
+            saw_pipe = True
+            abs_offset += len(line)
+        elif saw_pipe and stripped == "":
+            break
+        else:
+            abs_offset += len(line)
+    if not saw_pipe:
+        raise PlanEditError(
+            f"{spec_path}: '## Implementation Plans' has no table to append to; {_header_hint()}."
+        )
+
+    # Idempotence check is scoped to the TABLE region only. Scanning the whole
+    # spec (the pre-2026-07-24 behavior) let any backticked slug mention in the
+    # prose — e.g. a `**Slug:** `<slug>`` header, exactly what fr-goal writes —
+    # match, so the row was silently never appended while `create` reported
+    # success (and the empty table then broke `fr archive`'s spec-sweep).
+    table_region = text[m.end() : abs_offset]
+    if f"`{file}`" in table_region or f"| {file} |" in table_region:
+        return  # already present
+
+    new_row = f"| {plan_name} | `{repo}` | `{file}` | {depends_on} |\n"
+    new_text = text[:abs_offset] + new_row + text[abs_offset:]
+    spec_path.write_text(new_text)
+
+
+# ---------------------------------------------------------------------------
+# vk.plan.tick / vk.plan.complete_phase
+
+
+def tick(
+    plan_dir: Path,
+    step_id: str,
+    *,
+    state: Literal["x", "-"] = "x",
+    note: str | None = None,
+) -> None:
+    """Mark a step ticked or skipped. Idempotent on re-tick.
+
+    Writes to whichever phase yaml contains the step. Stages but does
+    not commit. Validates the result by re-parsing.
+    """
+    if state == "-" and not note:
+        raise PlanEditError("--state - (skipped) requires --note")
+
+    plan = parse(plan_dir)
+    repo_root = plan.repo_root
+
+    # Find the phase yaml that owns this step id
+    target_phase_n: int | None = None
+    for phase in plan.phases:
+        for task in phase.tasks:
+            for step in task.steps:
+                if step.id == step_id:
+                    target_phase_n = phase.phase.number
+                    break
+            if target_phase_n is not None:
+                break
+        if target_phase_n is not None:
+            break
+    if target_phase_n is None:
+        raise PlanEditError(f"step id {step_id!r} not found in any phase")
+
+    phase_path = plan_dir / f"{target_phase_n:02d}.yaml"
+    text = phase_path.read_text()
+    raw = yaml.safe_load(text)
+
+    current = raw["state"]["steps"][step_id]
+    if current.get("state") == state and (note is None or current.get("note") == note):
+        return  # idempotent
+
+    raw["state"]["steps"][step_id] = {
+        "state": state,
+        "ticked_at": _now_iso(),
+        "note": note,
+    }
+    phase_path.write_text(rewrite_phase_text(text, raw, "state"))
+
+    # Re-parse to validate schema still holds
+    parse(plan_dir)
+    _stage(repo_root, [phase_path])
+
+
+def complete_phase(plan_dir: Path, phase_n: int, *, note: str | None = None) -> None:
+    """Mark a phase complete via state.completion.at + (required for manual) note."""
+    plan = parse(plan_dir)
+    matched = next((p for p in plan.phases if p.phase.number == phase_n), None)
+    if matched is None:
+        raise PlanEditError(f"phase {phase_n} not found in plan")
+
+    if matched.phase.tag == "manual" and not note:
+        raise PlanEditError(f"phase {phase_n} is manual; --note is required")
+
+    if matched.phase.tag == "agentic":
+        unticked = [sid for sid, s in matched.state.steps.items() if s.state == " "]
+        if unticked:
+            raise PlanEditError(
+                f"phase {phase_n} (agentic) has unticked steps: {sorted(unticked)}. "
+                f"tick them first OR open a rework plan if they're being deferred."
+            )
+
+    phase_path = plan_dir / f"{phase_n:02d}.yaml"
+    text = phase_path.read_text()
+    raw = yaml.safe_load(text)
+    raw["state"]["completion"]["at"] = _now_iso()
+    if note is not None:
+        raw["state"]["completion"]["note"] = note
+    phase_path.write_text(rewrite_phase_text(text, raw, "state"))
+    parse(plan_dir)
+    _stage(plan.repo_root, [phase_path])
+
+
+def set_tracking_issue(plan_dir: Path, phase_n: int, url: str) -> None:
+    """Persist phase.tracking_issue back to <plan_dir>/<NN>.yaml.
+
+    Idempotent on same url; overwrites on different. Stages but does
+    not commit.
+    """
+    plan = parse(plan_dir)
+    phase_path = plan_dir / f"{phase_n:02d}.yaml"
+    if not phase_path.exists():
+        raise PlanEditError(f"phase {phase_n} yaml not found: {phase_path}")
+    text = phase_path.read_text()
+    raw = yaml.safe_load(text)
+    if raw["phase"].get("tracking_issue") == url:
+        return
+    raw["phase"]["tracking_issue"] = url
+    phase_path.write_text(rewrite_phase_text(text, raw, "phase"))
+    try:
+        parse(plan_dir)
+    except PlanSchemaError as e:
+        raise PlanEditError(f"post-write schema validation failed: {e}") from e
+    _stage(plan.repo_root, [phase_path])
+
+
+def clear_tracking_issue(plan_dir: Path, phase_n: int) -> bool:
+    """Null phase.tracking_issue in <plan_dir>/<NN>.yaml (inverse of
+    `set_tracking_issue` — the `fr undispatch` writeback).
+
+    Returns True when the field was cleared, False when it was already
+    null (no-op; the file is not rewritten, keeping re-runs byte-stable).
+    Stages but does not commit.
+    """
+    plan = parse(plan_dir)
+    phase_path = plan_dir / f"{phase_n:02d}.yaml"
+    if not phase_path.exists():
+        raise PlanEditError(f"phase {phase_n} yaml not found: {phase_path}")
+    text = phase_path.read_text()
+    raw = yaml.safe_load(text)
+    if raw["phase"].get("tracking_issue") is None:
+        return False
+    raw["phase"]["tracking_issue"] = None
+    phase_path.write_text(rewrite_phase_text(text, raw, "phase"))
+    try:
+        parse(plan_dir)
+    except PlanSchemaError as e:
+        raise PlanEditError(f"post-write schema validation failed: {e}") from e
+    _stage(plan.repo_root, [phase_path])
+    return True
+
+
+# ---------------------------------------------------------------------------
+# vk.plan.rework_create / rework_add_origin / rework_list
+
+
+_REWORK_SUFFIX_RE = re.compile(r"-rework-(\d+)$")
+
+
+def _superpowers_dir(parent_dir: Path) -> Path:
+    """Resolve the docs/superpowers/ root from a plan dir in any layout:
+    plans/<x>, implemented/plans/<x> (canonical archive, 2026-06-05 spec),
+    or archived-plans/<x> (legacy)."""
+    if parent_dir.parent.name == "plans" and parent_dir.parent.parent.name == "implemented":
+        return parent_dir.parent.parent.parent
+    return parent_dir.parent.parent
+
+
+def _next_rework_number(parent_dir: Path) -> int:
+    """Cross-directory N collision check, like v1 next_rework_number.
+
+    Scans active plans/, implemented/plans/ (canonical archive), and
+    archived-plans/ (legacy) so an archived rework still claims its number.
+    """
+    repo_root = _superpowers_dir(parent_dir)
+    plans_dir = repo_root / "plans"
+    implemented_dir = repo_root / "implemented" / "plans"
+    archived_dir = repo_root / "archived-plans"
+
+    parent_slug = parent_dir.name
+
+    def _scan(d: Path) -> set[int]:
+        if not d.is_dir():
+            return set()
+        out: set[int] = set()
+        for child in d.iterdir():
+            if not child.is_dir():
+                continue
+            if not child.name.startswith(parent_slug + "-rework-"):
+                continue
+            m = _REWORK_SUFFIX_RE.search(child.name)
+            if m:
+                out.add(int(m.group(1)))
+        return out
+
+    in_plans = _scan(plans_dir)
+    in_archived = _scan(implemented_dir) | _scan(archived_dir)
+    collision = in_plans & in_archived
+    if collision:
+        n = sorted(collision)[0]
+        raise PlanEditError(
+            f"ambiguous rework state: {parent_slug}-rework-{n} exists in BOTH "
+            f"plans/ and an archive dir (implemented/plans/ or archived-plans/). "
+            f"Resolve manually before scaffolding."
+        )
+    combined = in_plans | in_archived
+    return max(combined) + 1 if combined else 1
+
+
+def rework_create(parent_plan_dir: Path) -> Plan:
+    """Scaffold a sibling rework plan folder + append spec row.
+
+    Parent stays Complete and untouched. Rework folder is empty of phases
+    (operator authors them later, informed by origin_items).
+    """
+    parent_dir = parent_plan_dir.resolve()
+    if not parent_dir.is_dir():
+        raise PlanEditError(f"parent plan dir not found: {parent_dir}")
+    superpowers_dir = _superpowers_dir(parent_dir)
+    in_implemented = (
+        parent_dir.parent.name == "plans" and parent_dir.parent.parent.name == "implemented"
+    )
+    in_active_or_legacy = parent_dir.parent.name in ("plans", "archived-plans")
+    if superpowers_dir.name != "superpowers" or not (in_implemented or in_active_or_legacy):
+        raise PlanEditError(
+            f"parent must live under docs/superpowers/"
+            f"{{plans,implemented/plans,archived-plans}}/, got: {parent_dir}"
+        )
+
+    parent_plan = parse(parent_dir)
+    n = _next_rework_number(parent_dir)
+    rework_slug = f"{parent_dir.name}-rework-{n}"
+    plans_dir = superpowers_dir / "plans"
+    rework_folder = plans_dir / rework_slug
+    if rework_folder.exists():
+        raise PlanEditError(f"rework folder already exists: {rework_folder}")
+    rework_folder.mkdir()
+
+    repo_root = parent_plan.repo_root
+
+    # Canonical lifecycle-independent refs (2026-06-06 spec-path-repair):
+    # bare slugs cannot go stale when plans archive.
+    parent_rel = parent_dir.name
+    prior_rework_rel: str | None = None
+    if n > 1:
+        prior_dir = _find_prior_rework(parent_dir, below=n)
+        if prior_dir is not None:
+            prior_rework_rel = prior_dir.name
+
+    parent_spec = parent_plan.meta.spec
+    if parent_spec:
+        # The one canonical `spec:` form, shared with create and repair (#686).
+        parent_spec = refs.canonical_spec_ref(
+            parent_spec, repo_root or superpowers_dir.parent.parent
+        )
+
+    meta = {
+        "schema_version": 2,
+        "plan": rework_slug,
+        "spec": parent_spec,
+        "target_repo": parent_plan.meta.target_repo,
+        # Widened past the 4.0.0 major bump, same reasoning as plan_cmd.py's default.
+        "fr_version": parent_plan.meta.fr_version or f">=3.0.0,<{CEILING_VERSION}",
+        "created": _dt.date.today().isoformat(),
+        "parent_plan": parent_rel,
+    }
+    if prior_rework_rel:
+        meta["prior_rework"] = prior_rework_rel
+    meta["origin_items"] = []
+    (rework_folder / "_meta.yaml").write_text(_yaml_dump(meta))
+
+    parent_title = (
+        (parent_dir / "_prose.md").read_text().splitlines()[0]
+        if (parent_dir / "_prose.md").exists()
+        else parent_dir.name
+    )
+    prose = (
+        f"# {parent_title} — Rework {n}\n\n"
+        f"Rework plan against `{parent_dir.name}`. See `_meta.yaml` for "
+        f"`parent_plan`, `prior_rework`, and `origin_items`.\n"
+    )
+    (rework_folder / "_prose.md").write_text(prose)
+
+    written: list[Path] = [rework_folder / "_meta.yaml", rework_folder / "_prose.md"]
+
+    # Append spec row — lifecycle-resolved (2026-06-06 spec-path-repair):
+    # the spec may have archived to implemented/specs/ since the parent
+    # plan recorded it; the old exact-path check silently skipped then.
+    if (
+        parent_plan.meta.spec
+        and repo_root is not None
+        and not is_cross_repo_spec(parent_plan.meta.spec)
+    ):
+        spec_res = refs.resolve_spec_ref(parent_plan.meta.spec, repo_root)
+        if spec_res.path is not None:
+            _append_spec_row(
+                spec_res.path,
+                plan_name=rework_slug,
+                repo=parent_plan.meta.target_repo,
+                file=rework_slug,
+                depends_on=parent_plan.meta.plan,
+            )
+            written.append(spec_res.path)
+
+    _stage(repo_root, written)
+    return parse(rework_folder)
+
+
+def _find_prior_rework(parent_dir: Path, *, below: int) -> Path | None:
+    """Highest archived rework N below `below` (in archived-plans/)."""
+    superpowers_dir = parent_dir.parent.parent
+    archived_dir = superpowers_dir / "archived-plans"
+    if not archived_dir.is_dir():
+        return None
+    parent_slug = parent_dir.name
+    best_n = -1
+    best: Path | None = None
+    for child in archived_dir.iterdir():
+        if not child.is_dir():
+            continue
+        if not child.name.startswith(parent_slug + "-rework-"):
+            continue
+        m = _REWORK_SUFFIX_RE.search(child.name)
+        if m:
+            n = int(m.group(1))
+            if n < below and n > best_n:
+                best_n = n
+                best = child
+    return best
+
+
+def rework_add_origin(
+    rework_dir: Path,
+    *,
+    item: str,
+    source: str,
+    track: str,
+) -> int:
+    """Append an item to _meta.origin_items. Returns assigned id."""
+    plan = parse(rework_dir)
+    if plan.meta.parent_plan is None:
+        raise PlanEditError(f"{rework_dir} is not a rework plan (no parent_plan in _meta)")
+
+    raw = yaml.safe_load((rework_dir / "_meta.yaml").read_text())
+    items = list(raw.get("origin_items") or [])
+    next_id = (max((it["id"] for it in items), default=0) + 1) if items else 1
+    items.append({"id": next_id, "item": item, "source": source, "track": track})
+    raw["origin_items"] = items
+    (rework_dir / "_meta.yaml").write_text(_yaml_dump(raw))
+    parse(rework_dir)  # validate
+    _stage(plan.repo_root, [rework_dir / "_meta.yaml"])
+    return next_id
+
+
+@dataclass(frozen=True)
+class ReworkRecord:
+    parent_slug: str
+    rework_number: int
+    status: Literal["Not Started", "In Progress", "Complete"]
+    open_steps: int
+    origin_item_count: int
+    by_track: tuple[tuple[str, int], ...]  # frozen for hashability
+    folder_path: Path
+    spec_path: Path | None
+
+
+def rework_list(repo_root: Path, *, include_archived: bool = False) -> list[ReworkRecord]:
+    """Glob plan folders; filter by parent_plan; aggregate status."""
+    dirs = [repo_root / "docs" / "superpowers" / "plans"]
+    if include_archived:
+        dirs.append(repo_root / "docs" / "superpowers" / "archived-plans")
+
+    records: list[ReworkRecord] = []
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for folder in sorted(d.iterdir()):
+            if not folder.is_dir():
+                continue
+            try:
+                plan = parse(folder)
+            except PlanSchemaError:
+                continue
+            if plan.meta.parent_plan is None:
+                continue
+            m = _REWORK_SUFFIX_RE.search(folder.name)
+            n = int(m.group(1)) if m else 0
+            parent_slug = re.sub(r"-rework-\d+$", "", folder.name)
+
+            total_steps = sum(len(t.steps) for p in plan.phases for t in p.tasks)
+            ticked = sum(
+                1 for p in plan.phases for ss in p.state.steps.values() if ss.state in ("x", "-")
+            )
+            open_steps = total_steps - ticked
+            status: Literal["Not Started", "In Progress", "Complete"]
+            if total_steps == 0 or ticked == 0:
+                status = "Not Started"
+            elif ticked == total_steps:
+                status = "Complete"
+            else:
+                status = "In Progress"
+
+            by_track: dict[str, int] = {}
+            for it in plan.meta.origin_items:
+                by_track[it.track] = by_track.get(it.track, 0) + 1
+
+            spec_path = None
+            if plan.meta.spec:
+                if plan.spec_path is not None:
+                    spec_path = (repo_root / plan.spec_path).resolve()
+                else:
+                    spec_path = (repo_root / plan.meta.spec).resolve()
+            records.append(
+                ReworkRecord(
+                    parent_slug=parent_slug,
+                    rework_number=n,
+                    status=status,
+                    open_steps=open_steps,
+                    origin_item_count=len(plan.meta.origin_items),
+                    by_track=tuple(sorted(by_track.items())),
+                    folder_path=folder,
+                    spec_path=spec_path,
+                )
+            )
+    return records
+
+
+# ---------------------------------------------------------------------------
+# vk.plan.self_review (lints)
+
+# Agentic-purity gate (#252): a skipped (`state: '-'`) step in an AGENTIC
+# phase whose note defers it forward is a mis-scoped manual step — an
+# agentic phase must be fully agent-completable. The note either names a
+# later phase ("Executed in Phase 5") or uses a defer-phrase.
+_PHASE_REF_NOTE_RE = re.compile(r"[Pp]hase\s+(\d+)")
+_TASK_ID_RE = re.compile(r"p\d+\.t\d+")
+"""Task ids (`P<n>.T<m>`) inside journal justifications — matched casefolded,
+so `P1.T1`, `p1.t1` and a trailing comma all resolve; uppercased at use."""
+_DEFER_PHRASES = ("defer", "executed in", "moved to")
+
+# Part 2 of the gate: manual-operation language in a pending agentic step.
+# Deliberately conservative (precision over recall) — the deferred-step
+# lint above is the load-bearing detector; this one catches the authoring
+# mistake before any deferral happens. Word-boundary, case-insensitive.
+_MANUAL_VERB_RES = tuple(
+    re.compile(rf"\b{phrase}\b", re.IGNORECASE)
+    for phrase in (
+        "manually",
+        "by hand",
+        "via the UI",
+        "in the UI",
+        "click",
+        "SOPS",
+        "operator sets",
+        "operator provides",
+    )
+)
+
+
+# Agentic dispatch-verb gate (#428). `fr-phase-executor` is a leaf on both
+# harnesses — Claude Code omits `Agent` from its frontmatter tool grant,
+# OpenCode sets `task: deny` — so a step telling it to dispatch a subagent
+# is unexecutable by construction. The honest executor does the nearest
+# thing it can, reports the deviation, and ticks anyway; the plan then
+# records completion for work nobody performed as written (spec §2.E).
+#
+# Precision is the whole design problem: super-fr is a repo ABOUT dispatch.
+# #428's literal proposal `\bdispatch(es|ed|ing)?\b` scores 292 hits across
+# this repo's own plan corpus (the bare stem alone scores 262) and every
+# one is a false positive (spec §2.D measured 237 on the smaller enforcing
+# read) — at error severity the gate would be switched
+# off within a week. Both patterns below score ZERO over all 2113 agentic
+# steps of that corpus, ticked and pending alike, pinned by
+# `tests/unit/test_dispatch_lint_corpus.py`.
+#
+# "Both patterns, over ALL steps" is the claim that matters and it is the
+# one that was nearly shipped false: the first cut added a frameless
+# `subagent_type[:=]` arm, which hit a real live plan
+# (`2026-09-19-opencode-subagent-dispatch` P4.T1.S2). The corpus test
+# stayed green only because that step is ticked and the gate exempts
+# ticked steps — so the measurement has to be taken over every step, not
+# over the subset the gate happens to look at today.
+
+# Bare imperatives only. An inflected form (`dispatches`, `spawning`) is a
+# verb in the indicative or a gerund — it DESCRIBES. The boundary anchors
+# position; the bare stem is what anchors mood, and the two together are
+# what separate "Dispatch the cold-reader agent" from "Note: dispatch is
+# described in the agent docs".
+_DISPATCH_VERB = r"""(?:
+      dispatch
+    | delegate\s+to
+    | spawn
+    | hand\s+off\s+to
+    | fan\s+out\s+to
+)\b"""
+# The trailing `\b` is load-bearing, not tidiness: without it the stem
+# `dispatch` matches the PREFIX of `dispatching`, the window swallows the
+# suffix, and the bare-stem rule silently buys nothing — "Add a test:
+# dispatching to the fr-phase-executor agent is refused" was flagged.
+
+# ...and the verb must not be followed by a copula, a modal or `of`, all
+# of which turn the stem back into a subject or a noun: "dispatch IS
+# described", "dispatch OF a subagent belongs in a [manual] phase".
+_NOT_A_PREDICATE = r"""(?!\s+(?:
+      of|is|are|was|were|isn't|aren't
+    | can|cannot|can't|could|should|must|may|might|will|would
+    | does|do|did|has|have|had
+    | means|happens|occurs|belongs|remains|stays
+)\b)"""
+
+# An agent-shaped OBJECT. Every arm requires a ROLE WORD: without one, a
+# bare `word:word` token re-admits the 42-hit false-positive class §2.D
+# measured (`plan:my-slug`, `fr:synced`, `fr.tracker:GithubTracker`,
+# `start:end`, `cli:app`).
+_AGENT_ROLE = r"(?:sub-?agents?|agents?|executors?|researchers?|reviewers?|readers?)"
+_ROLE_STEM = r"(?:agent|executor|researcher|reviewer|reader)"
+_AGENT_OBJECT = rf"""(?:
+      `[\w.-]+:[\w.-]*{_ROLE_STEM}[\w.-]*`
+    | \b[\w.-]+:[\w.-]*{_ROLE_STEM}[\w.-]*\b
+    | \b{_AGENT_ROLE}\b
+)"""
+# Arm 1 (backticked) is not subsumed by arm 3 even though arm 3 would
+# also match `researcher` inside it: it is what makes the reported match
+# the COMPLETE token an author can recognise —
+# "Dispatch `blog-craft:post-researcher`" rather than a truncation
+# missing its closing backtick. Arm 2 catches the glued form
+# (`blog-craft:postresearcher`), where arm 3's word boundary fails. Both
+# are pinned by tests; delete either and a test goes red.
+
+# An INSTRUCTION BOUNDARY is start-of-text, real sentence punctuation
+# followed by whitespace, or a list marker starting a line — NEVER a bare
+# newline. Plan step text is hard-wrapped prose, so a bare-newline
+# boundary lets a SOFT WRAP fake an imperative: measured over the corpus,
+# it flagged this feature's own phase-3 step for saying "...spawn or\nhand
+# off to a subagent is a BLOCKER", which describes the contract and
+# instructs nothing. A list item is a fresh instruction and keeps its
+# anchor; a wrap is a formatting artifact and must not create one.
+#
+# Two refinements on the punctuation arm, both from measurement:
+#   * the trailing `\s+`, without which the ellipsis in `"...spawn` reads
+#     as a sentence start;
+#   * the abbreviation lookbehinds, because `e.g.`, `i.e.`, `etc.`, `cf.`
+#     and `vs.` all satisfy `(?<=[.;:!?])\s+` while continuing the same
+#     sentence — "Cf. dispatch to the fr-phase-executor agent" is a
+#     cross-reference, not an instruction.
+_INSTRUCTION_BOUNDARY = r"""(?:
+      \A\s*
+    | (?<=[.;:!?])(?<!e\.g\.)(?<!i\.e\.)(?<!etc\.)(?<!cf\.)(?<!vs\.)\s+
+    | ^[ \t]*(?:[-*+]|\d+[.)])[ \t]+
+)"""
+
+_CONNECTIVE = r"(?:(?:then|and|next|finally|also)\s+)?"
+
+# Pattern 1 — imperative-head dispatch verb with an agent-shaped object
+# within ~60 characters of the SAME LINE. The head anchor is what buys the
+# precision: it separates INSTRUCTING the executor to dispatch from
+# DESCRIBING dispatch, which is what every measured false positive
+# ("implement `fr_dispatch.tick()` so it dispatches phases to the runner")
+# was doing.
+#
+# `\n` is excluded from the window deliberately, and it costs recall: a
+# verb and its object split by a hard wrap ("Dispatch the\ncold-reader
+# agent") is NOT flagged. That is the priced trade — the same window
+# spanning newlines lets an object on an unrelated wrapped line manufacture
+# a hit, which is the soft-wrap defect one level down. Precision first: a
+# gate that fires on prose gets switched off, a gate that misses a wrapped
+# instruction still catches the next unwrapped one.
+_RE_DISPATCH_HEAD = re.compile(
+    _INSTRUCTION_BOUNDARY
+    + _CONNECTIVE
+    + _DISPATCH_VERB
+    + _NOT_A_PREDICATE
+    + r"[^.;:!?\n]{0,60}?"
+    + _AGENT_OBJECT,
+    re.IGNORECASE | re.MULTILINE | re.VERBOSE,
+)
+
+# Pattern 2 — the explicit mechanism, in an instructional frame, behind
+# the SAME instruction boundary as pattern 1. Bare `Agent tool` / `Task
+# tool` are ordinary nouns in a repo that documents dispatch: measured
+# over the corpus the nominal form flagged 3 steps, all 3 of them this
+# feature's own plan describing what the executor lacks. Anchoring and
+# bare-stem mood are both needed — "Explain why calling the Agent tool is
+# impossible here" is phase 4's own work, and it is not an instruction to
+# dispatch.
+#
+# Arm A requires a NON-EMPTY modifier between `the` and the role word,
+# which is what distinguishes naming an agent ("Use the fr-phase-executor
+# agent") from using `agent` as a modifier ("Use the agent frontmatter in
+# plugins/super-fr/agents/fr-phase-executor.md" — phase 3's own step).
+# Arm B is the fixed tool token.
+#
+# There is deliberately NO frameless `subagent_type[:=]` arm. In YAML and
+# in markdown that token is a KEY NAME — a mention, not a call site — and
+# a frameless arm hit a legitimate live plan on the corpus. The framed
+# form still catches "Call the Task tool with subagent_type:
+# general-purpose", so recall for the real instruction survives.
+_RE_DISPATCH_MECHANISM = re.compile(
+    _INSTRUCTION_BOUNDARY
+    + _CONNECTIVE
+    + r"""(?:use|call|invoke)\s+the\s+(?:
+          (?:[^\s.;:!?]+[ \t]+){1,3}"""
+    + _AGENT_ROLE
+    + r"""\b
+        | (?:Task|Agent)[ \t]+tools?\b
+    )""",
+    re.IGNORECASE | re.MULTILINE | re.VERBOSE,
+)
+
+_DISPATCH_RES = (_RE_DISPATCH_HEAD, _RE_DISPATCH_MECHANISM)
+
+# Fenced code blocks are content being WRITTEN, not an instruction to the
+# executor, so they are stripped before the scan. Inline backticks are
+# deliberately NOT stripped: the backticked agent name IS the object the
+# detector keys on, and removing it turns the observed defect
+# "Dispatch `blog-craft:post-researcher` per post" into "Dispatch   per
+# post" — the detector goes blind on the one case it exists for (spec
+# §4.A).
+#
+# The opening run is CAPTURED and back-referenced, because a fence is
+# closed by a run at least as long as its opener. Matching any ``` as a
+# closer mis-pairs a ````-fenced block that quotes a ```-fenced one — and
+# a ````markdown block quoting a rejected plan step is exactly the shape
+# phases 3 and 4 must write into SKILL.md. The mis-pairing does not merely
+# strip too little: it UN-FENCES the quoted instruction, so the gate fires
+# on a step that is only quoting the thing it forbids.
+#
+# An unterminated fence strips to end of text. For a precision-first gate
+# that is the safer reading of an ambiguous document: an author who opened
+# a block meant everything after it to be content.
+_FENCED_CODE_RE = re.compile(
+    r"^[ \t]*(`{3,})[^\n]*\n"  # opening run (captured) + info string
+    r".*?"  # content
+    r"(?:^[ \t]*\1`*[ \t]*$|\Z)",  # a run at least as long, or end of text
+    re.DOTALL | re.MULTILINE,
+)
+
+
+def _strip_fenced_code(text: str) -> str:
+    """Remove fenced code blocks. Inline backticks survive, by design."""
+    return _FENCED_CODE_RE.sub("\n", text)
+
+
+def _note_defers_forward(note: str, phase_number: int) -> bool:
+    """True iff `note` defers execution beyond `phase_number`.
+
+    An explicit phase reference decides outright: forward ("Executed in
+    Phase 5" on phase 3) is deferral; backward ("ported from Phase 1") is
+    history and disarms the defer-phrases. Only refless notes fall through
+    to the phrase scan.
+    """
+    m = _PHASE_REF_NOTE_RE.search(note)
+    if m:
+        return int(m.group(1)) > phase_number
+    lowered = note.lower()
+    return any(phrase in lowered for phrase in _DEFER_PHRASES)
+
+
+def _not_ticked_steps(phase: PhaseDoc) -> Iterator[Step]:
+    """Every not-yet-ticked step of `phase`, in document order.
+
+    The single walk both per-step detectors of the agentic-purity gate
+    consume (#252's manual-verb scan and #428's dispatch scan). They share
+    an exemption — a completed (`'x'`) step is a claim of performance that
+    already happened, so neither gate retro-errors on it — and sharing the
+    walk is what stops a future change to that exemption from applying to
+    one detector and not the other.
+    """
+    for task in phase.tasks:
+        for step in task.steps:
+            state = phase.state.steps.get(step.id)
+            if state is not None and state.state == "x":
+                continue
+            yield step
+
+
+@dataclass(frozen=True)
+class ReviewIssue:
+    severity: Literal["info", "warn", "error"]
+    message: str
+
+    def __str__(self) -> str:
+        return f"[{self.severity}] {self.message}"
+
+
+def _trailing_manual_block(plan: Plan) -> set[int]:
+    """The numbers of the plan's maximal *suffix* of `tag: manual` phases.
+
+    The invariant this serves (#496, 2026-09-20 spec §3.D.1) is: **no manual
+    phase may be outstanding when an agentic phase after it runs.** A manual
+    phase is therefore valid iff it is in this trailing block, OR is already
+    `fr.render.plan_locally_complete` — the second clause is what keeps
+    fr-goal §3's front-load exception expressible, since that flow ends with
+    the operator ticking the phase's steps before implementation resumes.
+
+    Walks phases in number order from the last one backwards and stops at
+    the first agentic phase, so `1 agentic, 2 manual, 3 agentic, 4 manual`
+    returns `{4}` and not `{2, 4}`. An all-manual plan returns every number;
+    a plan with no manual phases returns the empty set.
+
+    Shared on purpose: `self_review` (the authoring gate) and the `implement`
+    group preflight (the runtime gate, spec §3.D.2) both call this, so the
+    two enforcement points cannot disagree about what "trailing" means.
+    """
+    trailing: set[int] = set()
+    for phase in sorted(plan.phases, key=lambda p: p.phase.number, reverse=True):
+        if phase.phase.tag != "manual":
+            break
+        trailing.add(phase.phase.number)
+    return trailing
+
+
+def self_review(plan: Plan) -> list[ReviewIssue]:
+    """Soft lints beyond schema validation."""
+    issues: list[ReviewIssue] = []
+
+    # Cyclic depends_on
+    graph = {p.phase.number: set(p.phase.depends_on) for p in plan.phases}
+    for n, deps in graph.items():
+        if _has_cycle(graph, n):
+            issues.append(
+                ReviewIssue(
+                    severity="error",
+                    message=f"phase {n} is in a dependency cycle: depends_on={sorted(deps)}",
+                )
+            )
+            break
+
+    # Manual phase with completion.at but no note
+    for phase in plan.phases:
+        c = phase.state.completion
+        if c.at is not None and phase.phase.tag == "manual" and not c.note:
+            issues.append(
+                ReviewIssue(
+                    severity="error",
+                    message=(
+                        f"phase {phase.phase.number} is manual and complete but has "
+                        f"no completion.note — manual phases require a note."
+                    ),
+                )
+            )
+
+    # Agentic-purity gate (#252, extended by #428). An agentic phase is
+    # meant to be fully agent-completable and end in one PR. Three
+    # error-severity detectors per agentic phase (the gate is enforced, not
+    # advisory):
+    #   1. Deferred steps — a step skipped (`'-'`) with a forward-deferring
+    #      note was manual by nature and belongs in a manual phase.
+    #   2. Manual-operation language in a not-yet-completed step. Completed
+    #      ('x') steps are exempt — a ticked step already proved
+    #      agent-completable, and the exemption keeps historical plans (or
+    #      step texts that merely QUOTE the phrases) from retro-erroring.
+    #      At authoring time every step is unticked, so the gate bites
+    #      exactly where it should.
+    #   3. A dispatch instruction aimed at an actor with no Agent tool
+    #      (#428). Detectors 2 and 3 consume the same
+    #      `_not_ticked_steps` walk, so the exemptions above cannot
+    #      apply to one gate and not the other.
+    for phase in plan.phases:
+        if phase.phase.tag != "agentic":
+            continue
+        n = phase.phase.number
+        for step_id, ss in sorted(phase.state.steps.items()):
+            if ss.state != "-" or not ss.note:
+                continue
+            if _note_defers_forward(ss.note, n):
+                issues.append(
+                    ReviewIssue(
+                        severity="error",
+                        message=(
+                            f"phase {n} (agentic) step {step_id} is deferred "
+                            f"(note: {ss.note!r}) — manual-by-nature work must move "
+                            f"into a manual phase; agentic phases must be pure agentic."
+                        ),
+                    )
+                )
+        for step in _not_ticked_steps(phase):
+            hit = next((p for p in _MANUAL_VERB_RES if p.search(step.text)), None)
+            if hit is not None:
+                issues.append(
+                    ReviewIssue(
+                        severity="error",
+                        message=(
+                            f"phase {n} (agentic) step {step.id} reads like a "
+                            f"manual operation (matched {hit.pattern!r}) — move it "
+                            f"into a manual phase; agentic phases must be pure agentic."
+                        ),
+                    )
+                )
+            scanned = _strip_fenced_code(step.text)
+            m = next(
+                (m for m in (p.search(scanned) for p in _DISPATCH_RES) if m is not None),
+                None,
+            )
+            if m is not None:
+                matched = " ".join(m.group(0).split())
+                issues.append(
+                    ReviewIssue(
+                        severity="error",
+                        message=(
+                            f"phase {n} (agentic) step {step.id} tells the phase "
+                            f"executor to dispatch a subagent (matched {matched!r}) "
+                            f"— fr-phase-executor has no Agent tool (OpenCode: "
+                            f"task: deny) and cannot dispatch anything, so this step "
+                            f"is unexecutable by construction (#428). Name the "
+                            f'OUTCOME instead ("gather file:line-cited evidence '
+                            f'following <protocol>"), or move the dispatch into '
+                            f"the plan's TRAILING [manual] phase — a mid-plan "
+                            f"[manual] phase with agentic work after it trades this "
+                            f"error for the #496 placement one."
+                        ),
+                    )
+                )
+
+    # Trailing-manual invariant (#496, 2026-09-20 spec §3.D.1): no manual
+    # phase may be OUTSTANDING when an agentic phase after it runs. Checked
+    # here because "where may a manual phase sit" is a structural invariant
+    # of the plan, so it can be decided before anything is dispatched —
+    # fr-goal runs this as its `plan-review` cli step, whose exit code is
+    # the verdict, so a mis-shaped plan fails before phase 1 ever leaves.
+    issues.extend(_manual_placement_issues(plan))
+
+    # The plan's declared workflow shape (spec §4.A.1): it must resolve,
+    # and it must be a valid shape. Both are errors — dispatch reads this
+    # reference, so an unresolvable or malformed one is a plan that cannot
+    # be dispatched at all.
+    issues.extend(_workflow_issues(plan))
+
+    # Acceptance linkage (2026-07-04 acceptance-matrix spec, decision 2).
+    issues.extend(_acceptance_link_issues(plan))
+
+    # The spec's `## Verification` (2026-10-06 verification-strategies §B):
+    # a malformed section, a post-merge/`none` row with no reason, an agent
+    # pre-merge row with no scenario.
+    issues.extend(_verification_issues(plan))
+
+    # Walking-skeleton gate (fr-goal methodology restoration): the first
+    # agentic phase is the delivery-infrastructure smoke.
+    issues.extend(_skeleton_issues(plan))
+
+    # Phase sizing (2026-09-28 phase-sizing spec §B/§C): one agentic phase per
+    # ask of the spec's Requirements list, a recorded reason for any other.
+    issues.extend(_phase_sizing_issues(plan))
+
+    # Tier gates (2026-09-20 phases-file-tier-reaches-dispatch spec, D2): the
+    # fr_version floor probe for `tier`, and the untiered-agentic-phase nudge.
+    issues.extend(_tier_issues(plan))
+
+    # Proportionality inputs (2026-09-24 spec §C): the `files`/`estimate_lines`
+    # fr_version floor, and the no-`files` agentic-phase nudge.
+    issues.extend(_scope_field_issues(plan))
+
+    # The refactor-or-justify gate moved to `fr run resolve` (spec 2026-09-25
+    # §5.C.2.2, `fr.record.gates.refactor_gaps`): at plan time "nothing to
+    # clean" is a guess; at resolve the executor knows.
+
+    # Same-repo-form spec that doesn't resolve locally (#248): almost always a
+    # malformed cross-repo ref missing the `owner/repo:` prefix, which apply's
+    # reachability gate treats as a missing same-repo file and flags unreachable.
+    spec = plan.meta.spec
+    if (
+        spec
+        and spec not in ("none", "null", "—", "-")
+        and plan.repo_root is not None
+        and not is_cross_repo_spec(spec)
+        and ("/" in spec or spec.endswith(".md"))
+        # parse-time lifecycle resolution (2026-06-06 spec-path-repair):
+        # slug-form and archived specs resolve via plan.spec_path.
+        and plan.spec_path is None
+        and not (plan.repo_root / spec).exists()
+    ):
+        issues.append(
+            ReviewIssue(
+                severity="warn",
+                message=(
+                    f"spec {spec!r} does not resolve under the repo root. If the spec "
+                    f"lives in another repo, use the cross-repo form "
+                    f"'owner/repo:path/to/spec.md' (#248); otherwise create the file."
+                ),
+            )
+        )
+
+    # Over-long plan label (#249): `plan:<slug>` past GitHub's 50-char label
+    # cap is auto-truncated+hashed at dispatch, but the operator should know —
+    # a hashed routing key is opaque; a shorter slug reads better on the board.
+    # Check the NORMALIZED slug — that's the shape that actually ships; a raw
+    # dated slug whose date-free form fits is not over-long. Built by hand
+    # (not via `labels.plan_label`) on purpose: the factory's `.name` is
+    # already bounded to 50 chars, so overflow would be undetectable from it.
+    normalized_plan_label = f"plan:{normalize_label_slug(plan.meta.plan)}"
+    if len(normalized_plan_label) > MAX_LABEL_NAME_LEN:
+        issues.append(
+            ReviewIssue(
+                severity="warn",
+                message=(
+                    f"plan label {normalized_plan_label!r} is "
+                    f"{len(normalized_plan_label)} chars (>{MAX_LABEL_NAME_LEN}); "
+                    f"it will be truncated + hashed for GitHub. Consider a "
+                    f"shorter slug (rework suffixes push long slugs over)."
+                ),
+            )
+        )
+
+    return issues
+
+
+def _manual_placement_issues(plan: Plan) -> list[ReviewIssue]:
+    """Where a manual phase may sit (#496, 2026-09-20 spec §3.D.1).
+
+    One invariant — *no manual phase may be outstanding when an agentic
+    phase after it runs* — with two ways to break it, so one pass over the
+    phases and two distinct `severity="error"` messages:
+
+      POSITION    a manual phase that is neither in the trailing manual
+                  block nor already `plan_locally_complete`, with agentic
+                  work still to come after it.
+      DEPENDENCY  an agentic phase whose `depends_on` names an OUTSTANDING
+                  manual phase, whatever the two positions — position alone
+                  is not the invariant, and a *trailing* manual phase
+                  reintroduces the hazard the moment something agentic waits
+                  on it.
+
+    Both halves key on the same word, *outstanding*, and that is the whole
+    point (review `r4-f1`). An earlier draft made the dependency half
+    unconditional over every manual phase, which read as the stricter and
+    therefore safer choice. It is not: it makes fr-goal §3's **front-load**
+    exception unexpressible, because front-loading is defined by that very
+    dependency — §3 front-loads "only when agentic work depends on it". The
+    canonical front-load shape is `1 [manual] (ticked, the operator's go),
+    2 agentic depends_on [1]`, and the unconditional rule errors on it
+    forever with no remedy that keeps the plan's meaning: "drop the
+    dependency" discards a true fact about the build order, and "make
+    phase 2 manual" abandons the automation. Operator decision `d5` chose
+    "trailing OR already complete" precisely so §3 survived; a dependency on
+    an already-complete manual phase waits on nobody.
+
+    The reverse dependency direction is deliberately legal: a trailing
+    manual phase may declare backward deps on the agentic work it collects.
+    """
+    out: list[ReviewIssue] = []
+    ordered = sorted(plan.phases, key=lambda p: p.phase.number)
+    trailing = _trailing_manual_block(plan)
+    # OUTSTANDING manual phases, not all of them: a manual phase whose steps
+    # are already ticked is work nobody is still owed, so nothing waits on it
+    # (review `r4-f1`). Same predicate the position half uses, so the two
+    # halves cannot disagree about what "outstanding" means.
+    outstanding_manual = {
+        p.phase.number for p in ordered if p.phase.tag == "manual" and not plan_locally_complete(p)
+    }
+    for idx, phase in enumerate(ordered):
+        n = phase.phase.number
+        if phase.phase.tag == "manual":
+            if n in trailing or plan_locally_complete(phase):
+                continue
+            after = next(
+                (p.phase.number for p in ordered[idx + 1 :] if p.phase.tag == "agentic"),
+                None,
+            )
+            out.append(
+                ReviewIssue(
+                    severity="error",
+                    message=(
+                        f"phase {n} is `tag: manual` but is neither in the plan's "
+                        f"trailing manual block nor already complete, so agentic "
+                        f"phase {after} would run while a human is still owed work. "
+                        f"Move phase {n} to the end of the plan, or tick its steps "
+                        f"(the operator's go) before the run reaches phase {after}."
+                    ),
+                )
+            )
+            continue
+        for dep in sorted(set(phase.phase.depends_on) & outstanding_manual):
+            out.append(
+                ReviewIssue(
+                    severity="error",
+                    message=(
+                        f"phase {n} is agentic but declares depends_on phase {dep}, "
+                        f"which is `tag: manual` and still outstanding — an agentic "
+                        f"phase must never wait on a human, whatever the two "
+                        f"positions. Tick phase {dep}'s steps before the run reaches "
+                        f"phase {n} (fr-goal's front-load: the operator's go), drop "
+                        f"the dependency, or make phase {n} manual and move both into "
+                        f"the plan's trailing manual block."
+                    ),
+                )
+            )
+    return out
+
+
+def _workflow_issues(plan: Plan) -> list[ReviewIssue]:
+    """Validate `_meta.yaml`'s optional `workflow:` reference (spec §4.A.1).
+
+    A plan that names no shape is silent: absence resolves the default and
+    is the state of every plan written before the field existed. A plan
+    that DOES name one is checked twice — `workflow_for_plan` (does it
+    resolve, repo > shipped?) and `check_workflow` (is the resolved shape
+    internally valid?) — because a shape that resolves but is malformed
+    fails at tick time instead, far from the plan that chose it.
+    """
+    from fr.workflow.check import check_workflow
+    from fr.workflow.model import WorkflowError
+    from fr.workflow.resolve import workflow_for_plan
+
+    if plan.meta.workflow is None:
+        return []
+    try:
+        manifest = workflow_for_plan(plan)
+    except WorkflowError as e:
+        return [ReviewIssue(severity="error", message=str(e))]
+    return [
+        ReviewIssue(
+            severity="error",
+            message=f"workflow shape {plan.meta.workflow!r}: {err}",
+        )
+        for err in check_workflow(manifest, plan.repo_root)
+    ]
+
+
+def _verification_issues(plan: Plan) -> list[ReviewIssue]:
+    """Spec 2026-10-06-verification-strategies §B (R6, R10), each refused by
+    name: a malformed `## Verification`; a row citing the spec whose effective
+    strategy is post-merge or `none` with no reason line in the section; a row
+    whose effective strategy is agent-driven and pre-merge with no `scenario`;
+    and a strategy that does not resolve. A spec with no section is the world
+    before strategies and passes unchanged. Same-repo specs only, as the
+    acceptance linkage check."""
+    from fr.acceptance.model import AcceptanceError
+    from fr.requirements import load_spec_matrix, rows_citing
+    from fr.verification.effective import effective_shape_default
+    from fr.verification.model import RESERVED, StrategyError
+    from fr.verification.resolve import resolve_strategy
+    from fr.verification.rows import SpecVerification, spec_section_at, unrunnable_strategies
+    from fr.verification.spec_section import SectionError
+    from fr.workflow.model import WorkflowError
+    from fr.workflow.resolve import workflow_for_plan
+
+    root = plan.repo_root
+    spec_rel = plan.spec_path or plan.meta.spec
+    if root is None or not spec_rel or is_cross_repo_spec(spec_rel):
+        return []
+
+    def issue(message: str) -> ReviewIssue:
+        return ReviewIssue(severity="error", message=f"spec ## Verification: {message}")
+
+    try:
+        section = spec_section_at(root, spec_rel)
+    except SectionError as e:
+        return [issue(f"{spec_rel} {e}")]
+    if section is None:
+        return []
+    try:
+        shape = effective_shape_default(workflow_for_plan(plan).verification, root)
+    except WorkflowError:
+        shape = None  # `_workflow_issues` reports the shape itself
+    try:
+        matrix, spec_ref = load_spec_matrix(root, spec_rel)
+    except AcceptanceError:
+        return []  # `_acceptance_link_issues` reports an unreadable matrix
+    verification = SpecVerification(root, section, shape)
+    out: list[ReviewIssue] = [
+        issue(m) for m in unrunnable_strategies(root, section, rows_citing(matrix, spec_ref))
+    ]
+    for row in rows_citing(matrix, spec_ref):
+        name = verification.strategy(row)
+        if name is None:
+            continue
+        if name == RESERVED:
+            if not verification.reason(row):
+                out.append(
+                    issue(
+                        f"row `{row.id}` is `none` with no reason — add "
+                        f"`- {row.id}: none — <what verifies it instead>`"
+                    )
+                )
+            continue
+        try:
+            manifest = resolve_strategy(name, root)
+        except StrategyError as e:
+            out.append(issue(f"row `{row.id}`: {e}"))
+            continue
+        if manifest.when == "post-merge" and not verification.reason(row):
+            out.append(
+                issue(
+                    f"row `{row.id}` is post-merge (`{name}`) with no reason — add "
+                    f"`- {row.id}: {name} — <why no pre-merge strategy applies>`"
+                )
+            )
+        if manifest.when == "pre-merge" and manifest.driver == "agent" and not row.scenario:
+            out.append(
+                issue(
+                    f"row `{row.id}` is walked by an agent before merge (`{name}`) but names "
+                    "no `scenario` — set one with `fr acceptance set-status "
+                    f"--id {row.id} ... --scenario <path>`"
+                )
+            )
+    return out
+
+
+def _acceptance_link_issues(plan: Plan) -> list[ReviewIssue]:
+    """Decision 2 of the acceptance-matrix spec: a plan whose spec carries a
+    Test Plan must link >=1 matrix row (`acceptance: [row-ids]` on phases),
+    and every linked id must exist. Error only when the repo HAS a matrix —
+    matrix-less repos get an adoption nudge, not a broken self-review.
+    Cross-repo specs are exempt in v1 (the matrix lives with the spec's repo,
+    which this checkout cannot see)."""
+    from fr.acceptance.model import AcceptanceError, load_matrix
+
+    root = plan.repo_root
+    if root is None:
+        return []
+    spec_rel = plan.spec_path or plan.meta.spec
+    if not spec_rel or is_cross_repo_spec(spec_rel):
+        return []
+    spec_file = root / spec_rel
+    if not spec_file.exists() or "## Test Plan" not in spec_file.read_text():
+        return []
+
+    linked: dict[str, int] = {}  # row id → first phase that links it
+    for ph in plan.phases:
+        for rid in ph.phase.acceptance:
+            linked.setdefault(rid, ph.phase.number)
+
+    matrix_path = root / "docs" / "acceptance" / "matrix.yaml"
+    if not matrix_path.exists():
+        return [
+            ReviewIssue(
+                severity="warn",
+                message=(
+                    "spec has a Test Plan but the repo has no acceptance matrix — "
+                    "run `fr acceptance init`, add rows with `fr acceptance add`, "
+                    "then link them via `acceptance: [row-ids]` on phases."
+                ),
+            )
+        ]
+    try:
+        matrix = load_matrix(matrix_path)
+    except AcceptanceError as e:
+        return [ReviewIssue(severity="warn", message=f"acceptance matrix unreadable: {e}")]
+
+    out: list[ReviewIssue] = []
+    if not linked:
+        out.append(
+            ReviewIssue(
+                severity="error",
+                message=(
+                    "spec has a Test Plan but no acceptance rows linked — add "
+                    "`acceptance: [row-ids]` to the phases that advance them "
+                    "(`fr acceptance add` creates rows)."
+                ),
+            )
+        )
+    known = {r.id for r in matrix.rows}
+    for rid, phase_n in sorted(linked.items(), key=lambda kv: (kv[1], kv[0])):
+        if rid not in known:
+            out.append(
+                ReviewIssue(
+                    severity="error",
+                    message=(
+                        f"phase {phase_n} links unknown acceptance row id {rid!r} "
+                        f"(not in docs/acceptance/matrix.yaml)"
+                    ),
+                )
+            )
+
+    # `acceptance:` is a 3.7.0 schema field on the closed-world PhaseHeader —
+    # a plan that uses it while its fr_version admits an older fr would pass
+    # the version gate there and die on a raw "extra field" pydantic error
+    # (#352 review). Probe: does the constraint admit any pre-3.7.0 version?
+    if linked and plan.meta.fr_version:
+        floor = _version_floor_issue(
+            plan.meta.fr_version,
+            probe_version="3.6.99",
+            message=(
+                f"phases link acceptance rows but fr_version "
+                f"{plan.meta.fr_version!r} admits a pre-acceptance fr — "
+                f"floor it at '>=3.7.0,<{CEILING_VERSION}'."
+            ),
+        )
+        if floor is not None:
+            out.append(floor)
+    return out
+
+
+def _version_floor_issue(
+    fr_version: str,
+    *,
+    probe_version: str | None = None,
+    floor: str | None = None,
+    message: str,
+    severity: Literal["warn", "error"] = "warn",
+) -> ReviewIssue | None:
+    """Shared shape behind the `acceptance:`/`tier:`/`files:` (and, in
+    principle, any future field's) version-floor probes: does `fr_version`
+    admit `probe_version` (the highest pre-feature release)? If so, an issue
+    of `severity` carrying `message`; otherwise `None`. A malformed constraint
+    is left to the parser, which already fails loud elsewhere — swallow
+    silently here rather than duplicate a worse-worded error.
+
+    `floor` asks the fuller question instead: any version below it, probed
+    densely and with exact pins compared directly (`fr.version_floor`, shared
+    with `fr plan create`). Review p3-f3: one probe passes every constraint
+    that happens to exclude it — `==4.5.0` among them."""
+    from packaging.specifiers import InvalidSpecifier, SpecifierSet
+
+    if floor is not None:
+        from fr.version_floor import PRE_4_20_PROBES, admits_below
+
+        admitted = admits_below(fr_version, floor, PRE_4_20_PROBES)
+        return ReviewIssue(severity=severity, message=message) if admitted else None
+    assert probe_version is not None, "pass probe_version or floor"
+    try:
+        if SpecifierSet(fr_version).contains(probe_version, prereleases=True):
+            return ReviewIssue(severity=severity, message=message)
+    except InvalidSpecifier:
+        pass  # the parser already fails loud on malformed constraints
+    return None
+
+
+def _has_cycle(graph: dict[int, set[int]], start: int) -> bool:
+    """DFS for back-edges starting from `start`."""
+    stack: list[tuple[int, set[int]]] = [(start, {start})]
+    while stack:
+        node, ancestors = stack.pop()
+        for dep in graph.get(node, ()):
+            if dep in ancestors:
+                return True
+            stack.append((dep, ancestors | {dep}))
+    return False
+
+
+def _skeleton_issues(plan: Plan) -> list[ReviewIssue]:
+    """Walking-skeleton gate (fr-goal methodology restoration): with TWO OR
+    MORE agentic phases the FIRST is the delivery-infrastructure smoke, so
+    verification lands before the expensive part. Later work builds on
+    verified ground — a skeleton marker anywhere else is a mis-scoped plan.
+    A plan with a single agentic phase has nothing to build on the smoke, so
+    it is first-class: no marker and no override required (a marker on it is
+    tolerated; the fr_version floor probe still applies to any marker).
+
+    The marker is `skeleton: true` on the phase header (additive, defaulted,
+    omitted when unset — the `acceptance`/`tier` precedent). The one override
+    is an explicit operator decision at spec scope, ided
+    `skeleton-override-<plan-slug>`: plans with no runtime to smoke (docs,
+    framework internals exercised by the existing suite) say so on the
+    record instead of marking a phase dishonestly.
+    """
+    first: int | None = None
+    marked: list[int] = []
+    agentic = 0
+    for ph in plan.phases:
+        if ph.phase.tag != "agentic":
+            continue
+        agentic += 1
+        if first is None:
+            first = ph.phase.number
+        if ph.phase.skeleton:
+            marked.append(ph.phase.number)
+    if first is None:
+        return []  # no agentic phase: nothing to build on, nothing to smoke
+    out: list[ReviewIssue] = []
+    misplaced = [n for n in marked if n != first]
+    if misplaced:
+        out.append(
+            ReviewIssue(
+                severity="error",
+                message=(
+                    f"phase {misplaced[0]} carries the skeleton marker, but phase "
+                    f"{first} is the first agentic phase — the walking skeleton "
+                    f"belongs there; later work builds on verified ground."
+                ),
+            )
+        )
+    if agentic >= 2 and first not in marked and not _skeleton_overridden(plan):
+        out.append(
+            ReviewIssue(
+                severity="error",
+                message=(
+                    f"phase {first} is the first agentic phase but carries no "
+                    f"skeleton marker — mark it (`skeleton: true` in the phase "
+                    f"header) so CI smokes before the expensive phases, or log "
+                    f"an operator override: `fr journal add --scope spec "
+                    f"--slug <spec-slug> --kind decision "
+                    f"--id skeleton-override-{plan.meta.plan} --title <why> "
+                    f"--body <why-no-smoke-applies>`."
+                ),
+            )
+        )
+    if marked and plan.meta.fr_version:
+        # Same floor probe as `acceptance:` (#352 review) and `tier:` — and it
+        # says so, so it goes through the same helper. A plan that marks a
+        # skeleton while its fr_version admits a pre-marker fr passes here and
+        # dies on a raw "extra field" pydantic error over there.
+        floor = _version_floor_issue(
+            plan.meta.fr_version,
+            probe_version="4.1.1",
+            message=(
+                "a phase marks the skeleton but fr_version "
+                f"{plan.meta.fr_version!r} admits a pre-skeleton fr — "
+                f"floor it at '>=4.2.0,<{CEILING_VERSION}'."
+            ),
+        )
+        if floor is not None:
+            out.append(floor)
+    return out
+
+
+def _skeleton_overridden(plan: Plan) -> bool:
+    """True iff the spec-scope journal carries the override decision for this
+    plan. Missing/unparseable journal (or a repo-less plan) is not an override
+    — the gate fails closed toward marking the skeleton; the journal's own
+    `fr journal check` owns malformed files."""
+    want = f"skeleton-override-{plan.meta.plan}"
+    return any(e.kind == "decision" and e.id == want for e in _spec_journal_entries(plan))
+
+
+def _spec_journal_slug(plan: Plan) -> str | None:
+    """The slug of the plan's same-repo spec journal, or None (no repo, no
+    spec, a cross-repo spec — whose journal lives in its own repo — or a
+    spec ref that is not a `.md` path)."""
+    from fr.journal.model import spec_journal_slug
+
+    spec = plan.meta.spec
+    if plan.repo_root is None or not spec or spec in ("none", "null", "—", "-"):
+        return None
+    if is_cross_repo_spec(spec):
+        return None
+    stem = spec.rsplit("/", 1)[-1]
+    if not stem.endswith(".md"):
+        return None
+    return spec_journal_slug(stem[: -len(".md")])
+
+
+def _spec_journal_entries(plan: Plan) -> list[JournalEntry]:
+    """The plan's spec-journal entries, read-resolved (active else archived,
+    like `render`/`check`: a decision outlives the spec it was logged
+    against). A missing or unparseable journal holds no entries — its own
+    `fr journal check` owns malformed files. Shared by the skeleton override
+    and the phase-split decisions, so the two read the journal one way."""
+    from fr.journal.model import JournalParseError, parse_journal, resolve_journal_read_path
+
+    slug = _spec_journal_slug(plan)
+    if slug is None or plan.repo_root is None:
+        return []
+    path = resolve_journal_read_path(plan.repo_root, "spec", slug)
+    if not path.is_file():
+        return []
+    try:
+        return parse_journal(path.read_text())
+    except JournalParseError:
+        return []
+
+
+_SPLIT_WAIVERS_HINT = "tier:, risk-first:, review-size:"
+_SPLIT_ALL_HINT = "ask: (it serves an ask of its own), tier:, risk-first:, review-size:"
+
+
+def _split_record_hint(plan: Plan, split_id: str, reasons: str) -> str:
+    """The `fr journal add` line that records a split decision. `split_id` is
+    the NEXT FREE id (`fr.phase_sizing.next_split_id`): `journal add` refuses
+    a taken one, so naming the bare id after a decision exists would wedge
+    plan-review (review r1)."""
+    slug = _spec_journal_slug(plan) or "<spec-journal-slug>"
+    return (
+        f"`fr journal add --scope spec --slug {slug} --kind decision "
+        f'--id {split_id} --title "<reason>: …"` '
+        f"with <reason> one of {reasons}"
+    )
+
+
+def _phase_sizing_issues(plan: Plan) -> list[ReviewIssue]:
+    """Size phases to the spec's asks (2026-09-28 phase-sizing spec §B/§C).
+
+    Silent unless the plan's spec is same-repo, exists, and carries a
+    `## Requirements` table that parses — a spec without one predates asks,
+    which exempts every in-flight plan without an fr_version probe. A
+    `| id | requirement | source |` table that does NOT parse gets one
+    warning (review s4: a standalone fr-plan never passed the requirements
+    gate); a legacy prose section stays silent.
+
+    Per agentic phase, with S its `phase-split-<plan>-p<N>` spec-journal
+    decision (§B's table): the **floor** (d1, R2) — a phase with no S, or
+    S = `ask:`, must serve an ask of its own (`fr.phase_sizing.phase_asks`);
+    the **ceiling** (d1, R3) — every agentic phase after the first needs an
+    S. `tier:`/`risk-first:`/`review-size:` waive the floor. Both failures
+    are errors cleared by a recorded decision (d5, the `skeleton-override-*`
+    pattern); a malformed S is an error, never read as absent. S is the
+    winning decision for the phase — `phase-split-<plan>-p<N>-<k>` supersedes
+    a lower `k` — and every fix names the next free id (review r1). A
+    decision naming no agentic phase of this plan is an orphan: a warning,
+    since it waives nothing (review r6). The floor
+    message offers only the three waivers (review s1): `ask:` is the claim
+    it just disproved. With no matrix the floor cannot be derived, so it is
+    skipped and an `ask:` S is accepted with a warning; a matrix that exists
+    but cannot be loaded (or whose repo identity cannot be resolved) is one
+    warning of its own, never read as absent (review r3). The walking skeleton
+    needs no code here (d6, R6): a standalone skeleton with no rows fails
+    the floor, and folding it into the first ask's phase is the fix.
+
+    §C (R5): a warning on each one-step manual phase in the trailing manual
+    block — fr cannot tell a deploy step from a screenshot step.
+    """
+    from fr.acceptance.model import AcceptanceError, Matrix
+    from fr.phase_sizing import (
+        WAIVING,
+        SplitDecision,
+        next_split_id,
+        phase_asks,
+        split_decisions,
+    )
+    from fr.requirements import (
+        RequirementsError,
+        has_requirements,
+        load_spec_matrix,
+        parse_requirements,
+    )
+
+    root = plan.repo_root
+    spec_rel = plan.spec_path or plan.meta.spec
+    if root is None or not spec_rel or is_cross_repo_spec(spec_rel):
+        return []
+    spec_file = root / spec_rel
+    if not spec_file.is_file():
+        return []
+    spec_text = spec_file.read_text()
+    try:
+        parse_requirements(spec_text)
+    except RequirementsError as e:
+        if not has_requirements(spec_text):
+            return []
+        return [
+            ReviewIssue(
+                severity="warn",
+                message=(
+                    f"spec {spec_rel}'s Requirements list does not parse ({e}), "
+                    "so phase sizing was not checked — fix it and re-run self-review."
+                ),
+            )
+        ]
+
+    out: list[ReviewIssue] = []
+    matrix: Matrix | None = None
+    matrix_unreadable = False
+    spec_ref = ""
+    if (root / "docs" / "acceptance" / "matrix.yaml").is_file():
+        try:
+            matrix, spec_ref = load_spec_matrix(root, spec_rel)
+        except AcceptanceError as e:
+            matrix_unreadable = True
+            out.append(
+                ReviewIssue(
+                    severity="warn",
+                    message=f"acceptance matrix unreadable ({e}); ask floor not checked.",
+                )
+            )
+
+    entries = _spec_journal_entries(plan)
+    decisions = split_decisions(entries, plan.meta.plan)
+    ordered = sorted(plan.phases, key=lambda p: p.phase.number)
+    headers = [p.phase for p in ordered]
+    asks = (
+        {pa.number: pa for pa in phase_asks(headers, matrix, spec_ref, decisions)}
+        if matrix is not None
+        else {}
+    )
+    agentic = [h for h in headers if h.tag == "agentic"]
+    agentic_numbers = {h.number for h in agentic}
+
+    def _hint(n: int, reasons: str) -> str:
+        return _split_record_hint(plan, next_split_id(entries, plan.meta.plan, n), reasons)
+
+    for dec in sorted(decisions.values(), key=lambda d: d.number):
+        if dec.number not in agentic_numbers:
+            out.append(
+                ReviewIssue(
+                    severity="warn",
+                    message=(
+                        f"orphan phase-split decision {dec.id} names no agentic phase; "
+                        "it waives nothing."
+                    ),
+                )
+            )
+        elif dec.malformed:
+            out.append(
+                ReviewIssue(
+                    severity="error",
+                    message=(
+                        f"split decision {dec.id} has title {dec.title!r}, which starts "
+                        "with no reason token — supersede it: "
+                        f"{_hint(dec.number, _SPLIT_ALL_HINT)}."
+                    ),
+                )
+            )
+
+    def _waives(d: SplitDecision | None) -> bool:
+        return d is not None and d.reason in WAIVING
+
+    for k, h in enumerate(agentic, start=1):
+        n = h.number
+        d = decisions.get(n)
+        if d is not None and d.malformed:
+            continue  # reported above; never read as absent
+        if _waives(d):
+            continue  # tier / risk-first / review-size waive the floor
+        if d is None and k > 1:
+            out.append(
+                ReviewIssue(
+                    severity="error",
+                    message=(
+                        f"phase {n} is agentic phase #{k}; a phase after the first "
+                        f"needs a recorded split reason — record it: "
+                        f"{_hint(n, _SPLIT_ALL_HINT)}."
+                    ),
+                )
+            )
+            continue
+        if matrix is None:
+            if d is not None and not matrix_unreadable:
+                out.append(
+                    ReviewIssue(
+                        severity="warn",
+                        message=(
+                            f"phase {n}'s ask split reason is accepted as recorded but "
+                            "is unverifiable without docs/acceptance/matrix.yaml."
+                        ),
+                    )
+                )
+            continue
+        pa = asks[n]
+        if pa.own:
+            continue
+        fixes = (
+            "link the rows of the ask it serves, fold its work into the phase "
+            "that serves that ask, or record why it exists: "
+            f"{_hint(n, _SPLIT_WAIVERS_HINT)}"
+        )
+        if pa.asks:
+            # An `ask:` phase's own asks subtract every other phase (review
+            # r8); otherwise waived phases are left out (review s2).
+            claims = d is not None and d.reason == "ask"
+            sharers = sorted(
+                a.number
+                for a in asks.values()
+                if a.number != n
+                and a.asks & pa.asks
+                and (claims or not _waives(decisions.get(a.number)))
+            )
+            what = (
+                f"phase {n} serves no ask of its own — its asks "
+                f"{', '.join(sorted(pa.asks))} are all also served by phase(s) "
+                f"{', '.join(str(s) for s in sharers)}"
+            )
+        else:
+            what = (
+                f"phase {n} serves no ask — none of its acceptance rows cites a "
+                f"requirement of {spec_rel}"
+            )
+        out.append(ReviewIssue(severity="error", message=f"{what}. Fix: {fixes}."))
+
+    for ph in ordered:
+        if ph.phase.number not in _trailing_manual_block(plan):
+            continue
+        if sum(len(t.steps) for t in ph.tasks) != 1:
+            continue
+        out.append(
+            ReviewIssue(
+                severity="warn",
+                message=(
+                    f"phase {ph.phase.number} is a single operator step — if it "
+                    "verifies (screenshot, live check, post-merge run), make it a "
+                    "Test Plan line or a `verify: live` acceptance row; keep a "
+                    "[manual] phase only for a prerequisite or a real dispatch/deploy."
+                ),
+            )
+        )
+    return out
+
+
+def _tier_issues(plan: Plan) -> list[ReviewIssue]:
+    """`tier` gates (2026-09-20 phases-file-tier-reaches-dispatch spec, D2):
+
+    1. Floor probe — same shape as `_acceptance_link_issues`'/`_skeleton_issues`'
+       3.7.0/4.1.1 probes: `tier` is a 3.12.0 schema field on the closed-world
+       `PhaseHeader`, so a plan using it while `fr_version` admits an older fr
+       would pass the version gate and die on a raw "extra field" pydantic
+       error over there.
+    2. Untiered-agentic-phase warning — #498's fail-visibly doctrine moved to
+       plan time: an agentic phase with no `tier` is dispatched untiered,
+       silently inheriting the session model, which was previously
+       indistinguishable from working tiering at every observable point.
+       Manual phases are never dispatched to a model, so a missing tier there
+       is not a gap.
+    3. Reason above `standard` (#813) — `standard` is the default; `hard`
+       costs the most expensive model for the whole phase, so it is a claim
+       and is recorded as one: a `tier-<plan>-p<N>` spec-journal decision (or
+       a `tier:` phase-split decision for that phase). An error, like the
+       split ceiling it mirrors — take 10's plans both chose `hard` with no
+       reason, and nothing between plan and dispatch asked.
+    """
+    from fr.phase_sizing import tier_id, tier_reasons
+
+    out: list[ReviewIssue] = []
+    tiered = any(ph.phase.tier is not None for ph in plan.phases)
+    if tiered and plan.meta.fr_version:
+        floor = _version_floor_issue(
+            plan.meta.fr_version,
+            probe_version="3.11.99",
+            message=(
+                f"phases carry a tier but fr_version {plan.meta.fr_version!r} "
+                f"admits a pre-tier fr — floor it at '>=3.12.0,<{CEILING_VERSION}'."
+            ),
+        )
+        if floor is not None:
+            out.append(floor)
+
+    for ph in plan.phases:
+        if ph.phase.tag != "agentic" or ph.phase.tier is not None:
+            continue
+        out.append(
+            ReviewIssue(
+                severity="warn",
+                message=(
+                    f"phase {ph.phase.number} is agentic but declares no tier — "
+                    f"it will be dispatched untiered, inheriting the session's "
+                    f"model. Add `tier` to the phase header, one of "
+                    f"{list(PHASE_TIERS)}."
+                ),
+            )
+        )
+
+    above = [
+        ph.phase
+        for ph in plan.phases
+        if ph.phase.tag == "agentic" and ph.phase.tier in _TIERS_NEEDING_A_REASON
+    ]
+    if above:
+        reasoned = tier_reasons(_spec_journal_entries(plan), plan.meta.plan)
+        slug = _spec_journal_slug(plan)
+        for h in above:
+            if h.number in reasoned:
+                continue
+            if slug is None:
+                # No same-repo spec journal (a cross-repo spec, or none): there
+                # is nowhere here to record the reason, so an error could only
+                # be cleared by lowering the tier. Say it instead.
+                out.append(
+                    ReviewIssue(
+                        severity="warn",
+                        message=(
+                            f"phase {h.number} declares tier: {h.tier} — standard is the "
+                            "default, and this plan has no same-repo spec journal to "
+                            "record why; state the reason in the phase prose."
+                        ),
+                    )
+                )
+                continue
+            out.append(
+                ReviewIssue(
+                    severity="error",
+                    message=(
+                        f"phase {h.number} declares tier: {h.tier} with no recorded reason — "
+                        "standard is the default. Lower it, or record why: "
+                        f"`fr journal add --scope spec --slug {slug} --kind decision "
+                        f'--id {tier_id(plan.meta.plan, h.number)} --title "<reason>"`.'
+                    ),
+                )
+            )
+    return out
+
+
+_TIERS_NEEDING_A_REASON: frozenset[str] = frozenset(
+    PHASE_TIERS[PHASE_TIERS.index("standard") + 1 :]
+)
+"""The tiers above `standard` — derived from `fr.types.PHASE_TIERS`, which is
+ordered cheapest first, so a new top tier needs a reason with no edit here."""
+
+
+def _scope_field_issues(plan: Plan) -> list[ReviewIssue]:
+    """`files`/`estimate_lines` gates (2026-09-24 spec §C):
+
+    1. Floor probe, an ERROR where the older probes warn: `fr plan create`
+       writes this floor itself, so a plan below it was assembled by hand,
+       and any fr it admits below 4.20.0 dies on it at pickup with a raw
+       "extra field" error rather than a version message.
+    2. No-`files` warning, never an error: the report is report-first, and a
+       plan without globs only loses the out-of-plan section. Manual phases
+       touch no code, so they are exempt.
+    """
+    out: list[ReviewIssue] = []
+    scoped = any(ph.phase.files or ph.phase.estimate_lines is not None for ph in plan.phases)
+    if scoped and plan.meta.fr_version:
+        floor = _version_floor_issue(
+            plan.meta.fr_version,
+            floor="4.20.0",
+            severity="error",
+            message=(
+                f"phases carry files/estimate_lines but fr_version "
+                f"{plan.meta.fr_version!r} admits a pre-4.20.0 fr, which cannot parse "
+                f"them — floor it at '>=4.20.0,<{CEILING_VERSION}'."
+            ),
+        )
+        if floor is not None:
+            out.append(floor)
+
+    for ph in plan.phases:
+        if ph.phase.tag != "agentic" or ph.phase.files:
+            continue
+        out.append(
+            ReviewIssue(
+                severity="warn",
+                message=(
+                    f"phase {ph.phase.number} is agentic but lists no files — "
+                    f"`fr plan proportionality` cannot tell its touches from "
+                    f"out-of-plan ones. Add `files` (repo-relative globs) and "
+                    f"`estimate_lines` to the phase header."
+                ),
+            )
+        )
+    return out
+
+
+def _refactor_justifications(plan: Plan) -> set[str]:
+    """Task ids (`P<n>.T<m>`) with a recorded `no-refactor-because`
+    justification: a plan-scope discovery/decision whose title or body
+    carries both the marker and the id."""
+    from fr.journal.model import JournalParseError, parse_journal, resolve_journal_read_path
+
+    root = plan.repo_root
+    if root is None:
+        return set()
+    # Read-resolve (active else archived), like the skeleton override: a
+    # justification outlives the plan it was logged against.
+    path = resolve_journal_read_path(root, "plan", plan.meta.plan)
+    if not path.is_file():
+        return set()
+    try:
+        entries = parse_journal(path.read_text())
+    except JournalParseError:
+        return set()
+    found: set[str] = set()
+    for e in entries:
+        if e.kind not in ("discovery", "decision"):
+            continue
+        hay = f"{e.title}\n{e.body}".casefold()
+        if "no-refactor-because" not in hay:
+            continue
+        found.update(m.group(0).upper() for m in _TASK_ID_RE.finditer(hay))
+    return found

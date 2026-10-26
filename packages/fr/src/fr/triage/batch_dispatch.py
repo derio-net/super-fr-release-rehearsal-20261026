@@ -1,0 +1,337 @@
+"""The pure half of `batch dispatch` (spec 2026-09-25-triage-batches §3.C, §3.D, §3.E, §3.I).
+
+The brief, the marker comment, the idempotency read of the marker, the
+config-freshness rule and the live reservations: judgements and facts in,
+text or answers out. The runner, the adapter and the checkout are the command
+layer's (`fr.commands.triage_batch_cmd`); nothing here imports `fr_dispatch`,
+runs a process or calls a forge.
+"""
+
+from __future__ import annotations
+
+import shlex
+from collections.abc import Iterable, Sequence
+
+import yaml
+from pydantic import ValidationError
+
+from fr.triage.batch import (
+    batch_branch,
+    batch_repo,
+    derive_batch_stage,
+    last_dispatch,
+    latest_marker,
+    recorded_branch,
+)
+from fr.triage.errors import TriageError
+from fr.triage.model import (
+    Batch,
+    Facts,
+    Judgements,
+    TriageConfig,
+    batch_marker,
+    parse_triage_config,
+)
+
+# Stages whose reservation still stands: the run was briefed with it and has
+# not merged or been given up (§3.D "every live reservation").
+LIVE_STAGES = frozenset({"dispatched", "pr-open"})
+# `dispatch --yes` may start a batch only from these (§3.C step 6.1).
+DISPATCHABLE = frozenset({"proposed", "cancelled", "abandoned"})
+
+TRIAGE_CONFIG_PATH = ".fr/triage.yaml"
+
+CLOUD_PREFLIGHT_RUNNERS = frozenset({"claude-cloud"})
+"""Runners whose sessions do not load the plugin's agents before their first turn (a
+Claude Code cloud session's CLI is a pre-warmed spare, spec 2026-10-07-cloud-triage
+§H): their brief starts by checking fr and the repo's `agents` artifact (R19)."""
+
+
+def worker_remedy() -> str | None:
+    """The cloud remedy block the worker's BLOCKED `needs_action` quotes (§H), when the
+    brief is rendered in a cloud session (the cloud driver's); `None` on a host."""
+    from fr import cloud
+
+    return cloud.remedy_block([cloud.AGENTS_ITEM]) if cloud.detect() else None
+
+
+def _cloud_preflight(
+    branch: str, remedy: str | None, *, repo: str, skill: str = "fr-goal"
+) -> list[str]:
+    """The worker's first step (R19, §H): a current fr, the batch's skill, both agents
+    dispatchable, isolation entered through the CLI. A missing agent or skill ends the
+    turn BLOCKED, never re-homed. fr is installed, or updated when `fr cloud doctor` finds
+    it older than the latest release (a pre-warmed spare's, gh#1098), by the cloud setup
+    script itself, embedded whole (p7-r6): one install recipe, idempotent over an existing
+    clone, never a second one-liner."""
+    from fr import cloud
+
+    installed = (
+        f"~/.claude/plugins/marketplaces/derio-net--super-fr/plugins/super-fr/skills/"
+        f"{skill}/SKILL.md"
+    )
+    lines = [
+        "",
+        "## Before anything else (this is a cloud session)",
+        "1. Run `fr --version`. If that fails, run `~/.local/bin/fr --version`: if that "
+        'works, fr is installed but off PATH, so run `export PATH="$HOME/.local/bin:$PATH"` '
+        "and go on. Then run `fr cloud doctor` and read its `fr` line: this session may be "
+        "a pre-warmed spare whose fr is older than the latest release. When fr is missing, "
+        "or that line FAILs, save this script (the cloud environment's setup script, "
+        "`fr cloud setup-script`) to a file, run it with `bash` (it installs super-fr, or "
+        'updates the clone it finds and reinstalls), then run `export PATH="$HOME/.local/'
+        'bin:$PATH"` and `fr cloud doctor` again. If its `fr` line still FAILs, do nothing '
+        "else and end your turn BLOCKED with needs_action: fr could not be updated to the "
+        "latest release, and the doctor's `fr` line.",
+        "",
+        "```bash",
+        *cloud.setup_script(repo).rstrip("\n").splitlines(),
+        "```",
+        "",
+        f"2. This batch runs through `/{skill}`, and only through it. If the skill is not "
+        f"loaded in this session, read its installed copy, `{installed}` (the setup script "
+        "puts it there), and follow it exactly. Never do the work without it: a change "
+        "committed directly ships a PR with no run, a success that is false and that the "
+        "close-out cannot archive. If you can run it neither way, do nothing else and end "
+        "your turn BLOCKED with this needs_action:",
+        f"   needs_action: the `{skill}` skill is not available in this session (not "
+        f"loaded, and not at {installed}); rerun the setup script or fix the environment, "
+        "then dispatch this batch again.",
+        "3. Confirm that `fr-spec-reviewer` and `fr-phase-executor` are agent types your "
+        "harness lists as dispatchable in this session. A file under `.claude/agents/` is "
+        "not proof: agent types load when a session starts. If either is not dispatchable, "
+        "the repo lacks a current `agents` artifact: do nothing else, and end your turn "
+        "BLOCKED with this needs_action:",
+        "   needs_action: this repo's `agents` artifact (.claude/agents/fr-spec-reviewer.md, "
+        ".claude/agents/fr-phase-executor.md) is missing or stale. Run `fr init agents` "
+        "(or `fr migrate artifacts --yes`) on the default branch, merge it, then dispatch "
+        "this batch again.",
+    ]
+    if remedy:
+        lines += ["   " + line if line else "" for line in remedy.splitlines()]
+    lines += [
+        "   Do not ask to be re-homed: a new session from the same commit would start the "
+        "same way.",
+        "4. Say in your first reply which of these held, and whether the super-fr hooks "
+        "are live in this session (its SessionStart hook prints the acceptance-debt line "
+        "when it ran).",
+        f"5. Enter isolation with `fr isolation up --branch {branch}` before any edit; "
+        "never edit outside it.",
+    ]
+    return lines
+
+
+NO_APPROVAL_LINE = (
+    "Never add the `approved-fr` label: it is the operator's approval to merge, and fr "
+    "voids it on your next push."
+)
+"""Every brief fr sends a batch session carries it (merge-train-safety §A, R6)."""
+
+
+def render_brief(
+    batch: Batch,
+    judgements: Judgements,
+    facts: Facts,
+    *,
+    repo: str,
+    closing_refs: Sequence[str],
+    reserved_version: str | None,
+    runner: str | None = None,
+    remedy: str | None = None,
+) -> str:
+    """The launch brief (§3.C step 3): engine-owned, deterministic text.
+
+    A batch dispatched through a runner in `CLOUD_PREFLIGHT_RUNNERS` gets the worker's
+    first step right after its command line (cloud-triage R19); *remedy* (the cloud
+    remedy block, `worker_remedy()`) rides on its BLOCKED needs_action.
+
+    The same judgements and facts always give the same bytes. *closing_refs*
+    come from the adapter (`GhClient.closing_ref`), one per member in member
+    order, so the brief never hardcodes one forge's closing syntax.
+    """
+    debug = batch.skill == "debug"
+    slash = "/fr-debugging" if debug else "/fr-goal"
+    titles = {i.key: i.title for i in facts.issues}
+    lines = [f"{slash} {batch.title}"]
+    if runner in CLOUD_PREFLIGHT_RUNNERS:
+        lines += _cloud_preflight(
+            batch_branch(batch), remedy, repo=repo, skill=slash.removeprefix("/")
+        )
+    lines += [
+        "",
+        f"Batch `{batch.id}` of {repo}: {len(batch.ids)} issues, delivered as ONE pull request.",
+    ]
+    for key in batch.ids:
+        j = judgements.issues.get(key)
+        lines += ["", f"## {key}: {titles.get(key, '(title not collected)')}"]
+        if j is not None and j.detail:
+            lines.append(j.detail)
+        if j is not None and j.note:
+            lines.append(f"Note: {j.note}")
+    if batch.rationale:
+        lines += ["", "## Why these belong together", batch.rationale]
+    committed = "the failing test is committed" if debug else "the spec is committed"
+    lines += [
+        "",
+        "## Delivery rules",
+        f"- Work on branch `{batch_branch(batch)}`.",
+        f"- Open a draft PR as soon as {committed}. Its body contains these "
+        "lines, one per member, so every member closes when it merges:",
+        *(f"  {ref}" for ref in closing_refs),
+    ]
+    if reserved_version is not None:
+        lines.append(
+            # Provisional (super-fr#646): `live_reservations` sees only this
+            # triage scope's batches, so another scope may hold the same number;
+            # merge reconcile (`batch_merge`) renumbers, so nothing bad ships.
+            f"- Bump the version to `{reserved_version}` (provisional: reserved within "
+            "this triage only, and the merge renumbers it if another batch lands "
+            "that number first)."
+        )
+    lines += [
+        "- Do not name any member issue as a phase `tracking_issue` in the plan: the "
+        "bridge would then own that issue's `fr:` labels.",
+    ]
+    if debug:
+        lines += [
+            "",
+            "## Debugging rules",
+            "- If investigation cannot form a confident single hypothesis, stop and ask; "
+            "don't guess.",
+            "- After three failed fixes, stop and ask before a fourth attempt.",
+            "- These members were batched as ONE root cause; if investigation finds more "
+            "than one, stop and ask before fixing any.",
+        ]
+    lines += ["", NO_APPROVAL_LINE]
+    return "\n".join(lines) + "\n"
+
+
+def red_brief(batch: Batch, *, pr_url: str, head: str, checks: Sequence[str]) -> str:
+    """The red hand-back brief (merge-train-safety §C, R10): the PR, the failing sha and
+    the failing checks, what to do about it and what to leave alone."""
+    named = ", ".join(checks) or "its checks"
+    return (
+        "\n".join(
+            [
+                f"Red CI on batch {batch.id} ({batch.title}): {pr_url} is red at {head}; "
+                f"failing: {named}.",
+                "Fix it on the PR's own branch: commit the fix and push. Do not force-push "
+                "and do not rebase: the PR's history stays as it is.",
+                "Leave the PR's draft or ready state and its labels alone.",
+                NO_APPROVAL_LINE,
+            ]
+        )
+        + "\n"
+    )
+
+
+def conflict_brief(
+    batch: Batch,
+    *,
+    pr: int | None,
+    head: str,
+    paths: Sequence[str],
+    branch: str,
+    base: str,
+    mirrors: Sequence[Sequence[str]],
+) -> str:
+    """The conflict hand-back brief (spec 2026-10-06-verification-strategies §G, R20):
+    the batch, its PR, the head and the paths merge refused, then the six steps. The
+    repo's `.fr/triage.yaml` `mirrors:` commands, when declared, are step 4's."""
+    where = f"PR #{pr}" if pr is not None else "its PR"
+    regenerate = "4. Regenerate generated mirrors instead of hand-resolving them"
+    if mirrors:
+        commands = "; ".join(f"`{shlex.join(argv)}`" for argv in mirrors)
+        regenerate += f": run {commands}, then stage what they wrote."
+    else:
+        regenerate += " (rerun whatever generates them), then stage what they wrote."
+    return "\n".join(
+        [
+            f"Merge conflict on batch {batch.id} ({batch.title}): {where} on {branch}, at "
+            f"head {head}, conflicts with {base} in a change the wave driver will not "
+            f"resolve: {', '.join(paths)}.",
+            f"Resolve it on {branch} itself, in these six steps:",
+            f"1. Enter the batch's workspace first: `fr isolation up --branch {branch}`. "
+            f"{branch} is checked out there, not in the clone you may have started in; "
+            "on an existing workspace the command resumes it, and a session already in "
+            "that workspace has nothing to do. Every later step runs in the workspace.",
+            f"2. `git fetch origin && git merge {base}` into {branch}. Do not rebase and "
+            "do not force-push: the PR's history stays as it is.",
+            f"3. Resolve the conflicted paths: {', '.join(paths)}.",
+            regenerate,
+            "5. Run the test suite, and fix what the merge broke.",
+            f"6. Commit the merge and `git push origin {branch}`. The driver merges the PR "
+            "once its checks are green.",
+            NO_APPROVAL_LINE,
+        ]
+    )
+
+
+def dispatch_comment(batch: Batch, item_id: str, key: str) -> str:
+    """Member *key*'s comment (§3.E): marker first, then plain words naming the
+    other members. No handle, no host, no local detail."""
+    others = [k for k in batch.ids if k != key]
+    company = f", with {', '.join(others)}" if others else ""
+    return (
+        f"{batch_marker(item_id)}\n"
+        f"Dispatched as batch `{batch.id}` ({batch.title}){company}. "
+        f"Branch `{recorded_branch(batch)}`."
+    )
+
+
+def dispatched_already(comments: Iterable[dict[str, object]], item_id: str) -> bool:
+    """True when a dispatch marker for *item_id* is newer than its latest
+    withdrawal (comments oldest first).
+
+    Makes the §3.E comment idempotent under `--repair`, while a redispatch after
+    a cancel still posts a NEW marker: the old one predates the withdrawal
+    (decision p2-withdrawn-marker).
+    """
+    return latest_marker(comments, item_id) == "dispatch"
+
+
+def check_config_fresh(collected: TriageConfig | None, on_origin: str | None) -> tuple[str, ...]:
+    """Refuse a collected `.fr/triage.yaml` that is not the one on
+    `origin/<default>` now (§3.I).
+
+    Identity, not time (review r3-f13): the file's text at the default branch
+    is parsed and compared with what `collect` recorded. Committer dates are
+    set by whoever commits (a rebase, a skewed clock, a cherry-pick) and say
+    nothing about which content was read; the content itself does. *collected*
+    is None when collect found no file, *on_origin* when there is none now.
+    A top-level key this `fr` does not know is dropped from both sides of the
+    comparison, as collect dropped it (R4); the keys it dropped on the origin side are
+    returned so the caller can say so.
+    """
+    try:
+        current, ignored = (
+            parse_triage_config(yaml.safe_load(on_origin) or {})
+            if on_origin is not None
+            else (None, ())
+        )
+    except (yaml.YAMLError, ValidationError) as exc:
+        raise TriageError(
+            f"{TRIAGE_CONFIG_PATH} on the default branch is not valid triage config: {exc}"
+        ) from exc
+
+    def _shape(c: TriageConfig | None) -> object:  # values, not pydantic's fields-set
+        return c.model_dump(by_alias=True) if c is not None else None
+
+    if _shape(current) != _shape(collected):
+        raise TriageError(
+            f"the collected {TRIAGE_CONFIG_PATH} is not the one on the default branch now; "
+            "re-collect with `fr triage collect` first"
+        )
+    return ignored
+
+
+def live_reservations(batches: Sequence[Batch], facts: Facts, repo: str, *, skip: str) -> list[str]:
+    """Reserved versions of the repo's other batches still at dispatched / pr-open."""
+    out: list[str] = []
+    for b in batches:
+        if b.id == skip or batch_repo(b, facts) != repo:
+            continue
+        event = last_dispatch(b)
+        if event and event.reserved_version and derive_batch_stage(b, facts) in LIVE_STAGES:
+            out.append(event.reserved_version)
+    return out

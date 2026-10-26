@@ -1,0 +1,4337 @@
+"""fr isolation — Target protocol, state, profiles, and the local target.
+
+All devcontainer/docker/gh calls go through the Runner seam; git calls hit
+real throwaway repos (cheap, deterministic). Nothing here needs Docker.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import pytest
+from fr.isolation.hostworktree import HostWorktreeTarget
+from fr.isolation.local import (
+    LocalWorktreeDevcontainerTarget,
+    ReapHazard,
+    ReapRefused,
+    branch_changed_paths,
+    branch_changes_present,
+    devcontainer_id,
+    subprocess_runner,
+)
+from fr.isolation.types import (
+    IsolationError,
+    IsolationState,
+    delete_state,
+    list_states,
+    load_state,
+    profiles_config,
+    resolve_profile,
+    save_state,
+    secrets_env_file,
+    state_path,
+)
+
+
+def make_repo(
+    tmp_path: Path,
+    profiles: list[str] | None = None,
+    default: str | None = None,
+    profiles_yaml: str = "fr-profiles.yaml",
+    env_file_mount: str | None = None,
+) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    (repo / "README.md").write_text("x\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ],
+        check=True,
+    )
+    for name in profiles or []:
+        d = repo / ".devcontainer" / name
+        d.mkdir(parents=True)
+        config: dict = {"image": "x"}
+        if env_file_mount:
+            config["runArgs"] = ["--env-file", env_file_mount]
+        (d / "devcontainer.json").write_text(json.dumps(config) + "\n")
+    if default:
+        (repo / ".devcontainer" / profiles_yaml).write_text(
+            f"default: {default}\nprofiles:\n  {default}:\n    purpose: test\n"
+        )
+    if profiles:
+        # committed, as in real repos — worktrees check out .devcontainer/
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "profiles",
+            ],
+            check=True,
+        )
+    return repo
+
+
+def add_worktree(repo: Path, branch: str = "feat/x") -> Path:
+    """Add a linked worktree of `repo` — its .git is a gitfile, not a dir."""
+    wt = repo.parent / "wt"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", str(wt), "-b", branch],
+        check=True,
+    )
+    return wt
+
+
+def _git_out(repo: Path, *args: str) -> str:
+    # Output-capturing git helper. Distinct from the fire-and-forget `_git` the
+    # merge-config tests define later in this file — DON'T merge the two names.
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def make_repo_with_origin(
+    tmp_path: Path,
+    profiles: list[str] | None = None,
+    default: str | None = None,
+) -> tuple[Path, Path]:
+    """A real repo wired to a real bare `origin`, with `main` pushed.
+
+    FakeRunner delegates git to the real binary, so fetch / origin/<default>
+    resolution must run against a real remote (spec "Testing"). Returns
+    (repo, origin_dir).
+    """
+    repo = make_repo(tmp_path, profiles=profiles, default=default)
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-q", "-b", "main", str(origin)], check=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(origin)], check=True)
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", "main"], check=True)
+    return repo, origin
+
+
+def _commit_stray_feature_branch(repo: Path, branch: str = "stray-feature") -> str:
+    """Park `repo` on a NEW feature branch carrying an un-merged commit.
+
+    Returns the stray commit sha. Reproduces the incident's precondition: the
+    base repo's HEAD is an un-merged commit that must NOT ride into a fresh
+    isolation branch.
+    """
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", branch], check=True)
+    (repo / "stray.txt").write_text("unrelated\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "stray",
+        ],
+        check=True,
+    )
+    return _git_out(repo, "rev-parse", "HEAD")
+
+
+def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    return (
+        subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, descendant]
+        ).returncode
+        == 0
+    )
+
+
+class FakeRunner:
+    """Records non-git argv; delegates git to the real binary.
+
+    Stateful docker model (#354): a successful `docker rm <id>` records the id
+    as removed, and subsequent `docker ps` output drops that id — so `down`'s
+    post-condition re-query reflects reality. Fail the `rm` (`fail_on="rm"`) and
+    the id survives → the re-query still sees it → `down` raises. This is what
+    lets the same fixture exercise both the happy path and the transient-failure
+    path without call-sequence stubbing.
+    """
+
+    def __init__(
+        self,
+        fail_on: str | None = None,
+        stdout: dict[str, str] | None = None,
+        docker_labels: list[tuple[str, str]] | None = None,
+        pr_by_branch: dict[str, str] | None = None,
+        docker_images: list[tuple[str, str]] | None = None,
+        referenced_images: list[str] | None = None,
+        stop_sticks: bool = True,
+    ):
+        self.calls: list[list[str]] = []
+        self.git_calls: list[list[str]] = []
+        self.captures: list[bool] = []
+        self.fail_on = fail_on
+        self.stdout = stdout or {}
+        self.removed: set[str] = set()
+        # #471: a successful `docker stop <id>` flips that id's `docker ps`
+        # state to `exited` — unless `stop_sticks=False`, which models a
+        # container that is still running after the stop returned 0.
+        self.stopped: set[str] = set()
+        self.stop_sticks = stop_sticks
+        # gc host-wide discovery: (container_id, worktree_path) pairs the
+        # `docker ps -a --filter label=... --format '{{.ID}}\t{{.Label ...}}'`
+        # call returns (minus already-rm'd ids).
+        self.docker_labels = docker_labels or []
+        # gc classification: per-branch `gh pr view` JSON. A branch absent from
+        # the map ⇒ gh returns nothing (no PR).
+        self.pr_by_branch = pr_by_branch
+        # gc image sweep: `docker images` listing (id, repo, tag) and the set of
+        # images referenced by a live container (`docker ps -a --format {{.Image}}`).
+        self.docker_images = docker_images or []
+        self.referenced_images = referenced_images or []
+
+    def __call__(
+        self,
+        argv: list[str],
+        cwd: Path | None = None,
+        check: bool = False,
+        capture: bool = True,
+        **kw: Any,
+    ):
+        self.captures.append(capture)
+        if argv[0] == "git":
+            # `gh` is faked, but git hits the real binary — record git argv too so
+            # tests can assert mechanism (e.g. a fetch ran / did not run) on top of
+            # the resulting repo state.
+            self.git_calls.append(list(argv))
+            return subprocess.run(
+                argv, cwd=cwd, check=check, capture_output=True, text=True, env=kw.get("env")
+            )
+        self.calls.append(list(argv))
+        rc = 1 if (self.fail_on and self.fail_on in argv[0:2]) else 0
+        if argv[0:2] == ["docker", "rm"] and rc == 0:
+            self.removed.update(argv[2:])
+        if argv[0:2] == ["docker", "stop"] and rc == 0 and self.stop_sticks:
+            self.stopped.update(argv[2:])
+        out = self.stdout.get(argv[0], "")
+        if argv[0:2] == ["docker", "ps"]:
+            if any(".Label" in a for a in argv):
+                out = self._docker_labels_out()
+            elif any(".Image" in a for a in argv):
+                out = "".join(f"{ref}\n" for ref in self.referenced_images)
+            else:
+                out = self._ps_out()
+        elif argv[0:2] == ["docker", "images"]:
+            out = "".join(f"{i}\t{r}\t{t}\n" for i, r, t in self.docker_images)
+        elif argv[0:2] == ["docker", "inspect"]:
+            if any(".Mounts" in a for a in argv):
+                out = self.stdout.get("docker_volumes", "")
+            else:
+                out = self.stdout.get("docker_image", "")
+        elif argv[0:3] == ["gh", "pr", "view"] and self.pr_by_branch is not None:
+            body = self.pr_by_branch.get(argv[3], "")
+            return subprocess.CompletedProcess(argv, 0 if body else 1, stdout=body, stderr="")
+        return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="")
+
+    def _ps_out(self) -> str:
+        """Per-state `docker ps` line, minus any container id already `rm`'d."""
+        out = self.stdout.get("docker", "")
+        first = out.split()[0] if out.split() else ""
+        if first in self.removed:
+            return ""
+        if first in self.stopped:
+            return f"{first} exited\n"
+        return out
+
+    def _docker_labels_out(self) -> str:
+        """gc discovery listing: `id\\tpath` per labelled container, minus rm'd."""
+        return "".join(
+            f"{cid}\t{path}\n" for cid, path in self.docker_labels if cid not in self.removed
+        )
+
+    def argv_for(self, binary: str) -> list[list[str]]:
+        return [c for c in self.calls if c[0] == binary]
+
+
+# ---------- state ----------
+
+
+def test_state_roundtrip(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path, ["dev"], default="dev")
+    st = IsolationState(
+        repo_root=repo,
+        branch="vk-iso/x",
+        worktree=tmp_path / "wt",
+        profile="dev",
+        created_at="2026-06-04T00:00:00Z",
+    )
+    save_state(st)
+    p = state_path(repo, "vk-iso/x")
+    assert p.is_file() and str(p).startswith(str(repo / ".git"))
+    assert load_state(repo, "vk-iso/x") == st
+
+
+def test_state_path_sanitizes_branch_slash(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    assert "/" not in state_path(repo, "feat/x").name
+
+
+def test_state_dir_worktree_safe(tmp_path: Path) -> None:
+    # #292: in a linked worktree <wt>/.git is a gitfile, not a dir. State must
+    # resolve under the shared (main) .git dir, identically from either path.
+    repo = make_repo(tmp_path)
+    wt = add_worktree(repo)
+    common = repo / ".git"  # main checkout's real .git dir
+    st = IsolationState(
+        repo_root=wt,
+        branch="feat/x",
+        worktree=wt,
+        profile="dev",
+        created_at="2026-06-09T00:00:00Z",
+    )
+    save_state(st)  # must NOT raise NotADirectoryError
+    p = state_path(wt, "feat/x")
+    assert p.is_file()
+    assert str(p).startswith(str(common / "fr" / "isolation"))
+    # worktree-invariant key: main and worktree resolve to the same path
+    assert state_path(wt, "feat/x") == state_path(repo, "feat/x")
+    assert load_state(wt, "feat/x") == st
+    delete_state(wt, "feat/x")
+    assert load_state(wt, "feat/x") is None
+
+
+def test_state_dir_resolves_symlinked_repo_root(tmp_path: Path) -> None:
+    # #292 hardening: _git_common_dir resolves its own input, so a symlinked
+    # repo path keys identically to the real path — closing the macOS
+    # /tmp->/private/tmp realpath split-brain class regardless of caller.
+    repo = make_repo(tmp_path)
+    link = tmp_path / "link"
+    link.symlink_to(repo)
+    assert state_path(link, "feat/x") == state_path(repo, "feat/x")
+
+
+def test_target_normalizes_repo_root_from_worktree(tmp_path: Path) -> None:
+    # #292: a Target built from a worktree path keys off the MAIN checkout, so
+    # state + teardown survive the (possibly ephemeral) launch worktree.
+    repo = make_repo(tmp_path, ["dev"], default="dev")
+    wt = add_worktree(repo, "feat/y")
+    t = LocalWorktreeDevcontainerTarget(wt)
+    assert t.repo_root == repo.resolve()
+
+
+def test_up_on_non_git_path_raises(tmp_path: Path) -> None:
+    # #292: __init__ normalization must not swallow the friendly "not a git
+    # repo" guard. _git_common_dir falls back to repo_root/.git for a non-repo,
+    # so repo_root stays put and up() still raises IsolationError.
+    t = LocalWorktreeDevcontainerTarget(tmp_path)
+    with pytest.raises(IsolationError):
+        t.up(profile=None, branch="x", path=None)
+
+
+# ---------- profiles ----------
+
+
+def test_resolve_profile_default(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path, ["dev", "admin"], default="dev")
+    assert resolve_profile(repo, None) == "dev"
+    assert resolve_profile(repo, "admin") == "admin"
+
+
+def test_resolve_profile_no_devcontainer_points_at_fr_init(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    with pytest.raises(IsolationError, match="fr-init"):
+        resolve_profile(repo, None)
+
+
+def test_resolve_profile_unknown_lists_available(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path, ["dev"], default="dev")
+    with pytest.raises(IsolationError, match="dev"):
+        resolve_profile(repo, "nope")
+
+
+def test_resolve_profile_no_default_single_profile(tmp_path: Path) -> None:
+    """One profile dir, no vk-profiles.yaml → that profile is the default."""
+    repo = make_repo(tmp_path, ["dev"])
+    assert resolve_profile(repo, None) == "dev"
+
+
+# ---------- dual-read renames (#272) ----------
+
+
+def test_profiles_config_reads_fr_profiles(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    repo = make_repo(tmp_path, ["dev"], default="dev")  # writes fr-profiles.yaml
+    assert profiles_config(repo)["default"] == "dev"
+    assert "legacy" not in capsys.readouterr().err
+
+
+def test_profiles_config_ignores_lone_vk_profiles(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    repo = make_repo(tmp_path, ["dev"], default="dev", profiles_yaml="vk-profiles.yaml")
+    assert profiles_config(repo) == {}
+    assert "legacy" not in capsys.readouterr().err
+
+
+def test_profiles_config_reads_only_fr(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    repo = make_repo(tmp_path, ["dev"], default="dev", profiles_yaml="vk-profiles.yaml")
+    (repo / ".devcontainer" / "fr-profiles.yaml").write_text(
+        "default: dev\nprofiles:\n  dev:\n    purpose: fr-side\n"
+    )
+    assert profiles_config(repo)["profiles"]["dev"]["purpose"] == "fr-side"
+    assert "legacy" not in capsys.readouterr().err
+
+
+def test_secrets_env_file_is_fr_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    p = secrets_env_file("myrepo", "dev")
+    assert str(p).endswith(".config/fr/secrets/myrepo/dev.env")
+
+
+def test_save_state_writes_fr_dir(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path, ["dev"], default="dev")
+    st = IsolationState(
+        repo_root=repo,
+        branch="feat/x",
+        worktree=tmp_path / "wt",
+        profile="dev",
+        created_at="2026-06-07T00:00:00Z",
+    )
+    save_state(st)
+    assert str(state_path(repo, "feat/x")).startswith(str(repo / ".git" / "fr" / "isolation"))
+
+
+def test_load_state_ignores_legacy_vk_dir(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    repo = make_repo(tmp_path, ["dev"], default="dev")
+    legacy = repo / ".git" / "vk" / "isolation"
+    legacy.mkdir(parents=True)
+    st = IsolationState(
+        repo_root=repo,
+        branch="feat/x",
+        worktree=tmp_path / "wt",
+        profile="dev",
+        created_at="2026-06-07T00:00:00Z",
+    )
+    (legacy / "feat__x.json").write_text(st.model_dump_json())
+    assert load_state(repo, "feat/x") is None
+    assert "legacy" not in capsys.readouterr().err
+
+
+def test_load_state_fr_wins_over_legacy(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    repo = make_repo(tmp_path, ["dev"], default="dev")
+    legacy = repo / ".git" / "vk" / "isolation"
+    legacy.mkdir(parents=True)
+    old = IsolationState(
+        repo_root=repo,
+        branch="feat/x",
+        worktree=tmp_path / "old-wt",
+        profile="dev",
+        created_at="2026-06-01T00:00:00Z",
+    )
+    (legacy / "feat__x.json").write_text(old.model_dump_json())
+    new = old.model_copy(update={"worktree": tmp_path / "new-wt"})
+    save_state(new)
+    assert load_state(repo, "feat/x") == new
+    assert "legacy" not in capsys.readouterr().err
+
+
+def test_list_states_ignores_legacy_vk_dir(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    repo = make_repo(tmp_path, ["dev"], default="dev")
+    legacy = repo / ".git" / "vk" / "isolation"
+    legacy.mkdir(parents=True)
+    st = IsolationState(
+        repo_root=repo,
+        branch="feat/x",
+        worktree=tmp_path / "wt",
+        profile="dev",
+        created_at="2026-06-07T00:00:00Z",
+    )
+    (legacy / "feat__x.json").write_text(st.model_dump_json())
+    assert list_states(repo) == []
+    assert "legacy" not in capsys.readouterr().err
+
+
+# ---------- target.up ----------
+
+
+def test_up_creates_worktree_envfile_and_devcontainer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo = make_repo(
+        tmp_path,
+        ["dev"],
+        default="dev",
+        env_file_mount="${localEnv:HOME}/.config/fr/secrets/repo/dev.env",
+    )
+    runner = FakeRunner()
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+    st = target.up(profile=None, branch="vk-iso/test")
+
+    assert st.worktree.is_dir() and (st.worktree / "README.md").is_file()
+    assert str(st.worktree).startswith(
+        str(tmp_path / "home" / ".cache" / "fr" / "worktrees")
+    )  # ~/.cache/fr default
+    env = tmp_path / "home" / ".config" / "fr" / "secrets" / "repo" / "dev.env"
+    assert env.is_file()  # mount-followed: created when missing
+
+    (up,) = [call for call in runner.argv_for("devcontainer") if call[1] == "up"]
+    assert up[1] == "up"
+    assert f"--workspace-folder={st.worktree}" in up or str(st.worktree) in up
+    joined = " ".join(up)
+    assert ".devcontainer/dev/devcontainer.json" in joined
+    # base .git mounted rw at the same absolute path
+    assert f"source={repo / '.git'},target={repo / '.git'}" in joined
+    assert load_state(repo, "vk-iso/test") == st
+
+
+def test_up_refuses_a_container_without_fr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo = make_repo(tmp_path, ["dev"], default="dev")
+    runner = FakeRunner(fail_on="exec")
+
+    with pytest.raises(IsolationError, match="required `fr` runtime"):
+        LocalWorktreeDevcontainerTarget(repo, runner=runner).up(None, "fix/missing-fr")
+
+    assert any(
+        call[1] == "exec" and call[-2:] == ["fr", "--version"]
+        for call in runner.argv_for("devcontainer")
+    )
+
+
+def test_up_uncommitted_profile_raises_actionable_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """super-fr#299 part 2: a profile written but NOT committed is absent from
+    the worktree (cut from the committed tree). up() should explain that, not
+    fail cryptically in `devcontainer up`."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo = make_repo(tmp_path)  # committed README, no committed profile
+    # Profile in the base working tree, UNCOMMITTED (as `scaffold --no-commit`
+    # would leave it):
+    d = repo / ".devcontainer" / "dev"
+    d.mkdir(parents=True)
+    (d / "devcontainer.json").write_text('{"image": "x"}\n')
+    (repo / ".devcontainer" / "fr-profiles.yaml").write_text(
+        "default: dev\nprofiles:\n  dev:\n    purpose: test\n"
+    )
+    runner = FakeRunner()
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+
+    with pytest.raises(IsolationError) as ei:
+        target.up(profile="dev", branch="feat/x")
+    msg = str(ei.value)
+    assert "not committed" in msg
+    assert "fr init scaffold" in msg
+    # super-fr#806: the hint names the flags the re-run needs up front — the
+    # profile exists, so `--force`; and with no recognised remote `auto`
+    # tracking refuses, so `--tracking none`.
+    assert "--force" in msg and "--tracking none" in msg
+    assert not runner.argv_for("devcontainer")  # never reached devcontainer up
+
+
+def test_up_committed_profile_absent_on_old_branch_no_false_positive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-check must fire ONLY for a genuinely uncommitted profile. A
+    profile committed on main but absent on an older target branch is a
+    different situation — don't misreport it as 'not committed'."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo = make_repo(tmp_path)  # README committed on main (C0)
+    subprocess.run(["git", "-C", str(repo), "branch", "old"], check=True)  # old @ C0
+    # Commit the profile on main (C1) — clean working tree afterwards:
+    d = repo / ".devcontainer" / "dev"
+    d.mkdir(parents=True)
+    (d / "devcontainer.json").write_text('{"image": "x"}\n')
+    (repo / ".devcontainer" / "fr-profiles.yaml").write_text(
+        "default: dev\nprofiles:\n  dev:\n    purpose: test\n"
+    )
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "p"],
+        check=True,
+    )
+    runner = FakeRunner()
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+    # up on the OLD branch (lacks the profile, but it IS committed on main):
+    target.up(profile="dev", branch="old")
+    assert runner.argv_for("devcontainer")  # reached devcontainer up — no false error
+
+
+def test_up_from_worktree_mounts_main_git_and_keys_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#292 headline path: up() launched from a linked worktree mounts the
+    MAIN .git (a real dir), persists main-keyed state, and buckets the spawned
+    worktree under the real repo name — so teardown survives the launch wt."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo = make_repo(tmp_path, ["dev"], default="dev")
+    wt = add_worktree(repo, "feat/z")
+    runner = FakeRunner()
+    target = LocalWorktreeDevcontainerTarget(wt, runner=runner)
+    st = target.up(profile=None, branch="iso/work")
+    (up,) = [call for call in runner.argv_for("devcontainer") if call[1] == "up"]
+    main_git = repo.resolve() / ".git"
+    assert f"source={main_git},target={main_git}" in " ".join(up)
+    assert st.repo_root == repo.resolve()
+    assert str(st.worktree).startswith(
+        str(tmp_path / "home" / ".cache" / "fr" / "worktrees" / repo.name)
+    )
+
+
+def test_up_mount_resolves_common_git_even_without_normalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#292 belt-and-suspenders: the .git mount resolves the shared common dir
+    directly, so it stays correct even if repo_root somehow points at a
+    worktree (a gitfile) — independent of __init__ normalization."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo = make_repo(tmp_path, ["dev"], default="dev")
+    wt = add_worktree(repo, "feat/z")
+    runner = FakeRunner()
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+    target.repo_root = wt.resolve()  # bypass __init__ normalization
+    target.up(profile=None, branch="iso/work")
+    (up,) = [call for call in runner.argv_for("devcontainer") if call[1] == "up"]
+    main_git = repo.resolve() / ".git"
+    assert f"source={main_git},target={main_git}" in " ".join(up)
+
+
+def test_up_legacy_vk_mount_hard_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unmigrated repo: committed devcontainer.json still mounts the vk path —
+    up() now hard-errors pointing at `fr init migrate` and creates no vk file."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo = make_repo(
+        tmp_path,
+        ["dev"],
+        default="dev",
+        env_file_mount="${localEnv:HOME}/.config/vk/secrets/repo/dev.env",
+    )
+    target = LocalWorktreeDevcontainerTarget(repo, runner=FakeRunner())
+    with pytest.raises(IsolationError, match="fr init migrate"):
+        target.up(profile=None, branch="vk-iso/test")
+    env = tmp_path / "home" / ".config" / "vk" / "secrets" / "repo" / "dev.env"
+    assert not env.exists()
+
+
+def test_up_no_env_file_mount_creates_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo = make_repo(tmp_path, ["dev"], default="dev")  # no runArgs in fixture
+    target = LocalWorktreeDevcontainerTarget(repo, runner=FakeRunner())
+    target.up(profile=None, branch="vk-iso/test")
+    assert not (tmp_path / "home" / ".config").exists()
+
+
+def test_up_outside_repo_exits_with_isolation_error(tmp_path: Path) -> None:
+    with pytest.raises(IsolationError, match="git repo"):
+        LocalWorktreeDevcontainerTarget(tmp_path / "nowhere", runner=FakeRunner()).up(None, "b")
+
+
+def test_up_devcontainer_failure_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo = make_repo(tmp_path, ["dev"], default="dev")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=FakeRunner(fail_on="devcontainer"))
+    with pytest.raises(IsolationError, match="devcontainer up"):
+        target.up(None, "vk-iso/test")
+
+
+# ---------- cold-start base resolution (#322) ----------
+
+
+def _fetched(git_calls: list[list[str]]) -> bool:
+    return any(c[:2] == ["git", "fetch"] for c in git_calls)
+
+
+def test_up_new_branch_bases_on_origin_default_not_local_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#322 headline: a NEW cold-start branch is cut from freshly-fetched
+    origin/<default>, NOT the base repo's (feature-parked) HEAD."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo, _origin = make_repo_with_origin(tmp_path, ["dev"], default="dev")
+    stray = _commit_stray_feature_branch(repo)  # base HEAD now != main
+    runner = FakeRunner()
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+
+    target.up(profile="dev", branch="feat/x")
+
+    assert _is_ancestor(repo, "origin/main", "feat/x")  # cut from origin/main
+    assert not _is_ancestor(repo, stray, "feat/x")  # stray did NOT ride in
+    assert _fetched(runner.git_calls)  # the default path fetched
+
+
+def test_up_logs_chosen_base_on_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Every line `up` prints goes to stderr (2026-09-23 lifecycle spec §3.C):
+    `--print-path` and `fr run start` own stdout, so even the informational
+    'basing new branch …' line must not land there."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo, _origin = make_repo_with_origin(tmp_path, ["dev"], default="dev")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=FakeRunner())
+
+    target.up(profile="dev", branch="feat/x")
+
+    captured = capsys.readouterr()
+    assert "basing new branch feat/x on origin/main (fetched)" in captured.err
+    assert "basing new branch" not in captured.out
+    assert "WARNING" not in captured.err
+
+
+def test_up_base_head_forks_from_current_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--base HEAD opts back into 'fork from current checkout' (stacking)."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo, _origin = make_repo_with_origin(tmp_path, ["dev"], default="dev")
+    stray = _commit_stray_feature_branch(repo)
+    runner = FakeRunner()
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+
+    target.up(profile="dev", branch="feat/x", base="HEAD")
+
+    assert _is_ancestor(repo, stray, "feat/x")  # forked from current HEAD
+    assert not _fetched(runner.git_calls)  # explicit base → no fetch
+
+
+def test_up_explicit_base_ref_used_verbatim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--base <ref> uses the named ref as-is — no fetch, no default resolution."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo, _origin = make_repo_with_origin(tmp_path, ["dev"], default="dev")
+    v0 = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "tag", "v0")
+    (repo / "more.txt").write_text("x\n")
+    _git_out(repo, "add", "-A")
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "more",
+        ],
+        check=True,
+    )
+    runner = FakeRunner()
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+
+    target.up(profile="dev", branch="feat/x", base="v0")
+
+    assert _git_out(repo, "rev-parse", "feat/x") == v0
+    assert not _fetched(runner.git_calls)
+
+
+def test_up_no_fetch_uses_local_tracking_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--no-fetch bases on the LOCAL origin/<default> tracking ref, no network."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo, _origin = make_repo_with_origin(tmp_path, ["dev"], default="dev")
+    _git_out(repo, "fetch", "origin")  # tracking ref present, set up out-of-band
+    stray = _commit_stray_feature_branch(repo)
+    runner = FakeRunner()
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+
+    target.up(profile="dev", branch="feat/x", no_fetch=True)
+
+    assert _is_ancestor(repo, "origin/main", "feat/x")
+    assert not _is_ancestor(repo, stray, "feat/x")
+    assert not _fetched(runner.git_calls)  # --no-fetch issued no fetch
+
+
+def test_up_no_fetch_missing_tracking_ref_falls_back_to_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo, _origin = make_repo_with_origin(tmp_path, ["dev"], default="dev")
+    subprocess.run(["git", "-C", str(repo), "update-ref", "-d", "refs/remotes/origin/main"])
+    stray = _commit_stray_feature_branch(repo)
+    runner = FakeRunner()
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+
+    target.up(profile="dev", branch="feat/x", no_fetch=True)
+
+    assert _is_ancestor(repo, stray, "feat/x")  # no tracking ref → local HEAD
+    assert "WARNING" in capsys.readouterr().err
+
+
+def test_up_no_origin_falls_back_to_head_with_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo = make_repo(tmp_path, ["dev"], default="dev")  # NO origin remote
+    stray = _commit_stray_feature_branch(repo)
+    runner = FakeRunner()
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+
+    target.up(profile="dev", branch="feat/x")  # never aborts
+
+    assert _is_ancestor(repo, stray, "feat/x")  # local HEAD fallback
+    assert "WARNING" in capsys.readouterr().err
+    assert not _fetched(runner.git_calls)  # no origin → fetch never attempted
+
+
+def test_up_fetch_failure_falls_back_to_head_with_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo = make_repo(tmp_path, ["dev"], default="dev")
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", str(tmp_path / "does-not-exist.git")],
+        check=True,
+    )
+    stray = _commit_stray_feature_branch(repo)
+    runner = FakeRunner()
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+
+    target.up(profile="dev", branch="feat/x")  # fetch fails → graceful fallback
+
+    assert _is_ancestor(repo, stray, "feat/x")
+    assert "WARNING" in capsys.readouterr().err
+
+
+def test_resolve_default_branch_symbolic_ref(tmp_path: Path) -> None:
+    repo, _origin = make_repo_with_origin(tmp_path)
+    subprocess.run(["git", "-C", str(repo), "fetch", "origin"], check=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "set-head", "origin", "--auto"], check=True)
+    target = LocalWorktreeDevcontainerTarget(repo, runner=FakeRunner())
+    assert target._resolve_default_branch() == "main"
+
+
+def test_resolve_default_branch_gh_fallback(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)  # no origin → symbolic-ref fails
+    runner = FakeRunner(stdout={"gh": "trunk\n"})
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+    assert target._resolve_default_branch() == "trunk"
+
+
+def test_resolve_default_branch_main_fallback(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)  # no origin, gh yields nothing
+    target = LocalWorktreeDevcontainerTarget(repo, runner=FakeRunner())
+    assert target._resolve_default_branch() == "main"
+
+
+def test_resolve_default_branch_gitlab_backend(tmp_path: Path) -> None:
+    """Backend-aware fallback (docs/superpowers/specs/
+    2026-07-09-multi-backend-git-host-adapters-design.md §8): a
+    GitLab-backed repo (no symbolic-ref, no `gh`) resolves via
+    `glab repo view -F json --jq .default_branch`."""
+    repo = make_repo(tmp_path)  # no origin → symbolic-ref fails
+    (repo / ".devcontainer").mkdir()
+    (repo / ".devcontainer" / "fr-profiles.yaml").write_text(
+        "backend: gitlab\nprofiles:\n  dev:\n    purpose: x\n"
+    )
+    runner = FakeRunner(stdout={"glab": "develop\n"})
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+    assert target._resolve_default_branch() == "develop"
+    glab_calls = runner.argv_for("glab")
+    assert glab_calls and glab_calls[0][:2] == ["glab", "repo"]
+
+
+def test_resolve_default_branch_gitea_backend(tmp_path: Path) -> None:
+    """A Gitea-backed repo resolves via `tea repos ... --output json`
+    (field name `default_branch` — confirmed against Gitea's live
+    swagger spec, Repository.default_branch — but the CLI's own JSON
+    shape is reconfirmed against a live tea in Phase 9's manual
+    verification)."""
+    repo = make_repo(tmp_path)
+    (repo / ".devcontainer").mkdir()
+    (repo / ".devcontainer" / "fr-profiles.yaml").write_text(
+        "backend: gitea\nprofiles:\n  dev:\n    purpose: x\n"
+    )
+    runner = FakeRunner(stdout={"tea": '{"default_branch": "develop"}'})
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+    assert target._resolve_default_branch() == "develop"
+    tea_calls = runner.argv_for("tea")
+    assert tea_calls and tea_calls[0][:1] == ["tea"]
+
+
+def test_resolve_default_branch_gitlab_backend_falls_back_on_failure(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    (repo / ".devcontainer").mkdir()
+    (repo / ".devcontainer" / "fr-profiles.yaml").write_text(
+        "backend: gitlab\nprofiles:\n  dev:\n    purpose: x\n"
+    )
+    runner = FakeRunner()  # glab yields empty stdout → falls through to "main"
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+    assert target._resolve_default_branch() == "main"
+
+
+def test_pr_from_gitlab_backend(tmp_path: Path) -> None:
+    """A GitLab-backed repo's `_pr_from` uses `glab mr view <branch>
+    --output json` (a single-shot query, like gh's) — verified against
+    glab's own `--help` (`glab mr view {<id> | <branch>}` accepts a bare
+    branch name directly, unlike its `mr view <url>` case)."""
+    repo = make_repo(tmp_path)
+    (repo / ".devcontainer").mkdir()
+    (repo / ".devcontainer" / "fr-profiles.yaml").write_text(
+        "backend: gitlab\nprofiles:\n  dev:\n    purpose: x\n"
+    )
+    runner = FakeRunner(
+        stdout={
+            "glab": '{"state": "merged", "web_url": "https://gitlab.com/g/p/-/merge_requests/1"}'
+        }
+    )
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+    result = target._pr_from(repo, "feat/x")
+    assert result is not None
+    assert result["state"] == "MERGED"
+    assert result["url"] == "https://gitlab.com/g/p/-/merge_requests/1"
+
+
+def test_pr_from_gitlab_backend_no_mr_returns_none(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    (repo / ".devcontainer").mkdir()
+    (repo / ".devcontainer" / "fr-profiles.yaml").write_text(
+        "backend: gitlab\nprofiles:\n  dev:\n    purpose: x\n"
+    )
+    runner = FakeRunner()  # empty stdout, rc=0 by default — no MR
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+    assert target._pr_from(repo, "feat/x") is None
+
+
+def test_pr_from_gitea_backend_list_and_filter_fallback(tmp_path: Path) -> None:
+    """Gitea's CLI has no single-shot branch→PR query (unlike gh/glab) —
+    verified during the multi-backend design's research (`tea pulls`
+    only takes an index, not a branch). The adapter falls back to
+    listing ALL PRs and matching `head.label` client-side. This is a
+    real, bounded degradation vs. gh/glab's single-shot query, not a
+    bug — documented in the design doc §8."""
+    repo = make_repo(tmp_path)
+    (repo / ".devcontainer").mkdir()
+    (repo / ".devcontainer" / "fr-profiles.yaml").write_text(
+        "backend: gitea\nprofiles:\n  dev:\n    purpose: x\n"
+    )
+    listing = (
+        '[{"state": "open", "merged": false, "url": "https://gitea.example.com/o/r/pulls/1", '
+        '"head": {"label": "other-branch"}}, '
+        '{"state": "open", "merged": false, "url": "https://gitea.example.com/o/r/pulls/2", '
+        '"head": {"label": "feat/x"}}]'
+    )
+    runner = FakeRunner(stdout={"tea": listing})
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+    result = target._pr_from(repo, "feat/x")
+    assert result is not None
+    assert result["url"] == "https://gitea.example.com/o/r/pulls/2"
+    assert result["state"] == "OPEN"
+
+
+def test_pr_from_gitea_backend_merged_state(tmp_path: Path) -> None:
+    """A merged Gitea PR coerces to the shared "MERGED" vocabulary
+    (Gitea's `state` field alone would say "closed" — the separate
+    `merged: true` boolean is what distinguishes it, per Gitea's own
+    PullRequest schema, verified against its live swagger spec)."""
+    repo = make_repo(tmp_path)
+    (repo / ".devcontainer").mkdir()
+    (repo / ".devcontainer" / "fr-profiles.yaml").write_text(
+        "backend: gitea\nprofiles:\n  dev:\n    purpose: x\n"
+    )
+    listing = (
+        '[{"state": "closed", "merged": true, "url": "https://gitea.example.com/o/r/pulls/2", '
+        '"head": {"label": "feat/x"}}]'
+    )
+    runner = FakeRunner(stdout={"tea": listing})
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+    result = target._pr_from(repo, "feat/x")
+    assert result is not None
+    assert result["state"] == "MERGED"
+
+
+def test_pr_from_gitea_backend_no_matching_branch_returns_none(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    (repo / ".devcontainer").mkdir()
+    (repo / ".devcontainer" / "fr-profiles.yaml").write_text(
+        "backend: gitea\nprofiles:\n  dev:\n    purpose: x\n"
+    )
+    listing = '[{"state": "open", "merged": false, "url": "u", "head": {"label": "other-branch"}}]'
+    runner = FakeRunner(stdout={"tea": listing})
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+    assert target._pr_from(repo, "feat/x") is None
+
+
+def test_up_reuse_existing_worktree_never_fetches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo, _origin = make_repo_with_origin(tmp_path, ["dev"], default="dev")
+    runner = FakeRunner()
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+    target.up(profile="dev", branch="feat/x")  # first up creates + fetches
+    runner.git_calls.clear()
+
+    target.up(profile="dev", branch="feat/x")  # reuse: worktree already exists
+
+    assert not _fetched(runner.git_calls)  # corner case #1: reuse never rebases
+
+
+def test_up_reuse_existing_branch_no_fetch_no_rebase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo, _origin = make_repo_with_origin(tmp_path, ["dev"], default="dev")
+    branch_tip = _git_out(repo, "rev-parse", "HEAD")
+    subprocess.run(["git", "-C", str(repo), "branch", "feat/pre"], check=True)
+    runner = FakeRunner()
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+
+    target.up(profile="dev", branch="feat/pre")  # existing branch → checkout as-is
+
+    assert _git_out(repo, "rev-parse", "feat/pre") == branch_tip  # tip unchanged
+    assert not _fetched(runner.git_calls)
+
+
+# ---------- target.exec / status / down ----------
+
+
+def _upped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **runner_kw):
+    # A real bare `origin` (main pushed) rather than a plain make_repo(): the
+    # phase-2 unlanded-content guard fetches origin/<default> on every
+    # force=False down(), so every caller of this fixture needs one — not
+    # just the guard's own tests (spec §3.4).
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo, _origin = make_repo_with_origin(tmp_path, ["dev"], default="dev")
+    runner = FakeRunner(**runner_kw)
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+    st = target.up(None, "vk-iso/test")
+    runner.calls.clear()
+    runner.git_calls.clear()
+    return repo, runner, target, st
+
+
+def test_exec_passthrough(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # a running container: exec's _ensure_running execs directly (spec §3.B)
+    _, runner, target, st = _upped(tmp_path, monkeypatch, stdout={"docker": "cid1 running"})
+    rc = target.exec(st, ["pytest", "-q", "--no-cov"])
+    assert rc == 0
+    (call,) = runner.argv_for("devcontainer")
+    assert call[1] == "exec"
+    assert call[-3:] == ["pytest", "-q", "--no-cov"]
+    assert runner.captures[-1] is False, "exec must inherit stdio (stream output live)"
+
+
+def test_status_reports_worktree_container_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runner, target, st = _upped(
+        tmp_path,
+        monkeypatch,
+        stdout={"docker": "abc123 running\n", "gh": '{"state": "OPEN", "url": "u"}'},
+    )
+    s = target.status(st)
+    assert s["worktree"] == str(st.worktree) and s["worktree_exists"] is True
+    assert s["container"] == "running"
+    assert s["pr"] == {"state": "OPEN", "url": "u"}
+
+
+def test_down_refuses_open_pr_without_force(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, runner, target, st = _upped(
+        tmp_path, monkeypatch, stdout={"gh": '{"state": "OPEN", "url": "u"}'}
+    )
+    with pytest.raises(IsolationError, match="open"):
+        target.down(st, force=False)
+    assert st.worktree.is_dir()  # untouched
+
+
+def test_down_force_removes_worktree_and_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, runner, target, st = _upped(
+        tmp_path,
+        monkeypatch,
+        stdout={"docker": "abc123 running\n", "gh": '{"state": "OPEN", "url": "u"}'},
+    )
+    target.down(st, force=True)
+    assert not st.worktree.exists()
+    assert load_state(repo, "vk-iso/test") is None
+    stops = [c for c in runner.argv_for("docker") if c[1] in ("stop", "rm")]
+    assert stops, "container should be stopped/removed"
+
+
+def test_down_merged_pr_cleans_without_force(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, runner, target, st = _upped(
+        tmp_path, monkeypatch, stdout={"gh": '{"state": "MERGED", "url": "u"}'}
+    )
+    target.down(st, force=False)
+    assert not st.worktree.exists()
+
+
+def _orphan_worktree(repo: Path, st: IsolationState, *, keep_dir: bool) -> None:
+    """Remove the worktree from git out-of-band. keep_dir=True leaves a stray
+    directory at the path (so real `git worktree remove` fails while the dir
+    still exists); keep_dir=False leaves nothing behind."""
+    shutil.rmtree(st.worktree)
+    subprocess.run(["git", "-C", str(repo), "worktree", "prune"], check=True)
+    if keep_dir:
+        st.worktree.mkdir(parents=True)
+
+
+def test_down_raises_when_container_survives_stop_rm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A transient docker failure: `docker rm` fails, so the re-query still sees
+    # the container. down() must raise and LEAVE state + marker + worktree in
+    # place, so `fr isolation status` still sees the workspace.
+    repo, runner, target, st = _upped(
+        tmp_path,
+        monkeypatch,
+        fail_on="rm",
+        stdout={"docker": "abc123 running\n", "gh": '{"state": "MERGED", "url": "u"}'},
+    )
+    with pytest.raises(IsolationError, match="still present"):
+        target.down(st, force=False)
+    assert load_state(repo, "vk-iso/test") is not None, "state must survive"
+    assert (st.worktree / ".fr-isolation").exists(), "marker must survive"
+    assert st.worktree.is_dir(), "worktree must be untouched"
+
+
+def test_down_raises_when_worktree_remove_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Container tears down cleanly, but the worktree remove fails while the dir
+    # still exists (a stray dir git no longer tracks) → raise, keep state.
+    #
+    # force=True here — not exercising the open-PR/reap-hazard escape, but
+    # because the stray dir left by `_orphan_worktree` is no longer a git
+    # repository at all (its gitdir was pruned), so the #435 reap-hazard guard
+    # (which now runs first) would itself refuse it as "unverifiable" — see
+    # test_down_reap_hazard_guard_precedes_worktree_remove_failure below for
+    # that precedence, asserted directly. force=True skips straight to the
+    # worktree-remove post-condition check this test targets.
+    repo, runner, target, st = _upped(
+        tmp_path,
+        monkeypatch,
+        stdout={"docker": "abc123 running\n", "gh": '{"state": "MERGED", "url": "u"}'},
+    )
+    _orphan_worktree(repo, st, keep_dir=True)
+    # #575 p4-f10: a tree git cannot read no longer blocks preservation — it
+    # falls back to a git-less copy — so --force still reaches the post-condition.
+    with pytest.raises(IsolationError, match="worktree remove failed"):
+        target.down(st, force=True)
+    assert load_state(repo, "vk-iso/test") is not None, "state must survive a worktree failure"
+
+
+def test_down_reap_hazard_guard_precedes_worktree_remove_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The #435 guard runs BEFORE `_teardown_container`/worktree removal (spec
+    # §3.1's "one enforcement site"), so a stray, no-longer-a-git-repo
+    # directory is refused as unverifiable rather than reaching the
+    # worktree-remove failure above — the guard shadows it, deliberately.
+    repo, runner, target, st = _upped(
+        tmp_path,
+        monkeypatch,
+        stdout={"docker": "abc123 running\n", "gh": '{"state": "MERGED", "url": "u"}'},
+    )
+    _orphan_worktree(repo, st, keep_dir=True)
+    with pytest.raises(ReapRefused) as exc_info:
+        target.down(st, force=False)
+    assert exc_info.value.hazard.kind == "unverifiable"
+    assert load_state(repo, "vk-iso/test") is not None
+
+
+def test_down_completes_when_worktree_already_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Worktree removed out of band: `git worktree remove` fails but the dir is
+    # gone, so the post-condition holds → down completes and deletes state.
+    repo, runner, target, st = _upped(
+        tmp_path, monkeypatch, stdout={"gh": '{"state": "MERGED", "url": "u"}'}
+    )
+    _orphan_worktree(repo, st, keep_dir=False)
+    target.down(st, force=False)
+    assert load_state(repo, "vk-iso/test") is None
+
+
+def test_down_force_still_verifies_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # --force bypasses the open-PR guard, NOT the container-gone verification.
+    repo, runner, target, st = _upped(
+        tmp_path,
+        monkeypatch,
+        fail_on="rm",
+        stdout={"docker": "abc123 running\n", "gh": '{"state": "OPEN", "url": "u"}'},
+    )
+    with pytest.raises(IsolationError, match="still present"):
+        target.down(st, force=True)
+    assert load_state(repo, "vk-iso/test") is not None
+
+
+def test_down_raises_when_docker_query_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `docker ps` ITSELF failing (daemon unreachable) must not be read as "no
+    # container" — down must raise and keep state, or it re-opens the #354 leak
+    # (delete state while a container survives once docker recovers).
+    repo, runner, target, st = _upped(
+        tmp_path,
+        monkeypatch,
+        fail_on="ps",
+        stdout={"docker": "abc123 running\n", "gh": '{"state": "MERGED", "url": "u"}'},
+    )
+    with pytest.raises(IsolationError, match="docker ps failed"):
+        target.down(st, force=False)
+    assert load_state(repo, "vk-iso/test") is not None
+    assert not any(c[1] in ("stop", "rm") for c in runner.argv_for("docker"))
+
+
+def test_down_reclaims_image(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, runner, target, st = _upped(
+        tmp_path,
+        monkeypatch,
+        stdout={
+            "docker": "abc123 running\n",
+            "docker_image": "vsc-img-sha\n",
+            "gh": '{"state": "MERGED", "url": "u"}',
+        },
+    )
+    target.down(st, force=False)
+    assert not st.worktree.exists()
+    assert ["docker", "rmi", "vsc-img-sha"] in runner.argv_for("docker")
+
+
+def test_down_rmi_failure_is_non_fatal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A shared / in-use image failing `docker rmi` must NOT fail a teardown
+    # whose container is already gone.
+    repo, runner, target, st = _upped(
+        tmp_path,
+        monkeypatch,
+        fail_on="rmi",
+        stdout={
+            "docker": "abc123 running\n",
+            "docker_image": "vsc-img-sha\n",
+            "gh": '{"state": "MERGED", "url": "u"}',
+        },
+    )
+    target.down(st, force=False)  # no raise
+    assert load_state(repo, "vk-iso/test") is None
+
+
+def test_devcontainer_id_matches_the_cli() -> None:
+    # Vector from the devcontainer CLI's own formula (sha256 of the sorted
+    # id-label JSON, base-32, padded to 52). The same formula, run against the
+    # host's leaked volumes, reproduced their exact `dind-var-lib-docker-<id>` names.
+    folder = "/home/dev/.cache/fr/worktrees/demo/feat__x"
+    assert (
+        devcontainer_id(folder, f"{folder}/.devcontainer/dev/devcontainer.json")
+        == "1tfvnq8knufjte3fagegfvnrqrmqc13379esotndqa689d3plr71"
+    )
+
+
+def _volumes_out(st: IsolationState, *volumes: str) -> str:
+    """`docker inspect` output for the workspace-volume query: the two id
+    labels on line 1, the container's named volume mounts on line 2."""
+    config = st.worktree / ".devcontainer" / st.profile / "devcontainer.json"
+    return f"{st.worktree}\t{config}\n{' '.join(volumes)}\n"
+
+
+def test_down_removes_the_workspace_dind_volume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The leak: docker-in-docker keeps the inner dockerd's whole /var/lib/docker
+    # in the NAMED volume `dind-var-lib-docker-<devcontainerId>`. `docker rm`
+    # never removes a named volume, so every down leaked it (18.7 GB on one host).
+    # A shared named volume (no devcontainerId in its name) must survive.
+    repo, runner, target, st = _upped(tmp_path, monkeypatch)
+    config = st.worktree / ".devcontainer" / st.profile / "devcontainer.json"
+    owned = f"dind-var-lib-docker-{devcontainer_id(str(st.worktree), str(config))}"
+    runner.stdout = {
+        "docker": "abc123 running\n",
+        "docker_image": "vsc-img-sha\n",
+        "docker_volumes": _volumes_out(st, owned, "vscode"),
+        "gh": '{"state": "MERGED", "url": "u"}',
+    }
+    target.down(st, force=False)
+    calls = runner.argv_for("docker")
+    assert ["docker", "volume", "rm", owned] in calls
+    assert not any(c[0:3] == ["docker", "volume", "rm"] and "vscode" in c for c in calls)
+    # removed only after the container is gone (a mounted volume cannot be removed)
+    assert calls.index(["docker", "volume", "rm", owned]) > calls.index(["docker", "rm", "abc123"])
+
+
+def test_down_volume_rm_failure_is_non_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, runner, target, st = _upped(tmp_path, monkeypatch, fail_on="volume")
+    config = st.worktree / ".devcontainer" / st.profile / "devcontainer.json"
+    owned = f"dind-var-lib-docker-{devcontainer_id(str(st.worktree), str(config))}"
+    runner.stdout = {
+        "docker": "abc123 running\n",
+        "docker_volumes": _volumes_out(st, owned),
+        "gh": '{"state": "MERGED", "url": "u"}',
+    }
+    target.down(st, force=False)  # no raise
+    assert load_state(repo, "vk-iso/test") is None
+
+
+def test_gc_label_reap_removes_the_workspace_volume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A container found only by label (worktree already gone) leaks its volume too.
+    repo, runner, target, _up = _gc_env(tmp_path, monkeypatch)
+    gone = tmp_path / "home" / ".cache" / "fr" / "worktrees" / "other" / "gone"
+    config = gone / ".devcontainer" / "dev" / "devcontainer.json"
+    owned = f"dind-var-lib-docker-{devcontainer_id(str(gone), str(config))}"
+    runner.docker_labels = [("cOrph", str(gone))]
+    runner.stdout = {"docker_volumes": f"{gone}\t{config}\n{owned}\n"}
+    target.gc()
+    assert ["docker", "volume", "rm", owned] in runner.argv_for("docker")
+
+
+def test_down_no_container_skips_rmi(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, runner, target, st = _upped(
+        tmp_path, monkeypatch, stdout={"gh": '{"state": "MERGED", "url": "u"}'}
+    )
+    target.down(st, force=False)
+    assert not any(c[0:2] == ["docker", "rmi"] for c in runner.argv_for("docker"))
+
+
+# ---------- target.down — the dirty-worktree reap guard (#435) ----------
+
+
+def _worktree_remove_calls(runner: FakeRunner) -> list[list[str]]:
+    return [c for c in runner.git_calls if c[:3] == ["git", "worktree", "remove"]]
+
+
+def test_down_refuses_when_worktree_has_a_tracked_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, runner, target, st = _upped(
+        tmp_path, monkeypatch, stdout={"gh": '{"state": "MERGED", "url": "u"}'}
+    )
+    tracked = st.worktree / "README.md"
+    tracked.write_text(tracked.read_text() + "one more line\n")
+
+    with pytest.raises(ReapRefused) as exc_info:
+        target.down(st, force=False)
+
+    assert exc_info.value.hazard.kind == "dirty-worktree"
+    # Load-bearing: the removal must never have RUN, not merely that the raise
+    # happened — asserting only the exception would pass even if the removal
+    # ran first and the raise came after.
+    assert _worktree_remove_calls(runner) == []
+    assert st.worktree.is_dir()
+
+
+def test_down_refuses_when_worktree_has_an_untracked_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # d1: #435's own lost work was a newly-authored (untracked) file — the
+    # carve-out #435 floated ("untracked is fine to ignore") is rejected.
+    repo, runner, target, st = _upped(
+        tmp_path, monkeypatch, stdout={"gh": '{"state": "MERGED", "url": "u"}'}
+    )
+    (st.worktree / "new-phase.md").write_text("newly authored, never committed\n")
+
+    with pytest.raises(ReapRefused) as exc_info:
+        target.down(st, force=False)
+
+    assert exc_info.value.hazard.kind == "dirty-worktree"
+    assert _worktree_remove_calls(runner) == []
+    assert st.worktree.is_dir()
+
+
+def test_down_refuses_as_unverifiable_when_status_query_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #354 invariant applied to the working tree: a FAILED query is not
+    # evidence of a clean tree. Corrupt the linked worktree's gitfile so a real
+    # `git status --porcelain` exits non-zero while the directory still exists.
+    repo, runner, target, st = _upped(
+        tmp_path, monkeypatch, stdout={"gh": '{"state": "MERGED", "url": "u"}'}
+    )
+    (st.worktree / ".git").write_text("gitdir: /nonexistent/not-a-real-gitdir\n")
+
+    with pytest.raises(ReapRefused) as exc_info:
+        target.down(st, force=False)
+
+    assert exc_info.value.hazard.kind == "unverifiable"
+    assert _worktree_remove_calls(runner) == []
+    assert st.worktree.is_dir()
+    # Phase-1 review f1: the remedy clause is per-hazard. "Commit or stash
+    # them" has no referent when the hazard is that `git status` itself
+    # failed, so this hazard must NOT carry the dirty-tree remedy.
+    detail = exc_info.value.hazard.detail
+    assert "Commit or stash" not in detail
+    assert "`git status` runs there" in detail
+
+
+def test_down_dirty_worktree_message_names_branch_path_and_force_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, runner, target, st = _upped(
+        tmp_path, monkeypatch, stdout={"gh": '{"state": "MERGED", "url": "u"}'}
+    )
+    (st.worktree / "new-phase.md").write_text("newly authored, never committed\n")
+
+    with pytest.raises(ReapRefused) as exc_info:
+        target.down(st, force=False)
+
+    detail = exc_info.value.hazard.detail
+    assert st.branch in detail
+    assert "new-phase.md" in detail
+    assert "--force" in detail
+    assert "Commit or stash them." in detail
+    # Phase-1 review f2, verified against real git: `git worktree remove
+    # --force` does NOT delete the branch or its commits, so the message says
+    # what --force does rather than claiming it destroys "the work". For a
+    # DIRTY tree the uncommitted part genuinely is unrecoverable, and the
+    # sentence must say both halves.
+    assert "the branch and any commits on it remain in the repo" in detail
+    assert "uncommitted changes do not" in detail
+
+
+def test_down_reaps_a_clean_worktree_in_a_repo_with_no_origin_remote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase-2 review f3, real git, docker-less (HostWorktreeTarget).
+
+    A repo with NO `origin` is not a failed fetch. `fr isolation up` supports
+    this case deliberately — it warns "no origin remote — basing <branch> on
+    local HEAD" and proceeds — so `down` refusing it forever would strand a
+    whole class of repo behind --force, the one lever decision d3 says an
+    agent may not reach for on its own. Nothing unrecoverable is at stake
+    either: `git worktree remove` leaves the branch and its commits in the
+    repo (phase-1 review f2), and guard 2 still covers uncommitted work.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo = make_repo(tmp_path)
+    assert subprocess_runner(["git", "remote", "get-url", "origin"], cwd=repo).returncode != 0, (
+        "fixture precondition: this repo must have no origin remote"
+    )
+
+    target = HostWorktreeTarget(repo, runner=subprocess_runner)
+    st = target.up(None, "feat/no-origin")
+    assert st.worktree.is_dir()
+
+    assert target._reap_hazard(st) is None
+    target.down(st, force=False)  # the point: no --force needed
+    assert not st.worktree.exists()
+
+
+def test_reap_hazard_never_raises_when_the_content_comparison_blows_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Phase-2 review f4. `branch_changes_present` raises IsolationError on
+    # unrelated histories. A guard that RAISES is worse than one that refuses:
+    # `_gc_one`'s `if dry_run:` arms sit outside their `try`, so an exception
+    # escaping here would abort the entire host-wide sweep (phase 3 calls
+    # _reap_hazard from exactly there). Unknown state must become an
+    # `unverifiable` hazard, which gc classifies as a skip.
+    repo, runner, target, st = _upped(
+        tmp_path, monkeypatch, stdout={"gh": '{"state": "MERGED", "url": "u"}'}
+    )
+
+    def _boom(*_args: object, **_kwargs: object) -> object:
+        raise IsolationError("no merge-base for origin/dev and feat/x — unrelated histories?")
+
+    monkeypatch.setattr("fr.isolation.local.branch_changes_present", _boom)
+
+    hazard = target._reap_hazard(st)
+    assert hazard is not None
+    assert hazard.kind == "unverifiable"
+    assert "unrelated histories" in hazard.detail
+
+    # And the same through the live path: refuse, do not raise something gc
+    # would misfile as a teardown failure.
+    with pytest.raises(ReapRefused):
+        target.down(st, force=False)
+    assert _worktree_remove_calls(runner) == []
+
+
+def test_down_dirty_worktree_message_caps_the_listed_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A hazard on a many-file branch must not produce a wall of text — first
+    # few, then "+N more" (spec §3.1 refactor note).
+    repo, runner, target, st = _upped(
+        tmp_path, monkeypatch, stdout={"gh": '{"state": "MERGED", "url": "u"}'}
+    )
+    for i in range(8):
+        (st.worktree / f"scratch-{i}.md").write_text("uncommitted\n")
+
+    with pytest.raises(ReapRefused) as exc_info:
+        target.down(st, force=False)
+
+    detail = exc_info.value.hazard.detail
+    assert "+3 more" in detail
+    assert detail.count("scratch-") == 5
+
+
+def test_down_force_tears_down_a_dirty_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, runner, target, st = _upped(
+        tmp_path, monkeypatch, stdout={"gh": '{"state": "MERGED", "url": "u"}'}
+    )
+    (st.worktree / "new-phase.md").write_text("newly authored, never committed\n")
+
+    target.down(st, force=True)  # the escape still works
+
+    assert not st.worktree.exists()
+    assert load_state(repo, st.branch) is None
+
+
+def test_down_reaps_clean_landed_worktree_unaffected_by_new_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The happy path must not regress: a clean, merged workspace still reaps.
+    repo, runner, target, st = _upped(
+        tmp_path, monkeypatch, stdout={"gh": '{"state": "MERGED", "url": "u"}'}
+    )
+    target.down(st, force=False)
+    assert not st.worktree.exists()
+    assert load_state(repo, st.branch) is None
+
+
+def test_down_refuses_dirty_worktree_real_git_host_worktree_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Skeleton smoke (P1.T2.S1): no FakeRunner, real git, real subprocess_runner
+    driving HostWorktreeTarget — docker-less by construction
+    (`_teardown_container` is a no-op, hostworktree.py), so this needs no daemon
+    and runs in CI. There is no `gh` remote configured on this throwaway repo, so
+    `_pr` returns None and the OPEN-PR guard is inert — isolating exactly the new
+    guard. No repo-registered marker exists for "real subprocess" tests (checked
+    pyproject.toml's [tool.pytest.ini_options]; --strict-markers is set and
+    nothing beyond the builtin `parametrize` is registered), so this is a plain
+    test like the rest of this file's real-git fixtures (e.g.
+    test_branch_changes_present_squash) rather than inventing a marker scheme."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo = make_repo(tmp_path)
+    target = HostWorktreeTarget(repo, runner=subprocess_runner)
+    st = target.up(None, "feat/real-dirty-worktree")
+
+    (st.worktree / "new-note.md").write_text("uncommitted work\n")
+
+    with pytest.raises(ReapRefused):
+        target.down(st, force=False)
+    assert st.worktree.is_dir(), "refusal must not have deleted the worktree"
+
+    target.down(st, force=True)  # the escape still works
+    assert not st.worktree.exists()
+
+
+# ---------- target.down — the unlanded-content reap guard (#467) ----------
+#
+# All of these run through _upped(), whose repo now carries a real bare
+# `origin` with `main` pushed (make_repo_with_origin) — the content guard
+# fetches and compares against a real remote, so it needs one. Tests that
+# only exercise the phase-1 dirty check above never reach the fetch, so they
+# were untouched by that fixture change.
+
+
+def test_down_refuses_local_only_commit_never_landed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #467's own scenario: a commit exists only in the worktree, never pushed
+    # anywhere. branch_changes_present vs origin/main reports it missing.
+    repo, runner, target, st = _upped(
+        tmp_path, monkeypatch, stdout={"gh": '{"state": "MERGED", "url": "u"}'}
+    )
+    _commit_in_worktree(st.worktree, "feature.txt", "the feature\n")
+
+    with pytest.raises(ReapRefused) as exc_info:
+        target.down(st, force=False)
+
+    assert exc_info.value.hazard.kind == "unlanded-content"
+    assert "feature.txt" in exc_info.value.hazard.detail
+    assert _worktree_remove_calls(runner) == []
+    assert st.worktree.is_dir()
+
+
+def test_down_refuses_commit_pushed_to_branch_after_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The #320 orphan: a commit lands on the BRANCH itself after the PR
+    # merged — it reaches origin/<branch> but never origin/<default>, so it
+    # is equally unmerged and equally destroyed by a reap today. The same
+    # content check catches it for free (spec §3.3), with no #320-specific
+    # code.
+    repo, runner, target, st = _upped(
+        tmp_path, monkeypatch, stdout={"gh": '{"state": "MERGED", "url": "u"}'}
+    )
+    _commit_in_worktree(st.worktree, "late.txt", "landed after merge\n")
+    _git_out(st.worktree, "push", "origin", f"HEAD:{st.branch}")
+
+    with pytest.raises(ReapRefused) as exc_info:
+        target.down(st, force=False)
+
+    assert exc_info.value.hazard.kind == "unlanded-content"
+    assert "late.txt" in exc_info.value.hazard.detail
+    assert _worktree_remove_calls(runner) == []
+
+
+def test_down_refuses_as_unverifiable_when_fetch_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Offline (or origin gone) must DEFER a reap, never permit a wrong one
+    # (spec §3.4) — the #354 invariant applied to the network call.
+    repo, runner, target, st = _upped(
+        tmp_path, monkeypatch, stdout={"gh": '{"state": "MERGED", "url": "u"}'}
+    )
+    origin_url = _git_out(repo, "remote", "get-url", "origin")
+    shutil.rmtree(origin_url)  # `git fetch origin <default>` now fails outright
+
+    with pytest.raises(ReapRefused) as exc_info:
+        target.down(st, force=False)
+
+    assert exc_info.value.hazard.kind == "unverifiable"
+    assert _worktree_remove_calls(runner) == []
+    assert st.worktree.is_dir()
+
+
+def test_down_reaps_clean_worktree_when_content_has_landed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The happy path must survive: squash-style landing (the worktree's own
+    # commit is not on origin/main BY SHA, but its content is) must not
+    # false-refuse.
+    repo, runner, target, st = _upped(
+        tmp_path, monkeypatch, stdout={"gh": '{"state": "MERGED", "url": "u"}'}
+    )
+    _commit_in_worktree(st.worktree, "feature.txt", "the feature\n")
+    _land_on_origin_main(repo, "feature.txt", "the feature\n")
+
+    target.down(st, force=False)
+
+    assert not st.worktree.exists()
+    assert load_state(repo, st.branch) is None
+
+
+def test_down_content_check_uses_resolved_default_branch_not_literal_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `verify_merge`'s `default_branch: str = "main"` default is a latent bug
+    # for a repo on master — this is what stops the new guard inheriting it.
+    repo, runner, target, st = _upped(
+        tmp_path, monkeypatch, stdout={"gh": '{"state": "MERGED", "url": "u"}'}
+    )
+    _git_out(repo, "push", "origin", "main:refs/heads/master")
+    monkeypatch.setattr(target, "_resolve_default_branch", lambda: "master")
+
+    target.down(st, force=False)  # must not raise — content matches origin/master
+
+    fetches = [c for c in runner.git_calls if c[:2] == ["git", "fetch"]]
+    assert any(c[2:] == ["origin", "master"] for c in fetches)
+    assert not any("main" in c for c in fetches)
+    merge_bases = [c for c in runner.git_calls if c[:2] == ["git", "merge-base"]]
+    assert merge_bases and any("origin/master" in c for c in merge_bases)
+
+
+def test_down_unlanded_content_message_names_paths_and_push_remedy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, runner, target, st = _upped(
+        tmp_path, monkeypatch, stdout={"gh": '{"state": "MERGED", "url": "u"}'}
+    )
+    _commit_in_worktree(st.worktree, "feature.txt", "the feature\n")
+
+    with pytest.raises(ReapRefused) as exc_info:
+        target.down(st, force=False)
+
+    detail = exc_info.value.hazard.detail
+    assert st.branch in detail
+    assert "feature.txt" in detail
+    assert "not on origin/main" in detail
+    assert "Push the branch." in detail
+    assert "--force" in detail
+    assert "the branch and any commits on it remain in the repo" in detail
+
+
+def test_down_force_tears_down_unlanded_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, runner, target, st = _upped(
+        tmp_path, monkeypatch, stdout={"gh": '{"state": "MERGED", "url": "u"}'}
+    )
+    _commit_in_worktree(st.worktree, "feature.txt", "the feature\n")
+
+    target.down(st, force=True)  # the escape still works
+
+    assert not st.worktree.exists()
+    assert load_state(repo, st.branch) is None
+
+
+# ---------- target.gc — host-wide reconciliation (#354 Task B) ----------
+
+
+def _gc_env(tmp_path, monkeypatch, **runner_kw):
+    """A repo + runner sharing one HOME cache, plus an `up(branch)` helper that
+    returns the created worktree path. gc discovers across the whole HOME.
+
+    A real bare `origin` (main pushed), not a plain make_repo(): the phase-2
+    unlanded-content guard fetches origin/<default> on every live reap, and
+    without a real origin `_resolve_default_branch()` falls through to the
+    `gh` CLI branch, whose FakeRunner-faked stdout (a PR-state JSON blob, not
+    a branch name) is not a valid default-branch name.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo, _origin = make_repo_with_origin(tmp_path, ["dev"], default="dev")
+    runner = FakeRunner(**runner_kw)
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+
+    def up(branch: str) -> Path:
+        st = target.up(None, branch)
+        return st.worktree
+
+    return repo, runner, target, up
+
+
+def test_gc_discovers_label_and_worktree_union(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, runner, target, up = _gc_env(tmp_path, monkeypatch)
+    wt = up("feat/a")
+    gone = tmp_path / "home" / ".cache" / "fr" / "worktrees" / "other" / "gone"
+    runner.docker_labels = [("cA", str(wt)), ("cOrph", str(gone))]
+    recs = {r.worktree: r for r in target._discover_workspaces()}
+    assert set(recs) == {wt, gone}
+    assert recs[wt].container_id == "cA"
+    assert recs[wt].state is not None and recs[wt].state.branch == "feat/a"
+    assert recs[gone].container_id == "cOrph" and recs[gone].state is None
+
+
+def test_gc_classifies_and_reaps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, runner, target, up = _gc_env(
+        tmp_path,
+        monkeypatch,
+        pr_by_branch={
+            "feat/merged": '{"state": "MERGED", "url": "u"}',
+            "feat/open": '{"state": "OPEN", "url": "u"}',
+            # feat/nopr intentionally absent → no PR
+        },
+    )
+    wt_m, wt_o, wt_n = up("feat/merged"), up("feat/open"), up("feat/nopr")
+    gone = tmp_path / "home" / ".cache" / "fr" / "worktrees" / "other" / "gone"
+    nostate = tmp_path / "home" / ".cache" / "fr" / "worktrees" / "x" / "nostate"
+    nostate.mkdir(parents=True)
+    runner.docker_labels = [("cOrph", str(gone))]
+
+    by_wt = {a.worktree: a for a in target.gc()}
+    assert by_wt[str(wt_m)].action == "reaped" and not wt_m.exists()
+    assert load_state(repo, "feat/merged") is None
+    assert by_wt[str(wt_o)].verdict == "open" and by_wt[str(wt_o)].action == "skipped"
+    assert wt_o.is_dir()
+    assert by_wt[str(wt_n)].verdict == "no-pr" and by_wt[str(wt_n)].action == "warned"
+    assert wt_n.is_dir()
+    assert by_wt[str(gone)].action == "reaped"
+    assert ["docker", "rm", "cOrph"] in runner.argv_for("docker")
+    assert by_wt[str(nostate)].verdict == "no-state" and by_wt[str(nostate)].action == "warned"
+
+
+# ---------- gc discovery: ownership-proving sources (#423) ----------
+
+
+def test_gc_discovers_workspace_at_custom_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace created with `up --path` lives OUTSIDE ~/.cache/fr/worktrees —
+    the shape runners use. Directory + container discovery both miss it; the fr
+    state record is what proves fr owns it."""
+    repo, _runner, target, _up = _gc_env(tmp_path, monkeypatch)
+    custom = tmp_path / "elsewhere" / "wt"
+    target.up(None, "feat/custom", path=custom)
+
+    recs = {r.worktree: r for r in target._discover_workspaces()}
+    assert custom in recs
+    assert recs[custom].state is not None and recs[custom].state.branch == "feat/custom"
+
+
+def test_gc_ignores_unrelated_git_worktree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ownership boundary (#423): a plain `git worktree add` by other
+    automation has no fr state and is not under the fr cache root — gc must
+    neither report nor touch it. Discovery never calls `git worktree list`."""
+    repo, _runner, target, _up = _gc_env(tmp_path, monkeypatch)
+    scratch = tmp_path / "scratch"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", str(scratch), "-b", "other/manual"],
+        check=True,
+    )
+
+    actions = target.gc()
+    assert not any(a.worktree == str(scratch) for a in actions)
+    assert scratch.is_dir() and (scratch / "README.md").is_file()
+
+
+def test_gc_reaps_stale_state_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A worktree removed out of band (rm -rf / a runner reaping its own
+    workspace) leaves an fr state record that `status` keeps reporting forever.
+    gc retires the RECORD — no branch, no commit, nothing else is touched."""
+    repo, _runner, target, up = _gc_env(tmp_path, monkeypatch)
+    wt = up("feat/gone")
+    shutil.rmtree(wt)
+
+    (action,) = [a for a in target.gc() if a.branch == "feat/gone"]
+    assert action.verdict == "orphan" and action.action == "reaped"
+    assert "stale state record" in action.detail
+    assert load_state(repo, "feat/gone") is None
+    # the branch itself survives — gc retires bookkeeping, never work
+    assert _git_out(repo, "branch", "--list", "feat/gone")
+
+
+def test_gc_stale_state_dry_run_mutates_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _runner, target, up = _gc_env(tmp_path, monkeypatch)
+    wt = up("feat/gone")
+    shutil.rmtree(wt)
+
+    (action,) = [a for a in target.gc(dry_run=True) if a.branch == "feat/gone"]
+    assert action.action == "would-reap"
+    assert load_state(repo, "feat/gone") is not None
+
+
+def test_gc_stale_state_deferred_when_docker_unhealthy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#354's invariant survives: a FAILED docker query must never be read as
+    'no container'. With the daemon down the reap DEFERS to a later sweep."""
+    repo, _runner, target, up = _gc_env(tmp_path, monkeypatch, fail_on="ps")
+    wt = up("feat/gone")
+    shutil.rmtree(wt)
+
+    (action,) = [a for a in target.gc() if a.branch == "feat/gone"]
+    assert action.action == "skipped" and "docker" in action.detail
+    assert load_state(repo, "feat/gone") is not None
+
+
+# ---------- gc: merged-by-content (no PR, changes already on origin/<default>) ----------
+
+
+def _gc_env_origin(tmp_path, monkeypatch, **runner_kw):  # noqa: ANN001, ANN201
+    """gc env whose repo has a real bare origin + origin/HEAD, so the
+    merged-by-content check (branch_changes_present vs origin/<default>) resolves
+    a real remote ref. Returns (repo, origin, runner, target, up)."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo, origin = make_repo_with_origin(tmp_path, ["dev"], default="dev")
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+        check=True,
+    )
+    runner = FakeRunner(**runner_kw)
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+
+    def up(branch: str) -> Path:
+        return target.up(None, branch).worktree
+
+    return repo, origin, runner, target, up
+
+
+def _commit_in_worktree(wt: Path, name: str, content: str = "payload\n") -> None:
+    (wt / name).write_text(content)
+    subprocess.run(["git", "-C", str(wt), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(wt), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", name],
+        check=True,
+    )
+
+
+def _land_on_origin_main(repo: Path, name: str, content: str) -> None:
+    """Land `content` at path `name` on origin/main as ONE new commit — models a
+    SQUASH merge: the branch's net content reaches main under a fresh commit, so
+    the branch itself is NOT an ancestor of main, yet its file content is
+    present. `name`/`content` matching a branch's commit makes it merged-by-
+    content; a different `name` just advances main (unrelated work)."""
+    (repo / name).write_text(content)
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            f"squash {name}",
+        ],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", "main"], check=True)
+
+
+def test_gc_dry_run_resolves_the_workspace_repos_default_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase-3 review f5 — the cross-repo dry-run divergence.
+
+    gc is host-wide by design ("an `up` in repo A reaps completed work in
+    B…F"), so `self` during a sweep is whichever repo triggered it, not the
+    workspace's. `_reap_hazard` resolves the default branch via
+    `_resolve_default_branch()`, which reads `self.repo_root` — so asking
+    `self` would compare repo B's worktree against repo A's default branch.
+    A `master` repo swept from a `main` one previewed "would-skip" for a
+    workspace the live run then reaps, which is exactly the preview/live
+    divergence the dry-run change exists to remove. `_merged_by_content`
+    already solves this with a sibling Target rooted at `state.repo_root`;
+    the dry-run arm must too.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    # Workspace repo: default branch `main`, clean and fully landed.
+    (tmp_path / "b").mkdir()
+    (tmp_path / "a").mkdir()
+    repo_b, _origin_b = make_repo_with_origin(tmp_path / "b", ["dev"], default="main")
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_b),
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+        check=True,
+    )
+    runner = FakeRunner(pr_by_branch={"feat/b": "MERGED"})
+    target_b = LocalWorktreeDevcontainerTarget(repo_b, runner=runner)
+    st_b = target_b.up(None, "feat/b")
+
+    # Sweeping repo: a DIFFERENT default branch, which does not exist on
+    # repo B's origin at all.
+    repo_a, _origin_a = make_repo_with_origin(tmp_path / "a", ["dev"], default="main")
+    subprocess.run(["git", "-C", str(repo_a), "branch", "-q", "trunk"], check=True)
+    subprocess.run(["git", "-C", str(repo_a), "push", "-q", "origin", "trunk"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_a),
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ],
+        check=True,
+    )
+    target_a = LocalWorktreeDevcontainerTarget(repo_a, runner=runner)
+    assert target_a._resolve_default_branch() == "trunk"
+    assert target_b._resolve_default_branch() == "main"
+
+    action = target_a._reap_or_classify(str(st_b.worktree), st_b, "merged", dry_run=True)
+
+    # Before the fix this fetched `origin/trunk` inside repo B's worktree,
+    # failed, and previewed "would-skip" for a workspace the live sweep reaps.
+    assert action.action == "would-reap", action.detail
+
+
+def test_gc_reaps_no_pr_branch_squash_merged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The org's dominant pattern: a branch's PR is SQUASH-merged, so the branch is
+    # NOT an ancestor of main, but its net content IS on main. With no discoverable
+    # PR it would warn forever — content comparison must see it as merged → reap.
+    repo, _origin, _runner, target, up = _gc_env_origin(tmp_path, monkeypatch)
+    wt = up("feat/work")
+    _commit_in_worktree(wt, "feature.txt", "the feature\n")  # branch's work
+    _land_on_origin_main(repo, "feature.txt", "the feature\n")  # squash-equivalent
+
+    (action,) = [a for a in target.gc() if a.branch == "feat/work"]
+    assert action.verdict == "merged-by-content" and action.action == "reaped"
+    assert not wt.exists()
+    assert load_state(repo, "feat/work") is None
+
+
+def test_gc_does_not_reap_idle_branch_that_fell_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A workspace that did NO work of its own, while main advanced past it, is an
+    # ancestor of main and clean — but it changed nothing, so it is NOT a merge.
+    # (An is-ancestor check would wrongly reap this pristine-but-behind workspace;
+    # content comparison correctly leaves it warned.)
+    repo, _origin, _runner, target, up = _gc_env_origin(tmp_path, monkeypatch)
+    wt = up("feat/idle")
+    _land_on_origin_main(repo, "unrelated.txt", "other work\n")  # main moves; branch idle
+
+    (action,) = [a for a in target.gc() if a.branch == "feat/idle"]
+    assert action.verdict == "no-pr" and action.action == "warned"
+    assert wt.is_dir()
+
+
+def test_gc_warns_no_pr_branch_with_unmerged_commits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A no-PR branch whose changed file is NOT present on origin/main (real
+    # in-progress work) stays warned, never reaped.
+    repo, _origin, _runner, target, up = _gc_env_origin(tmp_path, monkeypatch)
+    wt = up("feat/wip")
+    _commit_in_worktree(wt, "wip.txt", "not on main yet\n")
+
+    (action,) = [a for a in target.gc() if a.branch == "feat/wip"]
+    assert action.verdict == "no-pr" and action.action == "warned"
+    assert wt.is_dir()
+
+
+def test_gc_does_not_reap_fresh_branch_at_default_tip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A pristine just-created workspace sits AT origin/main's tip having changed
+    # nothing — not a merge → must warn, never reap a brand-new workspace.
+    repo, _origin, _runner, target, up = _gc_env_origin(tmp_path, monkeypatch)
+    wt = up("feat/fresh")  # no work, no advance
+
+    (action,) = [a for a in target.gc() if a.branch == "feat/fresh"]
+    assert action.verdict == "no-pr" and action.action == "warned"
+    assert wt.is_dir()
+
+
+def test_gc_does_not_reap_merged_content_with_dirty_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Even when the branch's committed work is all on main, uncommitted changes in
+    # the worktree must block the reap — that work would be lost.
+    repo, _origin, _runner, target, up = _gc_env_origin(tmp_path, monkeypatch)
+    wt = up("feat/work-dirty")
+    _commit_in_worktree(wt, "feature.txt", "the feature\n")
+    _land_on_origin_main(repo, "feature.txt", "the feature\n")
+    (wt / "uncommitted.txt").write_text("unsaved\n")  # dirty worktree
+
+    (action,) = [a for a in target.gc() if a.branch == "feat/work-dirty"]
+    assert action.verdict == "no-pr" and action.action == "warned"
+    assert wt.is_dir()
+
+
+def test_gc_content_reap_dry_run_mutates_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _origin, _runner, target, up = _gc_env_origin(tmp_path, monkeypatch)
+    wt = up("feat/work")
+    _commit_in_worktree(wt, "feature.txt", "the feature\n")
+    _land_on_origin_main(repo, "feature.txt", "the feature\n")
+
+    (action,) = [a for a in target.gc(dry_run=True) if a.branch == "feat/work"]
+    assert action.verdict == "merged-by-content" and action.action == "would-reap"
+    assert wt.is_dir() and load_state(repo, "feat/work") is not None
+
+
+def test_gc_one_failure_does_not_abort_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two merged workspaces whose container survives `docker rm` (fail_on='rm')
+    # → both down() raise; the sweep records both and does not abort.
+    repo, runner, target, up = _gc_env(
+        tmp_path,
+        monkeypatch,
+        fail_on="rm",
+        stdout={"docker": "cX running\n"},
+        pr_by_branch={
+            "feat/m1": '{"state": "MERGED", "url": "u"}',
+            "feat/m2": '{"state": "MERGED", "url": "u"}',
+        },
+    )
+    up("feat/m1")
+    up("feat/m2")
+    actions = target.gc()
+    reap_failed = [a for a in actions if a.verdict == "merged"]
+    assert len(reap_failed) == 2
+    assert all(a.action == "reap-failed" for a in reap_failed)
+
+
+def test_gc_dry_run_mutates_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, runner, target, up = _gc_env(
+        tmp_path,
+        monkeypatch,
+        pr_by_branch={"feat/merged": '{"state": "MERGED", "url": "u"}'},
+    )
+    wt = up("feat/merged")
+    (action,) = [a for a in target.gc(dry_run=True) if a.branch == "feat/merged"]
+    assert action.action == "would-reap"
+    assert wt.is_dir() and load_state(repo, "feat/merged") is not None
+    assert not any(c[0:2] == ["docker", "rm"] for c in runner.argv_for("docker"))
+
+
+def test_gc_merged_reap_unexpected_error_does_not_abort_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An UNEXPECTED error (not IsolationError) from a sibling down() must be
+    # caught per-workspace, not abort the whole host-wide sweep.
+    repo, runner, target, up = _gc_env(
+        tmp_path,
+        monkeypatch,
+        pr_by_branch={
+            "feat/m": '{"state": "MERGED", "url": "u"}',
+            "feat/o": '{"state": "OPEN", "url": "u"}',
+        },
+    )
+    up("feat/m")
+    up("feat/o")
+
+    def boom(self, state, force=False):  # noqa: ANN001, ANN202
+        raise RuntimeError("unexpected teardown failure")
+
+    monkeypatch.setattr(LocalWorktreeDevcontainerTarget, "down", boom)
+    by_branch = {a.branch: a for a in target.gc()}
+    assert by_branch["feat/m"].action == "reap-failed"
+    assert by_branch["feat/o"].action == "skipped"  # sweep continued past the failure
+
+
+def test_gc_corrupt_state_does_not_abort_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fr.isolation.types import state_path
+
+    repo, runner, target, up = _gc_env(tmp_path, monkeypatch)
+    wt = up("feat/a")
+    state_path(repo, "feat/a").write_text("{ not valid json")  # corrupt
+    recs = target._discover_workspaces()  # must not raise
+    rec = next(r for r in recs if r.worktree == wt)
+    assert rec.state is None  # degrades to no-state (warned, never blindly reaped)
+
+
+# ---------- gc: a reap refusal is a skip, not a failure (phase 3, #467 spec §3.5) ----------
+
+
+def test_gc_merged_reap_refusal_reports_skipped_not_reap_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A MERGED-PR workspace with an uncommitted change: down()'s own hazard
+    # guard (unconditional, force=False) refuses it. That refusal is a
+    # deliberate decision, not a teardown failure, and must be reported as
+    # "skipped" — not "reap-failed", which reads as breakage.
+    repo, runner, target, up = _gc_env(
+        tmp_path,
+        monkeypatch,
+        pr_by_branch={"feat/dirty-merged": '{"state": "MERGED", "url": "u"}'},
+    )
+    wt = up("feat/dirty-merged")
+    (wt / "uncommitted.txt").write_text("unsaved\n")
+
+    (action,) = [a for a in target.gc() if a.branch == "feat/dirty-merged"]
+    assert action.verdict == "merged" and action.action == "skipped"
+    assert "uncommitted" in action.detail
+    assert wt.is_dir()
+    assert load_state(repo, "feat/dirty-merged") is not None
+
+
+def test_gc_merged_by_content_reap_refusal_reports_skipped_not_reap_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Same wiring on the merged-by-content branch: _merged_by_content's own
+    # (separate) cleanliness check already excludes a dirty worktree from
+    # reaching this branch at all, so the refusal here is exercised by
+    # forcing the SAME hazard guard `down()` calls to fire, mirroring
+    # test_gc_merged_reap_refusal_reports_skipped_not_reap_failed.
+    repo, _origin, _runner, target, up = _gc_env_origin(tmp_path, monkeypatch)
+    wt = up("feat/work")
+    _commit_in_worktree(wt, "feature.txt", "the feature\n")
+    _land_on_origin_main(repo, "feature.txt", "the feature\n")
+
+    synthetic = ReapHazard(kind="dirty-worktree", detail="isolation: feat/work synthetic hazard")
+    monkeypatch.setattr(
+        LocalWorktreeDevcontainerTarget, "_reap_hazard", lambda self, state: synthetic
+    )
+
+    (action,) = [a for a in target.gc() if a.branch == "feat/work"]
+    assert action.verdict == "merged-by-content" and action.action == "skipped"
+    assert action.detail == synthetic.detail
+    assert wt.is_dir()
+    assert load_state(repo, "feat/work") is not None
+
+
+def test_gc_merged_by_content_genuine_teardown_error_still_reap_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The broad handler must survive alongside the new ReapRefused catch: a
+    # genuine teardown error (container survives docker rm) on the
+    # merged-by-content branch is still "reap-failed", never "skipped".
+    repo, origin, runner, target, up = _gc_env_origin(
+        tmp_path, monkeypatch, fail_on="rm", stdout={"docker": "cX running\n"}
+    )
+    wt = up("feat/work")
+    _commit_in_worktree(wt, "feature.txt", "the feature\n")
+    _land_on_origin_main(repo, "feature.txt", "the feature\n")
+
+    (action,) = [a for a in target.gc() if a.branch == "feat/work"]
+    assert action.verdict == "merged-by-content" and action.action == "reap-failed"
+
+
+def test_gc_dry_run_predicts_a_reap_refusal_as_would_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A preview that promises "would-reap" when the live run would actually
+    # refuse is not a preview — dry-run must ask the same hazard question.
+    repo, runner, target, up = _gc_env(
+        tmp_path,
+        monkeypatch,
+        pr_by_branch={"feat/dirty-merged": '{"state": "MERGED", "url": "u"}'},
+    )
+    wt = up("feat/dirty-merged")
+    (wt / "uncommitted.txt").write_text("unsaved\n")
+
+    (action,) = [a for a in target.gc(dry_run=True) if a.branch == "feat/dirty-merged"]
+    assert action.verdict == "merged" and action.action == "would-skip"
+    assert "uncommitted" in action.detail
+    assert wt.is_dir()
+    assert load_state(repo, "feat/dirty-merged") is not None
+
+
+def test_gc_content_reap_dry_run_predicts_a_reap_refusal_as_would_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _origin, _runner, target, up = _gc_env_origin(tmp_path, monkeypatch)
+    wt = up("feat/work")
+    _commit_in_worktree(wt, "feature.txt", "the feature\n")
+    _land_on_origin_main(repo, "feature.txt", "the feature\n")
+
+    synthetic = ReapHazard(kind="dirty-worktree", detail="isolation: feat/work synthetic hazard")
+    monkeypatch.setattr(
+        LocalWorktreeDevcontainerTarget, "_reap_hazard", lambda self, state: synthetic
+    )
+
+    (action,) = [a for a in target.gc(dry_run=True) if a.branch == "feat/work"]
+    assert action.verdict == "merged-by-content" and action.action == "would-skip"
+    assert action.detail == synthetic.detail
+    assert wt.is_dir()
+    assert load_state(repo, "feat/work") is not None
+
+
+def test_gc_reap_refusal_does_not_abort_the_host_wide_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # One workspace refuses (dirty worktree), a sibling reaps cleanly — the
+    # sweep must still produce both actions.
+    repo, runner, target, up = _gc_env(
+        tmp_path,
+        monkeypatch,
+        pr_by_branch={
+            "feat/dirty-merged": '{"state": "MERGED", "url": "u"}',
+            "feat/clean-merged": '{"state": "MERGED", "url": "u"}',
+        },
+    )
+    dirty_wt = up("feat/dirty-merged")
+    clean_wt = up("feat/clean-merged")
+    (dirty_wt / "uncommitted.txt").write_text("unsaved\n")
+
+    by_branch = {a.branch: a for a in target.gc()}
+    assert by_branch["feat/dirty-merged"].action == "skipped"
+    assert by_branch["feat/clean-merged"].action == "reaped"
+    assert not clean_wt.exists()
+
+
+def test_gc_sweeps_dangling_vsc_images(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # vsc-a is referenced by a live container (keep); vsc-b is dangling (rmi);
+    # ubuntu is not a devcontainer image (ignore). Reap targets the repo:tag ref.
+    repo, runner, target, up = _gc_env(
+        tmp_path,
+        monkeypatch,
+        docker_images=[
+            ("img-a", "vsc-a", "latest"),
+            ("img-b", "vsc-b", "latest"),
+            ("img-u", "ubuntu", "latest"),
+        ],
+        referenced_images=["img-a"],
+    )
+    images = [a for a in target.gc() if a.verdict == "dangling-image"]
+    assert [a.detail for a in images] == ["img-b"]
+    assert ["docker", "rmi", "vsc-b:latest"] in runner.argv_for("docker")
+    assert not any(c == ["docker", "rmi", "vsc-a:latest"] for c in runner.argv_for("docker"))
+    assert not any(c == ["docker", "rmi", "ubuntu:latest"] for c in runner.argv_for("docker"))
+
+
+def test_gc_reaps_multitagged_dangling_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # One image id carrying TWO vsc tags — the real failure: `docker rmi <id>`
+    # errors "referenced in multiple repositories". Reaping each repo:tag untags
+    # both without force; both reaped, neither reap-failed, never a bare-id rmi.
+    repo, runner, target, up = _gc_env(
+        tmp_path,
+        monkeypatch,
+        docker_images=[("shared", "vsc-cwd", "latest"), ("shared", "vsc-pwd", "latest")],
+    )
+    images = [a for a in target.gc() if a.verdict == "dangling-image"]
+    assert len(images) == 2 and {a.action for a in images} == {"reaped"}
+    assert ["docker", "rmi", "vsc-cwd:latest"] in runner.argv_for("docker")
+    assert ["docker", "rmi", "vsc-pwd:latest"] in runner.argv_for("docker")
+    assert not any(c == ["docker", "rmi", "shared"] for c in runner.argv_for("docker"))
+
+
+def test_gc_image_rmi_failure_is_non_fatal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, runner, target, up = _gc_env(
+        tmp_path,
+        monkeypatch,
+        fail_on="rmi",
+        docker_images=[("img-b", "vsc-b", "latest")],
+    )
+    (img,) = [a for a in target.gc() if a.verdict == "dangling-image"]  # no raise
+    assert img.action == "reap-failed"
+
+
+# ---------- opportunistic gc spawn + flock (#354 Task B) ----------
+
+
+def _spawn_target(tmp_path, monkeypatch, spawner, **runner_kw):
+    # Real origin, same reason as _gc_env above (phase-2 content guard).
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo, _origin = make_repo_with_origin(tmp_path, ["dev"], default="dev")
+    runner = FakeRunner(**runner_kw)
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner, gc_spawner=spawner)
+    return repo, runner, target
+
+
+def test_up_spawns_background_gc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    spawns: list[int] = []
+    _, _, target = _spawn_target(tmp_path, monkeypatch, lambda _root, _mode: spawns.append(1))
+    target.up(None, "feat/a")
+    assert spawns == [1], "up() fires exactly one background gc after its work"
+
+
+def test_down_spawns_background_gc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    spawns: list[int] = []
+    repo, runner, target = _spawn_target(
+        tmp_path,
+        monkeypatch,
+        lambda _root, _mode: spawns.append(1),
+        stdout={"gh": '{"state": "MERGED"}'},
+    )
+    st = target.up(None, "feat/a")
+    spawns.clear()
+    target.down(st, force=False)
+    assert spawns == [1], "down() fires exactly one background gc after teardown"
+
+
+def test_spawn_failure_does_not_break_flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(_root: Path, _mode: str) -> None:
+        raise RuntimeError("no fork today")
+
+    _, _, target = _spawn_target(tmp_path, monkeypatch, boom)
+    st = target.up(None, "feat/a")  # must not raise
+    assert st.worktree.is_dir()
+
+
+def test_default_target_does_not_spawn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The library default spawner is a no-op — a directly-constructed Target
+    # (as in tests, and gc's own sibling teardowns) never forks a real sweep.
+    from fr.isolation.local import _noop_gc_spawn
+
+    target = LocalWorktreeDevcontainerTarget(make_repo(tmp_path, ["dev"], default="dev"))
+    assert target._gc_spawner is _noop_gc_spawn
+
+
+def test_gc_second_concurrent_sweep_noops(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, runner, target, up = _gc_env(
+        tmp_path,
+        monkeypatch,
+        pr_by_branch={"feat/merged": '{"state": "MERGED", "url": "u"}'},
+    )
+    up("feat/merged")
+    held = target._acquire_gc_lock()  # simulate a concurrent sweep holding the lock
+    try:
+        assert target.gc() == [], "a second concurrent sweep short-circuits"
+        assert not any(c[0:2] == ["docker", "rm"] for c in runner.argv_for("docker"))
+    finally:
+        held.close()
+
+
+def test_up_twice_is_idempotent_on_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-running up() must not fail on the existing worktree (re-entrant runs)."""
+    repo, runner, target, st1 = _upped(tmp_path, monkeypatch)
+    st2 = target.up(None, "vk-iso/test")
+    assert st2.worktree == st1.worktree
+    assert st2.worktree.is_dir()
+    # second up still (re)starts the devcontainer but adds no second worktree
+    (up_call,) = [call for call in runner.argv_for("devcontainer") if call[1] == "up"]
+    assert up_call[1] == "up"
+
+
+def test_pr_malformed_gh_json_is_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, runner, target, st = _upped(tmp_path, monkeypatch, stdout={"gh": "not-json {"})
+    assert target.status(st)["pr"] is None
+
+
+# ---------- merge-config verification (#320 review follow-up) ----------
+# The content check must be correct across EVERY merge strategy (squash,
+# merge-commit, rebase) — these hit real throwaway repos, base_ref is a local
+# ref so no remote/network is needed.
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True)
+
+
+def _commit(repo: Path, path: str, content: str, msg: str) -> None:
+    (repo / path).write_text(content)
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", msg)
+
+
+def _squash_merge(repo: Path, branch: str, msg: str) -> None:
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "merge", "--squash", branch)
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", msg)
+
+
+def _state(repo: Path, branch: str) -> IsolationState:
+    return IsolationState(
+        repo_root=repo, branch=branch, worktree=repo, profile="dev", created_at="t"
+    )
+
+
+def test_branch_changes_present_squash(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _squash_merge(repo, "feature", "squash fix")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changes_present
+    assert res.missing == []
+
+
+def test_branch_changes_present_no_merge_base_names_base_and_suggests_flag(
+    tmp_path: Path,
+) -> None:
+    # P1.T1.S2 (§3.A): the message must name the base ref that failed to
+    # resolve AND suggest --default-branch as the way out — a wrong/omitted
+    # base is a usage question, not a dead end.
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "--orphan", "unrelated")
+    _commit(repo, "other.py", "x\n", "unrelated root")
+    with pytest.raises(IsolationError) as exc_info:
+        branch_changes_present(subprocess_runner, repo, "unrelated", "main")
+    msg = str(exc_info.value)
+    assert "main" in msg
+    assert "--default-branch" in msg
+
+
+def test_branch_changes_present_merge_commit(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _git(repo, "checkout", "-q", "main")
+    _git(
+        repo, "-c", "user.email=t@t", "-c", "user.name=t", "merge", "--no-ff", "-m", "m", "feature"
+    )
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changes_present
+
+
+def test_branch_changes_present_rebase(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "feature"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "cherry-pick", sha)
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changes_present
+
+
+def test_branch_changes_present_orphan(tmp_path: Path) -> None:
+    # fix1 squash-merged; fix2 pushed to the branch AFTER the merge (#320).
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix1.py", "one\n", "fix1")
+    _squash_merge(repo, "feature", "squash fix1")
+    _git(repo, "checkout", "-q", "feature")
+    _commit(repo, "fix2.py", "two\n", "fix2 after merge")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+    assert "fix2.py" in res.missing
+    assert "fix1.py" not in res.missing
+
+
+def test_branch_changes_present_main_diverged_other_path(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _squash_merge(repo, "feature", "squash fix")
+    _commit(repo, "other.py", "unrelated\n", "other on main")  # main moves on a different file
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changes_present
+
+
+def test_branch_changes_present_multi_file_squash(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "a.py").write_text("a\n")
+    (repo / "b.py").write_text("b\n")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "two files")
+    _squash_merge(repo, "feature", "squash two files")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changes_present
+    assert res.missing == []
+
+
+def test_branch_changes_present_deletion_squash(tmp_path: Path) -> None:
+    # make_repo seeds README.md; the branch deletes it.
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _git(repo, "rm", "-q", "README.md")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "delete readme")
+    _squash_merge(repo, "feature", "squash delete")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changes_present
+
+
+def test_branch_changes_present_multi_commit_rebase(tmp_path: Path) -> None:
+    # GitHub rebase-merge replays ALL branch commits onto main; model with a
+    # range cherry-pick of two commits.
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "a.py", "1\n", "c1")
+    _commit(repo, "b.py", "2\n", "c2")
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "cherry-pick", "main..feature")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changes_present
+    assert res.missing == []
+
+
+@pytest.mark.parametrize("failing_call", [1, 2])
+def test_branch_changes_present_failed_diff_raises(tmp_path: Path, failing_call: int) -> None:
+    # #705: a failed `git diff --name-only` has empty stdout, which read as
+    # "nothing changed" (1st call) or "nothing differs" (2nd) — i.e. ALL
+    # CHANGES PRESENT. It must raise, which every caller maps to not-verified.
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    diff_calls = 0
+
+    def runner(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal diff_calls
+        if argv[:2] == ["git", "diff"]:
+            diff_calls += 1
+            if diff_calls == failing_call:
+                return subprocess.CompletedProcess(argv, 128, stdout="", stderr="fatal: boom\n")
+        return subprocess_runner(argv, **kw)
+
+    with pytest.raises(IsolationError, match="boom"):
+        branch_changes_present(runner, repo, "feature", "main")
+
+
+def test_branch_changes_present_non_ascii_path_unmerged_is_missing(tmp_path: Path) -> None:
+    # #717: without -z git C-quotes the name ("caf\303\251.py"); fed back as a
+    # pathspec it matched nothing, so an UNMERGED file read as present.
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "café.py", "one\n", "non-ascii")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changed == ["café.py"]
+    assert res.missing == ["café.py"]
+    assert not res.changes_present
+
+
+def test_branch_changes_present_non_ascii_path_squash(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "café.py", "one\n", "non-ascii")
+    _commit(repo, "tab\there.py", "two\n", "special")
+    _squash_merge(repo, "feature", "squash")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert sorted(res.changed) == ["café.py", "tab\there.py"]
+    assert res.missing == []
+    assert res.changes_present
+
+
+# ---------- concurrent same-file merge (#387) ----------
+# A branch's changes land, then a SECOND PR touches the SAME file (a different
+# section) right after. The branch's own added lines are all verbatim on main,
+# so verify-merge must still report changes_present — a whole-file content
+# equality check false-negatives here and fr-goal step 9 would STOP-and-recover
+# on it, spawning a duplicate PR that re-lands already-merged lines.
+
+
+def _seed_two_line_file(repo: Path) -> None:
+    _commit(repo, "gotchas.md", "line1\nline2\n", "seed gotchas")
+
+
+@pytest.mark.parametrize(
+    ("label", "base_after_concurrent"),
+    [
+        ("concurrent-line-at-top", "X_CONCURRENT\nline1\nline2\nBRANCH_A\nBRANCH_B\n"),
+        ("concurrent-line-in-middle", "line1\nX_CONCURRENT\nline2\nBRANCH_A\nBRANCH_B\n"),
+        ("concurrent-splits-branch-lines", "line1\nline2\nBRANCH_A\nX_CONCURRENT\nBRANCH_B\n"),
+        ("concurrent-line-at-bottom", "line1\nline2\nBRANCH_A\nBRANCH_B\nX_CONCURRENT\n"),
+    ],
+)
+def test_branch_changes_present_concurrent_same_file(
+    tmp_path: Path, label: str, base_after_concurrent: str
+) -> None:
+    repo = make_repo(tmp_path)
+    _seed_two_line_file(repo)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "gotchas.md", "line1\nline2\nBRANCH_A\nBRANCH_B\n", "branch adds two gotchas")
+    _squash_merge(repo, "feature", "squash gotchas")
+    # a concurrent PR touches the SAME file after the branch's own merge
+    _commit(repo, "gotchas.md", base_after_concurrent, f"concurrent PR ({label})")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changes_present, f"{label}: branch's added lines are all on main"
+    assert res.missing == []
+
+
+def test_branch_changes_present_blob_landed_only_as_a_merge_result(tmp_path: Path) -> None:
+    """Opus fix review f2: `git log --raw` prints nothing for a merge commit
+    without `-m`, so a blob that exists on the base ONLY as a merge result (a
+    conflict resolution) read as never landed. The old per-commit scan saw it."""
+    repo = make_repo(tmp_path)
+    _seed_two_line_file(repo)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "gotchas.md", "line1\nline2\nRESOLVED\n", "branch content")
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "gotchas.md", "line1\nSIDE\n", "side edit")
+    _git(repo, "checkout", "-q", "main")
+    _commit(repo, "gotchas.md", "MAIN\nline2\n", "main edit")
+    subprocess.run(["git", "-C", str(repo), "merge", "-q", "--no-commit", "side"], check=False)
+    (repo / "gotchas.md").write_text("line1\nline2\nRESOLVED\n")  # the merge's own result
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "merge side")
+    _commit(repo, "gotchas.md", "line1\nline2\nRESOLVED\nLATER\nREWRITE\n", "later")
+    _commit(repo, "gotchas.md", "rewritten\n", "rewrite the lines")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changes_present, res.missing
+
+
+def test_branch_changes_present_concurrent_but_branch_line_absent(tmp_path: Path) -> None:
+    # The file exists and diverged on main (a concurrent edit), but one of the
+    # branch's own added lines never landed — this MUST still report missing;
+    # the per-line check may not paper over a genuinely-unmerged contribution.
+    repo = make_repo(tmp_path)
+    _seed_two_line_file(repo)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "gotchas.md", "line1\nline2\nBRANCH_A\nBRANCH_B\n", "branch adds two gotchas")
+    # main NEVER got BRANCH_B; it only has BRANCH_A plus an unrelated concurrent line.
+    _git(repo, "checkout", "-q", "main")
+    _commit(repo, "gotchas.md", "line1\nline2\nBRANCH_A\nX_CONCURRENT\n", "partial + concurrent")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+    assert "gotchas.md" in res.missing
+
+
+def _with_origin(repo: Path) -> None:
+    """Add a bare remote and push main so `git fetch origin main` succeeds —
+    verify_merge requires a fresh fetch, so the verdict tests need a real one."""
+    remote = repo.parent / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    _git(repo, "remote", "add", "origin", str(remote))
+    _git(repo, "push", "-q", "origin", "main")
+
+
+def test_verify_merge_verified(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _squash_merge(repo, "feature", "squash")
+    _with_origin(repo)
+    _git(repo, "checkout", "-q", "feature")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    monkeypatch.setattr(target, "_pr", lambda state: {"state": "MERGED", "url": "u"})
+    res = target.verify_merge(_state(repo, "feature"), default_branch="main")
+    assert res["verified"] is True
+    assert res["changes_present"] is True
+    assert res["fetched"] is True
+    assert res["pr_state"] == "MERGED"
+
+
+def test_verify_merge_reaped_resolves_origin_ref_and_verifies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _squash_merge(repo, "feature", "squash")
+    _with_origin(repo)
+    _git(repo, "push", "-q", "origin", "feature")
+    _git(repo, "branch", "-q", "-D", "feature")  # only origin/feature remains
+    _git(repo, "fetch", "-q", "origin")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    monkeypatch.setattr(target, "_pr_from", lambda cwd, b: {"state": "MERGED"})
+    res = target.verify_merge_reaped("feature", default_branch="main")
+    assert res["verified"] is True and res["reaped"] is True
+    monkeypatch.setattr(target, "_pr_from", lambda cwd, b: {"state": "OPEN"})
+    assert target.verify_merge_reaped("feature", default_branch="main")["verified"] is False
+
+
+def test_verify_merge_reaped_prefers_origin_ref_over_a_stale_local_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#320 orphan: a commit pushed to origin/<b> AFTER the merge must not be hidden
+    by a stale local branch that still points at the merged tip."""
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _squash_merge(repo, "feature", "squash")
+    _with_origin(repo)
+    _git(repo, "push", "-q", "origin", "feature")
+    _git(repo, "checkout", "-q", "feature")
+    _commit(repo, "late.py", "late\n", "pushed after the merge")
+    _git(repo, "push", "-q", "origin", "feature")
+    _git(repo, "reset", "-q", "--hard", "HEAD~1")  # local feature is now stale
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "fetch", "-q", "origin")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    monkeypatch.setattr(target, "_pr_from", lambda cwd, b: {"state": "MERGED"})
+    res = target.verify_merge_reaped("feature", default_branch="main")
+    assert res["verified"] is False and "late.py" in res["missing"]
+
+
+def test_verify_merge_reaped_fetches_the_branch_before_trusting_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review M1: the post-merge push came from ANOTHER clone (a runner's own
+    checkout, another machine), so this repo's `origin/feature` is stale. It
+    must be fetched, or the content check compares stale content and reads
+    verified while the push is missing — the #320 orphan, undetected."""
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _squash_merge(repo, "feature", "squash")
+    _with_origin(repo)
+    _git(repo, "push", "-q", "origin", "feature")
+    _git(repo, "fetch", "-q", "origin")
+    _git(repo, "branch", "-q", "-D", "feature")  # only the stale tracking ref remains
+    other = tmp_path / "other-clone"
+    subprocess.run(
+        ["git", "clone", "-q", "-b", "feature", str(tmp_path / "origin.git"), str(other)],
+        check=True,
+    )
+    _commit(other, "late.py", "late\n", "pushed after the merge, elsewhere")
+    _git(other, "push", "-q", "origin", "feature")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    monkeypatch.setattr(target, "_pr_from", lambda cwd, b: {"state": "MERGED"})
+    res = target.verify_merge_reaped("feature", default_branch="main")
+    assert res["verified"] is False and "late.py" in res["missing"]
+
+
+def test_verify_merge_reaped_checks_unpushed_local_commits_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """gc keeps the local branch. A commit on it that never reached origin is
+    work that is not on main either; preferring `origin/<b>` alone hid it."""
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _squash_merge(repo, "feature", "squash")
+    _with_origin(repo)
+    _git(repo, "push", "-q", "origin", "feature")
+    _git(repo, "checkout", "-q", "feature")
+    _commit(repo, "local_only.py", "x\n", "never pushed")
+    _git(repo, "checkout", "-q", "main")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    monkeypatch.setattr(target, "_pr_from", lambda cwd, b: {"state": "MERGED"})
+    res = target.verify_merge_reaped("feature", default_branch="main")
+    assert res["verified"] is False and "local_only.py" in res["missing"]
+
+
+def test_verify_merge_reaped_survives_the_remote_branch_being_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GitHub deletes a merged branch by default here, so the fetch of it
+    FAILS. That is not a verdict: fall back to the refs we still have."""
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _squash_merge(repo, "feature", "squash")
+    _with_origin(repo)
+    _git(repo, "push", "-q", "origin", "feature")
+    _git(repo, "fetch", "-q", "origin")
+    _git(repo, "push", "-q", "origin", "--delete", "feature")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    monkeypatch.setattr(target, "_pr_from", lambda cwd, b: {"state": "MERGED"})
+    res = target.verify_merge_reaped("feature", default_branch="main")
+    assert res["verified"] is True
+
+
+def test_verify_merge_reaped_unresolvable_ref_raises_naming_ref(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    _with_origin(repo)
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    with pytest.raises(IsolationError, match="ghost-branch"):
+        target.verify_merge_reaped("ghost-branch", default_branch="main")
+
+
+def test_verify_merge_orphan_not_verified(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix1.py", "one\n", "fix1")
+    _squash_merge(repo, "feature", "squash fix1")
+    _with_origin(repo)
+    _git(repo, "checkout", "-q", "feature")
+    _commit(repo, "fix2.py", "two\n", "fix2 after merge")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    monkeypatch.setattr(target, "_pr", lambda state: {"state": "MERGED", "url": "u"})
+    res = target.verify_merge(_state(repo, "feature"), default_branch="main")
+    assert res["verified"] is False
+    assert "fix2.py" in res["missing"]
+
+
+def test_verify_merge_fetch_failure_not_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Content present + PR MERGED, but NO remote → fetch fails → NOT verified
+    # (a stale origin/main must never green-light — the false-positive guard).
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _squash_merge(repo, "feature", "squash")
+    _git(repo, "update-ref", "refs/remotes/origin/main", "main")  # ref exists, but no remote
+    _git(repo, "checkout", "-q", "feature")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    monkeypatch.setattr(target, "_pr", lambda state: {"state": "MERGED", "url": "u"})
+    res = target.verify_merge(_state(repo, "feature"), default_branch="main")
+    assert res["fetched"] is False
+    assert res["changes_present"] is True
+    assert res["verified"] is False
+
+
+def test_verify_merge_unknown_pr_state_not_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # gh unavailable (pr_state None) must NOT pass — PR-MERGED is the tiebreak.
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _squash_merge(repo, "feature", "squash")
+    _with_origin(repo)
+    _git(repo, "checkout", "-q", "feature")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    monkeypatch.setattr(target, "_pr", lambda state: None)
+    res = target.verify_merge(_state(repo, "feature"), default_branch="main")
+    assert res["changes_present"] is True
+    assert res["fetched"] is True
+    assert res["pr_state"] is None
+    assert res["verified"] is False
+
+
+# ---------- .fr-isolation marker lifecycle (#328 Task 3) ----------
+
+
+def _exclude_lines(repo: Path) -> list[str]:
+    exclude = repo / ".git" / "info" / "exclude"
+    return exclude.read_text().splitlines() if exclude.is_file() else []
+
+
+def test_up_writes_isolation_marker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo = make_repo(tmp_path, ["dev"], default="dev")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=FakeRunner())
+    st = target.up(profile=None, branch="feat/x")
+
+    marker = st.worktree / ".fr-isolation"
+    assert marker.is_file()
+    data = json.loads(marker.read_text())
+    assert data["toplevel"] == str(st.worktree.resolve())
+    assert data["branch"] == "feat/x"
+    assert data["mode"] == "worktree"
+    # p2-r20: the chosen target rides beside the unchanged `mode`
+    assert data["target"] == "devcontainer"
+    assert isinstance(data["created_at"], str) and data["created_at"]
+
+
+def test_up_adds_marker_to_info_exclude(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo = make_repo(tmp_path, ["dev"], default="dev")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=FakeRunner())
+    target.up(profile=None, branch="feat/x")
+    assert ".fr-isolation" in _exclude_lines(repo)
+
+
+def test_up_marker_exclude_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo = make_repo(tmp_path, ["dev"], default="dev")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=FakeRunner())
+    st = target.up(profile=None, branch="feat/x")
+    # Re-writing the marker must not duplicate the exclude line.
+    target._write_isolation_marker(st.worktree, "feat/x")
+    assert _exclude_lines(repo).count(".fr-isolation") == 1
+
+
+def test_remove_isolation_marker_unit(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    target = LocalWorktreeDevcontainerTarget(repo, runner=FakeRunner())
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / ".fr-isolation").write_text("{}\n")
+    target._remove_isolation_marker(wt)
+    assert not (wt / ".fr-isolation").exists()
+    target._remove_isolation_marker(wt)  # idempotent — no error when absent
+
+
+def test_down_removes_isolation_marker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo = make_repo(tmp_path, ["dev"], default="dev")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=FakeRunner())
+    st = target.up(profile=None, branch="feat/x")
+    assert (st.worktree / ".fr-isolation").is_file()
+
+    removed: list[Path] = []
+    orig = target._remove_isolation_marker
+    monkeypatch.setattr(
+        target,
+        "_remove_isolation_marker",
+        lambda wt: (removed.append(wt), orig(wt))[1],
+    )
+    target.down(st, force=True)
+    assert removed == [st.worktree]  # down retires the marker
+
+
+class TestClearRepoSentinels:
+    """#341 Task 2A: clear_repo_sentinels owns the Python side of the sentinel
+    contract shared with fr-pipeline-sentinel.sh (writer) and
+    fr-isolation-guard.sh (reader): $FR_SENTINEL_DIR/<session>.json files each
+    carrying {"repo_root": ...}. `fr isolation down --all` uses it to drop
+    session state explicitly."""
+
+    def test_removes_only_matching_repo(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fr.isolation.types import clear_repo_sentinels
+
+        sdir = tmp_path / "sentinels"
+        sdir.mkdir()
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        other = tmp_path / "other"
+        other.mkdir()
+        monkeypatch.setenv("FR_SENTINEL_DIR", str(sdir))
+        (sdir / "s1.json").write_text(json.dumps({"repo_root": str(repo)}))
+        (sdir / "s2.json").write_text(json.dumps({"repo_root": str(other)}))
+        (sdir / "bad.json").write_text("{ not json")
+
+        n = clear_repo_sentinels(repo)
+
+        assert n == 1
+        assert not (sdir / "s1.json").exists()
+        assert (sdir / "s2.json").exists(), "foreign-repo sentinel untouched"
+        assert (sdir / "bad.json").exists(), "malformed sentinel skipped, not removed"
+
+    def test_absent_dir_returns_zero(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from fr.isolation.types import clear_repo_sentinels
+
+        monkeypatch.setenv("FR_SENTINEL_DIR", str(tmp_path / "nope"))
+        assert clear_repo_sentinels(tmp_path / "repo") == 0
+
+
+# ---------- target.restart / target.stats (#341 Task 3) ----------
+
+
+def _target_state(tmp_path: Path, runner: FakeRunner) -> tuple:
+    repo = make_repo(tmp_path, ["dev"], default="dev")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+    st = IsolationState(
+        repo_root=repo,
+        branch="feat/x",
+        worktree=tmp_path / "wt",
+        profile="dev",
+        created_at="2026-07-03T00:00:00Z",
+    )
+    return target, st
+
+
+class TestRestart:
+    def test_graceful_restart(self, tmp_path: Path) -> None:
+        runner = FakeRunner(stdout={"docker": "cid1 running"})
+        target, st = _target_state(tmp_path, runner)
+        target.restart(st)
+        restarts = [c for c in runner.argv_for("docker") if c[1:2] == ["restart"]]
+        assert restarts == [["docker", "restart", "cid1"]]
+
+    def test_force_restart_uses_time_zero(self, tmp_path: Path) -> None:
+        runner = FakeRunner(stdout={"docker": "cid1 running"})
+        target, st = _target_state(tmp_path, runner)
+        target.restart(st, force=True)
+        restarts = [c for c in runner.argv_for("docker") if c[1:2] == ["restart"]]
+        assert restarts == [["docker", "restart", "--time=0", "cid1"]]
+
+    def test_no_container_errors(self, tmp_path: Path) -> None:
+        runner = FakeRunner(stdout={})  # docker ps → "" → no container
+        target, st = _target_state(tmp_path, runner)
+        with pytest.raises(IsolationError, match="nothing to restart"):
+            target.restart(st)
+
+    def test_failure_suggests_force(self, tmp_path: Path) -> None:
+        runner = FakeRunner(fail_on="restart", stdout={"docker": "cid1 running"})
+        target, st = _target_state(tmp_path, runner)
+        with pytest.raises(IsolationError, match="--force"):
+            target.restart(st)
+
+    def test_failed_docker_ps_is_unreachable_not_absent(self, tmp_path: Path) -> None:
+        """Phase-1 review f2: a failed query is not 'no container — run up'."""
+        runner = FakeRunner(fail_on="ps", stdout={"docker": "cid1 running"})
+        target, st = _target_state(tmp_path, runner)
+        with pytest.raises(IsolationError, match="unreachable"):
+            target.restart(st)
+        assert not [c for c in runner.argv_for("docker") if c[1:2] == ["restart"]]
+
+
+class TestStop:
+    """#471 / spec §3.B: `stop` halts the container, keeps everything else,
+    and verifies the stop with a re-query rather than trusting docker's rc."""
+
+    def test_stop_runs_docker_stop_then_verifies(self, tmp_path: Path) -> None:
+        runner = FakeRunner(stdout={"docker": "cid1 running"})
+        target, st = _target_state(tmp_path, runner)
+        msg = target.stop(st)
+        docker = runner.argv_for("docker")
+        stops = [c for c in docker if c[1:2] == ["stop"]]
+        assert stops == [["docker", "stop", "cid1"]]
+        # the verification re-query comes AFTER the stop, and asks `--all`
+        after = docker[docker.index(stops[0]) + 1 :]
+        assert any(c[1:2] == ["ps"] and "--all" in c for c in after)
+        assert "cid1" in msg and "stopped" in msg and "already" not in msg
+
+    def test_already_exited_is_noop_success(self, tmp_path: Path) -> None:
+        runner = FakeRunner(stdout={"docker": "cid1 exited"})
+        target, st = _target_state(tmp_path, runner)
+        msg = target.stop(st)
+        assert "already stopped" in msg
+        assert not [c for c in runner.argv_for("docker") if c[1:2] == ["stop"]]
+
+    def test_no_container_errors_with_up_hint(self, tmp_path: Path) -> None:
+        runner = FakeRunner(stdout={})
+        target, st = _target_state(tmp_path, runner)
+        with pytest.raises(IsolationError, match="fr isolation up"):
+            target.stop(st)
+
+    def test_failed_docker_ps_is_an_error_never_absence(self, tmp_path: Path) -> None:
+        runner = FakeRunner(fail_on="ps", stdout={"docker": "cid1 running"})
+        target, st = _target_state(tmp_path, runner)
+        with pytest.raises(IsolationError, match="unreachable"):
+            target.stop(st)
+        assert not [c for c in runner.argv_for("docker") if c[1:2] == ["stop"]]
+
+    def test_missing_docker_binary_is_unreachable(self, tmp_path: Path) -> None:
+        def no_docker(argv, cwd=None, check=False, capture=True):
+            if argv[0] == "git":
+                return subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+            raise FileNotFoundError(argv[0])
+
+        target, st = _target_state(tmp_path, FakeRunner())
+        target.run = no_docker
+        with pytest.raises(IsolationError, match="unreachable"):
+            target.stop(st)
+
+    def test_verifies_this_container_by_id_not_first_line(self, tmp_path: Path) -> None:
+        """Phase-1 review f1: the label filter can list a stale sibling FIRST.
+        A still-running cid1 behind an exited cid0 must not read as stopped."""
+        ps_outputs = iter(["cid1 running\n", "cid0 exited\ncid1 running\n"])
+
+        def run(argv, cwd=None, check=False, capture=True, **_kw):
+            if argv[0] == "git":
+                return subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+            out = next(ps_outputs) if argv[:2] == ["docker", "ps"] else ""
+            return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+        target, st = _target_state(tmp_path, FakeRunner())
+        target.run = run
+        with pytest.raises(IsolationError, match="cid1 .*still running"):
+            target.stop(st)
+
+    def test_dead_container_points_at_rebuild(self, tmp_path: Path) -> None:
+        runner = FakeRunner(stdout={"docker": "cid1 dead"})
+        target, st = _target_state(tmp_path, runner)
+        msg = target.stop(st)
+        assert "dead" in msg and "fr isolation rebuild --branch feat/x" in msg
+        assert "resumes" not in msg
+        assert not [c for c in runner.argv_for("docker") if c[1:2] == ["stop"]]
+
+    def test_still_running_after_stop_raises(self, tmp_path: Path) -> None:
+        runner = FakeRunner(stdout={"docker": "cid1 running"}, stop_sticks=False)
+        target, st = _target_state(tmp_path, runner)
+        with pytest.raises(IsolationError, match="still running"):
+            target.stop(st)
+
+    def test_docker_stop_failure_raises(self, tmp_path: Path) -> None:
+        runner = FakeRunner(fail_on="stop", stdout={"docker": "cid1 running"})
+        target, st = _target_state(tmp_path, runner)
+        with pytest.raises(IsolationError, match="docker stop failed"):
+            target.stop(st)
+
+    def test_host_worktree_stop_is_noop_without_docker(self, tmp_path: Path) -> None:
+        runner = FakeRunner(stdout={"docker": "cid1 running"})
+        repo = make_repo(tmp_path, ["dev"], default="dev")
+        target = HostWorktreeTarget(repo, runner=runner)
+        st = IsolationState(
+            repo_root=repo,
+            branch="feat/x",
+            worktree=tmp_path / "wt",
+            profile="host",
+            created_at="2026-09-23T00:00:00Z",
+        )
+        msg = target.stop(st)
+        assert "no-op" in msg
+        assert runner.argv_for("docker") == []
+
+    def test_external_stop_refuses(self, tmp_path: Path) -> None:
+        from fr.isolation.external import ExternalTarget
+
+        runner = FakeRunner(stdout={"docker": "cid1 running"})
+        repo = make_repo(tmp_path, ["dev"], default="dev")
+        st = IsolationState(
+            repo_root=repo,
+            branch="feat/x",
+            worktree=repo,
+            profile="external",
+            created_at="2026-09-23T00:00:00Z",
+        )
+        with pytest.raises(IsolationError, match="externally managed"):
+            ExternalTarget(repo, runner=runner).stop(st)
+        assert runner.argv_for("docker") == []
+
+
+class TestStatusStopped:
+    """Spec §3.B: docker's `exited` reads as `stopped`; others pass through."""
+
+    @pytest.mark.parametrize(
+        ("ps", "shown"),
+        [
+            ("cid1 exited", "stopped"),
+            ("cid1 running", "running"),
+            ("cid1 paused", "paused"),
+            ("cid1 created", "created"),
+            ("", "not running"),
+        ],
+    )
+    def test_status_container_state(self, tmp_path: Path, ps: str, shown: str) -> None:
+        runner = FakeRunner(stdout={"docker": ps})
+        target, st = _target_state(tmp_path, runner)
+        assert target.status(st)["container"] == shown
+
+    def test_failed_query_is_unknown_not_absent(self, tmp_path: Path) -> None:
+        """Phase-1 review f7 (#354): a down daemon must not read as no container."""
+        runner = FakeRunner(fail_on="ps", stdout={"docker": "cid1 running"})
+        target, st = _target_state(tmp_path, runner)
+        assert target.status(st)["container"] == "unknown (docker unreachable)"
+
+
+class _DockerRunner:
+    """Runner distinguishing `docker ps` from `docker stats` (FakeRunner keys
+    stdout by argv[0] only, so it can't give the two docker calls different
+    output). git hits the real binary."""
+
+    def __init__(self, ps: str = "cid running", stats: str = "", stats_rc: int = 0):
+        self.ps = ps
+        self.stats = stats
+        self.stats_rc = stats_rc
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, cwd=None, check=False, capture=True, **_kw):
+        if argv[0] == "git":
+            return subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+        self.calls.append(list(argv))
+        if argv[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=self.ps, stderr="")
+        if argv[:2] == ["docker", "stats"]:
+            return subprocess.CompletedProcess(argv, self.stats_rc, stdout=self.stats, stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+
+class TestStats:
+    def _target_state(self, tmp_path: Path, runner) -> tuple:
+        repo = make_repo(tmp_path, ["dev"], default="dev")
+        target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+        st = IsolationState(
+            repo_root=repo,
+            branch="feat/x",
+            worktree=tmp_path / "wt",
+            profile="dev",
+            created_at="2026-07-03T00:00:00Z",
+        )
+        return target, st
+
+    def test_running_container_parses_pipe_row(self, tmp_path: Path) -> None:
+        r = _DockerRunner(ps="cid running", stats="12.5%|1.2GiB / 4GiB|30.0%")
+        target, st = self._target_state(tmp_path, r)
+        assert target.stats(st) == {"cpu": "12.5%", "mem": "1.2GiB / 4GiB", "mem_perc": "30.0%"}
+        # id + state come from ONE `docker ps`, not two (state check + id lookup).
+        assert len([c for c in r.calls if c[:2] == ["docker", "ps"]]) == 1
+
+    def test_exited_container_returns_none_without_stats_call(self, tmp_path: Path) -> None:
+        r = _DockerRunner(ps="cid exited")
+        target, st = self._target_state(tmp_path, r)
+        assert target.stats(st) is None
+        assert not any(c[:2] == ["docker", "stats"] for c in r.calls)
+
+    def test_no_container_returns_none(self, tmp_path: Path) -> None:
+        r = _DockerRunner(ps="")
+        target, st = self._target_state(tmp_path, r)
+        assert target.stats(st) is None
+
+    def test_stats_command_failure_returns_none(self, tmp_path: Path) -> None:
+        r = _DockerRunner(ps="cid running", stats="", stats_rc=1)
+        target, st = self._target_state(tmp_path, r)
+        assert target.stats(st) is None
+
+
+class TestPushCheck:
+    """#377: a read-only preflight — remotes, in-container SSH-agent
+    presence/absence, and backend-aware host-push guidance. Never a live
+    SSH/GitLab server: git hits a real throwaway repo (FakeRunner delegates
+    git argv to the real binary), the ssh-agent probe is faked via
+    FakeRunner's devcontainer stdout."""
+
+    def _target_state(self, tmp_path: Path, runner, repo: Path | None = None) -> tuple:
+        repo = repo or make_repo(tmp_path, ["dev"], default="dev")
+        target = LocalWorktreeDevcontainerTarget(repo, runner=runner)
+        st = IsolationState(
+            repo_root=repo,
+            branch="feat/x",
+            # push_check's only git call is `git -C <worktree> remote -v` —
+            # reusing the real repo dir as the "worktree" is enough to
+            # exercise it without a real `git worktree add`.
+            worktree=repo,
+            profile="dev",
+            created_at="2026-07-14T00:00:00Z",
+        )
+        return target, st
+
+    def test_remotes_backend_and_guidance_for_gitlab(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path, ["dev"], default="dev")
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "remote",
+                "add",
+                "origin",
+                "git@gitlab.example.com:group/proj.git",
+            ],
+            check=True,
+        )
+        (repo / ".devcontainer" / "fr-profiles.yaml").write_text(
+            "default: dev\nbackend: gitlab\nprofiles:\n  dev:\n    purpose: test\n"
+        )
+        runner = FakeRunner(stdout={"devcontainer": "unset"})
+        target, st = self._target_state(tmp_path, runner, repo=repo)
+        result = target.push_check(st)
+        assert any("origin" in line and "gitlab.example.com" in line for line in result["remotes"])
+        assert result["backend"] == "gitlab"
+        assert "glab" in result["guidance"]
+        assert "MR" in result["guidance"]
+        assert "git push" in result["guidance"]
+
+    def test_default_backend_is_github_with_gh_guidance(self, tmp_path: Path) -> None:
+        runner = FakeRunner(stdout={"devcontainer": "unset"})
+        target, st = self._target_state(tmp_path, runner)
+        result = target.push_check(st)
+        assert result["backend"] == "github"
+        assert "gh" in result["guidance"]
+        assert "PR" in result["guidance"]
+
+    def test_backend_gitea_uses_tea_and_pr_label(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path, ["dev"], default="dev")
+        (repo / ".devcontainer" / "fr-profiles.yaml").write_text(
+            "default: dev\nbackend: gitea\nprofiles:\n  dev:\n    purpose: test\n"
+        )
+        runner = FakeRunner(stdout={"devcontainer": "unset"})
+        target, st = self._target_state(tmp_path, runner, repo=repo)
+        result = target.push_check(st)
+        assert result["backend"] == "gitea"
+        assert "tea" in result["guidance"]
+        assert "PR" in result["guidance"]
+
+    def test_ssh_agent_unset(self, tmp_path: Path) -> None:
+        runner = FakeRunner(stdout={"devcontainer": "unset"})
+        target, st = self._target_state(tmp_path, runner)
+        result = target.push_check(st)
+        assert result["ssh_agent_in_container"] == {"present": False, "detail": "unset"}
+
+    def test_ssh_agent_set_socket_exists(self, tmp_path: Path) -> None:
+        runner = FakeRunner(stdout={"devcontainer": "set:socket-exists"})
+        target, st = self._target_state(tmp_path, runner)
+        result = target.push_check(st)
+        assert result["ssh_agent_in_container"] == {
+            "present": True,
+            "detail": "set:socket-exists",
+        }
+
+    def test_ssh_agent_set_socket_missing(self, tmp_path: Path) -> None:
+        runner = FakeRunner(stdout={"devcontainer": "set:socket-missing"})
+        target, st = self._target_state(tmp_path, runner)
+        result = target.push_check(st)
+        assert result["ssh_agent_in_container"] == {
+            "present": True,
+            "detail": "set:socket-missing",
+        }
+        # Never a raw socket path — exact-dict-equality above already pins
+        # the two allowed keys ("present", "detail"); this is a
+        # belt-and-suspenders check that no path leaked into JUST that
+        # sub-payload (the worktree path legitimately appears elsewhere, in
+        # `guidance`'s `cd <worktree>` — that's not the socket).
+        assert "/tmp" not in str(result["ssh_agent_in_container"])
+
+
+# ---------- verify-merge survives later rewrites (2026-09-26 spec) ----------
+
+
+def _squash_then_rewrite(repo: Path) -> None:
+    """`report.md` gains lines on `feature`, which is squash-merged; a LATER
+    commit on main then rewrites those very lines (a generated report)."""
+    _commit(repo, "report.md", "head\n", "report base")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "report.md", "head\nfoo\nbar\n", "feature adds lines")
+    _squash_merge(repo, "feature", "squash feature")
+    _commit(repo, "report.md", "head\nFOO2\nBAR2\n", "later merge rewrites the lines")
+
+
+def test_branch_changes_present_survives_a_later_rewrite_of_its_lines(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    _squash_then_rewrite(repo)
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changes_present
+    assert res.missing == []
+
+
+def test_branch_blob_was_on_base_cost_is_constant_per_commit_count(tmp_path: Path) -> None:
+    """C1 perf: `_branch_blob_was_on_base` must answer with a CONSTANT number
+    of git subprocess calls regardless of how many later commits touched the
+    path — not one `git rev-parse` per commit in `merge_base..base_ref`. A
+    generated report/matrix file is touched by nearly every later PR, so an
+    O(N) scan multiplies across every workspace in a gc sweep."""
+    from fr.isolation.local import _branch_blob_was_on_base
+
+    def _build(parent: Path, n_rewrites: int) -> Path:
+        parent.mkdir()
+        repo = make_repo(parent)
+        _commit(repo, "report.md", "head\n", "report base")
+        _git(repo, "checkout", "-q", "-b", "feature")
+        _commit(repo, "report.md", "head\nfoo\nbar\n", "feature adds lines")
+        _squash_merge(repo, "feature", "squash feature")
+        for i in range(n_rewrites):
+            _commit(repo, "report.md", f"head\nFOO2\nBAR2\nrev{i}\n", f"rewrite {i}")
+        return repo
+
+    def _count_calls(repo: Path) -> int:
+        calls: list[list[str]] = []
+
+        def counting_runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            calls.append(argv)
+            return subprocess_runner(argv, **kwargs)
+
+        merge_base = _git_out(repo, "merge-base", "main", "feature")
+        found = _branch_blob_was_on_base(
+            counting_runner, repo, merge_base, "feature", "main", "report.md"
+        )
+        assert found
+        return len(calls)
+
+    few = _count_calls(_build(tmp_path / "few", 1))
+    many = _count_calls(_build(tmp_path / "many", 25))
+    assert few == many, f"expected O(1) git calls, got {few} for N=1 vs {many} for N=25"
+
+
+def test_branch_changes_present_orphan_after_merge_and_rewrite_still_missing(
+    tmp_path: Path,
+) -> None:
+    repo = make_repo(tmp_path)
+    _squash_then_rewrite(repo)
+    _git(repo, "checkout", "-q", "feature")
+    _commit(repo, "report.md", "head\nfoo\nbar\nbaz\n", "orphan pushed after the merge")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+    assert res.missing == ["report.md"]
+
+
+def test_branch_changes_present_file_deleted_from_base_later_counts_as_landed(
+    tmp_path: Path,
+) -> None:
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "gone.txt", "one\ntwo\n", "add gone")
+    _squash_merge(repo, "feature", "squash gone")
+    _git(repo, "rm", "-q", "gone.txt")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "delete gone")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changes_present
+    assert res.missing == []
+
+
+def test_branch_changes_present_branch_side_deletion_that_differs_stays_missing(
+    tmp_path: Path,
+) -> None:
+    repo = make_repo(tmp_path)
+    _commit(repo, "d.txt", "1\n2\n", "add d")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _git(repo, "rm", "-q", "d.txt")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "branch deletes d")
+    _git(repo, "checkout", "-q", "main")
+    _commit(repo, "d.txt", "1\n3\n", "main edits d instead")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+    assert res.missing == ["d.txt"]
+
+
+def test_verify_merge_checks_the_fetched_remote_branch_not_a_stale_local_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _squash_merge(repo, "feature", "squash")
+    _with_origin(repo)
+    _git(repo, "push", "-q", "origin", "feature")
+    _git(repo, "checkout", "-q", "feature")
+    _commit(repo, "late.py", "late\n", "pushed after the merge")
+    _git(repo, "push", "-q", "origin", "feature")
+    _git(repo, "reset", "-q", "--hard", "HEAD~1")  # local feature is now stale
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    monkeypatch.setattr(target, "_pr", lambda state: {"state": "MERGED", "url": "u"})
+    res = target.verify_merge(_state(repo, "feature"), default_branch="main")
+    assert res["verified"] is False and "late.py" in res["missing"]
+
+
+def test_verify_merge_single_branch_clone_detects_a_post_merge_remote_push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C2: a `--single-branch` clone's configured fetch refspec only covers
+    `main`, so `_branch_refs`' fetch of `feature` must use an EXPLICIT refspec
+    (`+refs/heads/feature:refs/remotes/origin/feature`) — a bare
+    `git fetch origin feature` updates nothing there, leaving `origin/feature`
+    stale/absent and hiding a commit pushed to the remote branch (from a
+    different clone) after the merge."""
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _squash_merge(repo, "feature", "squash")
+    _with_origin(repo)
+    _git(repo, "push", "-q", "origin", "feature")
+    # Narrow the fetch refspec the way `git clone --single-branch` configures it.
+    _git(repo, "config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main")
+    _git(repo, "checkout", "-q", "feature")
+    # A commit lands on the REMOTE feature branch, from a different clone,
+    # after the merge — this worktree's own local `feature` never sees it.
+    other = tmp_path / "other-clone"
+    subprocess.run(["git", "clone", "-q", str(tmp_path / "origin.git"), str(other)], check=True)
+    _git(other, "checkout", "-q", "feature")
+    _commit(other, "late.py", "late\n", "pushed after the merge, from elsewhere")
+    _git(other, "push", "-q", "origin", "feature")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    monkeypatch.setattr(target, "_pr", lambda state: {"state": "MERGED", "url": "u"})
+    res = target.verify_merge(_state(repo, "feature"), default_branch="main")
+    assert res["verified"] is False
+    assert "late.py" in res["missing"]
+
+
+def test_verify_merge_branch_fetch_failure_with_branch_present_not_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C2: a failed branch fetch is not automatically a fallback — if
+    `git ls-remote` says the branch still exists, the true remote state is
+    unknown (could hold a post-merge push), so the verdict must be NOT
+    verified, never a pass from stale/local refs alone."""
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _squash_merge(repo, "feature", "squash")
+    _with_origin(repo)
+    _git(repo, "push", "-q", "origin", "feature")
+    _git(repo, "checkout", "-q", "feature")
+
+    def flaky_runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if argv[:2] == ["git", "fetch"] and any("feature" in a for a in argv):
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="timed out\n")
+        if argv[:2] == ["git", "ls-remote"]:
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="deadbeef\trefs/heads/feature\n", stderr=""
+            )
+        return subprocess_runner(argv, **kwargs)
+
+    target = LocalWorktreeDevcontainerTarget(repo, runner=flaky_runner)
+    monkeypatch.setattr(target, "_pr", lambda state: {"state": "MERGED", "url": "u"})
+    res = target.verify_merge(_state(repo, "feature"), default_branch="main")
+    assert res["verified"] is False
+    assert res["branch_fetched"] is False
+
+
+def test_verify_merge_branch_fetch_failure_unknown_branch_state_not_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C2: when even `git ls-remote` fails, the branch's remote state is
+    UNKNOWN (not confirmed gone) — still NOT verified."""
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _squash_merge(repo, "feature", "squash")
+    _with_origin(repo)
+    _git(repo, "push", "-q", "origin", "feature")
+    _git(repo, "checkout", "-q", "feature")
+
+    def flaky_runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if argv[:2] == ["git", "fetch"] and any("feature" in a for a in argv):
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="timed out\n")
+        if argv[:2] == ["git", "ls-remote"]:
+            return subprocess.CompletedProcess(
+                argv, 1, stdout="", stderr="could not resolve host\n"
+            )
+        return subprocess_runner(argv, **kwargs)
+
+    target = LocalWorktreeDevcontainerTarget(repo, runner=flaky_runner)
+    monkeypatch.setattr(target, "_pr", lambda state: {"state": "MERGED", "url": "u"})
+    res = target.verify_merge(_state(repo, "feature"), default_branch="main")
+    assert res["verified"] is False
+    assert res["branch_fetched"] is False
+
+
+def test_verify_merge_refuses_an_unpushed_local_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _squash_merge(repo, "feature", "squash")
+    _with_origin(repo)
+    _git(repo, "push", "-q", "origin", "feature")
+    _git(repo, "checkout", "-q", "feature")
+    _commit(repo, "local_only.py", "x\n", "never pushed")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    monkeypatch.setattr(target, "_pr", lambda state: {"state": "MERGED", "url": "u"})
+    res = target.verify_merge(_state(repo, "feature"), default_branch="main")
+    assert res["verified"] is False and "local_only.py" in res["missing"]
+
+
+def test_verify_merge_falls_back_to_the_local_ref_when_the_remote_branch_is_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _squash_merge(repo, "feature", "squash")
+    _with_origin(repo)
+    _git(repo, "push", "-q", "origin", "feature")
+    _git(repo, "fetch", "-q", "origin")
+    _git(repo, "push", "-q", "origin", "--delete", "feature")
+    _git(repo, "checkout", "-q", "feature")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    monkeypatch.setattr(target, "_pr", lambda state: {"state": "MERGED", "url": "u"})
+    res = target.verify_merge(_state(repo, "feature"), default_branch="main")
+    assert res["verified"] is True
+
+
+def test_verify_merge_deleted_branch_is_not_confused_with_a_suffix_sharing_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opus fix review f1: `ls-remote --heads origin feature` pattern-matches
+    `refs/heads/foo/feature` too, so a deleted merged branch read as present
+    (a false refusal). The probe must name `refs/heads/<b>` exactly."""
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _squash_merge(repo, "feature", "squash")
+    _with_origin(repo)
+    _git(repo, "push", "-q", "origin", "feature", "main:refs/heads/foo/feature")
+    _git(repo, "fetch", "-q", "origin")
+    _git(repo, "push", "-q", "origin", "--delete", "feature")
+    _git(repo, "checkout", "-q", "feature")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    monkeypatch.setattr(target, "_pr", lambda state: {"state": "MERGED", "url": "u"})
+    res = target.verify_merge(_state(repo, "feature"), default_branch="main")
+    assert res["branch_fetched"] is True
+    assert res["verified"] is True
+
+
+def test_verify_merge_unresolvable_ref_raises_naming_the_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_repo(tmp_path)
+    _with_origin(repo)
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    monkeypatch.setattr(target, "_pr", lambda state: {"state": "MERGED", "url": "u"})
+    # "cannot resolve branch ref" is _branch_refs' own message; the old
+    # refs=None path failed later, at merge-base, with different wording.
+    with pytest.raises(IsolationError, match="cannot resolve branch ref 'ghost-branch'"):
+        target.verify_merge(_state(repo, "ghost-branch"), default_branch="main")
+
+
+def test_reap_hazard_ignores_lines_a_later_merge_rewrote_but_flags_unlanded_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _origin, _runner, target, up = _gc_env_origin(tmp_path, monkeypatch)
+    wt = up("feat/rewrite")
+    _commit_in_worktree(wt, "report.md", "head\nfoo\nbar\n")
+    _land_on_origin_main(repo, "report.md", "head\nfoo\nbar\n")  # squash-equivalent
+    _land_on_origin_main(repo, "report.md", "head\nFOO2\nBAR2\n")  # later rewrite
+    st = load_state(repo, "feat/rewrite")
+    assert st is not None
+    assert target._reap_hazard(st) is None
+
+    _commit_in_worktree(wt, "report.md", "head\nfoo\nbar\nbaz\n")  # never landed
+    hazard = target._reap_hazard(st)
+    assert hazard is not None and hazard.kind == "unlanded-content"
+
+
+# ---------- the release bot consumes the change fragment (#666 / #665) ----------
+# Every PR ADDS `.changes/<slug>.yaml`; the next `release: vX.Y.Z` commit on the
+# default branch DELETES it. The branch's fragment is then absent from base.
+
+_FRAGMENT = "bump: patch\nsummary: fix a thing\n"
+
+
+def _release_consumes_fragment(repo: Path, fragment: str) -> None:
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "rm", "-q", fragment)
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "release: v1.2.3")
+
+
+def _fragment_branch(repo: Path) -> None:
+    _git(repo, "checkout", "-q", "-b", "feature")
+    (repo / ".changes").mkdir(exist_ok=True)
+    _commit(repo, ".changes/feat-x.yaml", _FRAGMENT, "add fragment")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+
+
+def test_branch_changes_present_fragment_consumed_by_release_counts_as_landed(
+    tmp_path: Path,
+) -> None:
+    repo = make_repo(tmp_path)
+    _fragment_branch(repo)
+    _squash_merge(repo, "feature", "squash feature")
+    _release_consumes_fragment(repo, ".changes/feat-x.yaml")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changes_present
+    assert res.missing == []
+
+
+def test_verify_merge_fragment_consumed_by_release_is_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_repo(tmp_path)
+    _fragment_branch(repo)
+    _squash_merge(repo, "feature", "squash feature")
+    _release_consumes_fragment(repo, ".changes/feat-x.yaml")
+    _with_origin(repo)
+    _git(repo, "checkout", "-q", "feature")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    monkeypatch.setattr(target, "_pr", lambda state: {"state": "MERGED", "url": "u"})
+    res = target.verify_merge(_state(repo, "feature"), default_branch="main")
+    assert res["verified"] is True
+    assert res["missing"] == []
+
+
+def test_branch_changes_present_fragment_that_never_landed_stays_missing(
+    tmp_path: Path,
+) -> None:
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    (repo / ".changes").mkdir(exist_ok=True)
+    _commit(repo, ".changes/feat-x.yaml", _FRAGMENT, "add fragment")
+    _git(repo, "checkout", "-q", "main")
+    _commit(repo, "other.py", "x\n", "unrelated main commit")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+    assert res.missing == [".changes/feat-x.yaml"]
+
+
+def test_branch_changes_present_orphan_code_file_still_missing_after_fragment_consumed(
+    tmp_path: Path,
+) -> None:
+    repo = make_repo(tmp_path)
+    _fragment_branch(repo)
+    _squash_merge(repo, "feature", "squash feature")
+    _release_consumes_fragment(repo, ".changes/feat-x.yaml")
+    _git(repo, "checkout", "-q", "feature")
+    _commit(repo, "orphan.py", "late\n", "pushed after the merge")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+    assert res.missing == ["orphan.py"]
+
+
+# ---------- a merge that was later REVERTED no longer reads as landed (#716) ----------
+# The blob fallback is positive evidence from base history: the branch's blob was
+# written to the base at some commit. A revert leaves that commit in history, so
+# the fallback must also ask whether the path was later put back to a state it
+# held before the branch landed.
+
+
+def _revert_head(repo: Path) -> None:
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "revert", "--no-edit", "HEAD")
+
+
+def _squash_report_feature(repo: Path) -> None:
+    _commit(repo, "report.md", "head\n", "report base")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "report.md", "head\nfoo\nbar\n", "feature adds lines")
+    _squash_merge(repo, "feature", "squash feature")
+
+
+def test_branch_changes_present_reverted_squash_is_missing(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    _squash_report_feature(repo)
+    _revert_head(repo)
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+    assert res.missing == ["report.md"]
+
+
+def test_branch_changes_present_reverted_then_edited_is_missing(tmp_path: Path) -> None:
+    """A hot file (a generated report) is edited again after the revert: the
+    base's CURRENT blob is new content, but the revert still happened."""
+    repo = make_repo(tmp_path)
+    _squash_report_feature(repo)
+    _revert_head(repo)
+    _commit(repo, "report.md", "head\nunrelated\n", "a later PR edits the report")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+    assert res.missing == ["report.md"]
+
+
+def test_branch_changes_present_revert_after_other_prs_touched_the_file_is_missing(
+    tmp_path: Path,
+) -> None:
+    """Another PR changed the file after the fork and the branch synced with
+    main before landing, so the revert restores THAT state, not the
+    merge-base's."""
+    repo = make_repo(tmp_path)
+    _commit(repo, "report.md", "a\nb\nc\nd\ne\n", "report base")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "report.md", "a\nfoo\nb\nc\nd\ne\n", "feature adds a line")
+    _git(repo, "checkout", "-q", "main")
+    _commit(repo, "report.md", "a\nb\nc\nd\nE\n", "another PR lands first")
+    _git(repo, "checkout", "-q", "feature")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "merge", "-q", "--no-edit", "main")
+    _squash_merge(repo, "feature", "squash feature")
+    _revert_head(repo)
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+    assert res.missing == ["report.md"]
+
+
+def _concurrent_squash_feature(repo: Path) -> None:
+    """The base edits report.md while `feature` is open and the branch never
+    syncs, so the squash's blob combines both edits: never the branch's own."""
+    _commit(repo, "report.md", "a\nb\nc\nd\ne\n", "report base")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "report.md", "a\nfoo\nbar\nb\nc\nd\ne\n", "feature adds lines")
+    _git(repo, "checkout", "-q", "main")
+    _commit(repo, "report.md", "a\nb\nc\nd\nE\n", "another PR lands concurrently")
+    _squash_merge(repo, "feature", "squash feature")
+
+
+def test_branch_changes_present_concurrent_edit_then_rewrite_counts_as_landed(
+    tmp_path: Path,
+) -> None:
+    """#715: after the squash, a later commit rewrites the branch's lines. Its
+    blob never matches and its lines are gone, but the squash's own patch
+    added every one of them: that is the landing."""
+    repo = make_repo(tmp_path)
+    _concurrent_squash_feature(repo)
+    _commit(repo, "report.md", "a\nFOO2\nBAR2\nb\nc\nd\nE\n", "later merge rewrites the lines")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changes_present
+    assert res.missing == []
+
+
+def test_branch_changes_present_concurrent_edit_then_revert_is_missing(tmp_path: Path) -> None:
+    """The same landing, reverted rather than rewritten, stays missing."""
+    repo = make_repo(tmp_path)
+    _concurrent_squash_feature(repo)
+    _revert_head(repo)
+    _commit(repo, "report.md", "a\nb\nc\nd\nE\nlater\n", "a later PR edits the report")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+    assert res.missing == ["report.md"]
+
+
+def test_branch_changes_present_concurrent_edit_orphan_line_is_missing(tmp_path: Path) -> None:
+    """A line pushed to the branch after the squash was never in any base
+    commit's patch: the landing must add EVERY line the branch added."""
+    repo = make_repo(tmp_path)
+    _concurrent_squash_feature(repo)
+    _commit(repo, "report.md", "a\nFOO2\nBAR2\nb\nc\nd\nE\n", "later merge rewrites the lines")
+    _git(repo, "checkout", "-q", "feature")
+    _commit(repo, "report.md", "a\nfoo\nbar\nb\nc\nd\ne\norphan\n", "pushed after the merge")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+    assert res.missing == ["report.md"]
+
+
+def test_branch_changes_present_revert_of_the_revert_counts_as_landed(tmp_path: Path) -> None:
+    """Re-landed (the revert reverted), then its lines rewritten: landed again."""
+    repo = make_repo(tmp_path)
+    _squash_report_feature(repo)
+    _revert_head(repo)
+    _revert_head(repo)
+    _commit(repo, "report.md", "head\nFOO2\nBAR2\n", "later merge rewrites the lines")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changes_present
+    assert res.missing == []
+
+
+def test_branch_changes_present_reverted_rebase_merge_is_missing(tmp_path: Path) -> None:
+    """A rebase merge lands the branch as several commits; the revert restores
+    the state before the FIRST of them, not before the one that wrote the blob."""
+    repo = make_repo(tmp_path)
+    _commit(repo, "report.md", "head\n", "report base")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "report.md", "head\nfoo\n", "feature step 1")
+    _commit(repo, "report.md", "head\nfoo\nbar\n", "feature step 2")
+    _git(repo, "checkout", "-q", "main")
+    _commit(repo, "other.py", "x\n", "main moved on, so the rebase rewrites the commits")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "cherry-pick", "main..feature")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "revert", "--no-edit", "HEAD~2..HEAD")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+    assert res.missing == ["report.md"]
+
+
+def test_branch_changes_present_reverted_after_fragment_consumed_is_missing(
+    tmp_path: Path,
+) -> None:
+    """The release bot consumed the fragment, then the code change was reverted:
+    the consumed fragment still reads as landed, the reverted file does not."""
+    repo = make_repo(tmp_path)
+    _commit(repo, "fix.py", "broken\n", "base")
+    _fragment_branch(repo)
+    _squash_merge(repo, "feature", "squash feature")
+    _release_consumes_fragment(repo, ".changes/feat-x.yaml")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "revert", "--no-edit", "HEAD~1")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+    assert res.missing == ["fix.py"]
+
+
+_ID = ("-c", "user.email=t@t", "-c", "user.name=t")
+
+
+def test_branch_changes_present_side_branch_merged_later_does_not_unland(
+    tmp_path: Path,
+) -> None:
+    """Review f1: a merge-commit PR forked BEFORE the landing, which synced main
+    (so its own history writes a pre-landing blob of the path), is merged after
+    the landing and a later rewrite. Its side-branch commits must not read as a
+    revert — only the base's first-parent line is history here."""
+    repo = make_repo(tmp_path)
+    _commit(repo, "report.md", "h\n", "report base")
+    _git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "p.txt", "p\n", "side PR work")
+    _git(repo, "checkout", "-q", "main")
+    _commit(repo, "report.md", "h\nq\n", "another PR")
+    _git(repo, "checkout", "-q", "side")
+    _git(repo, *_ID, "merge", "-q", "--no-edit", "main")  # sync: side now writes h,q
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "report.md", "h\nq\nfoo\n", "feature adds a line")
+    _squash_merge(repo, "feature", "squash feature")
+    _commit(repo, "report.md", "h\nq\nFOO2\n", "later merge rewrites the line")
+    _git(repo, *_ID, "merge", "-q", "--no-ff", "--no-edit", "side")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changes_present
+    assert res.missing == []
+
+
+def test_branch_changes_present_reverted_no_ff_merge_is_missing(tmp_path: Path) -> None:
+    """A merge-commit landing reverted with `git revert -m 1`."""
+    repo = make_repo(tmp_path)
+    _commit(repo, "report.md", "head\n", "report base")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "report.md", "head\nfoo\n", "feature step 1")
+    _commit(repo, "report.md", "head\nfoo\nbar\n", "feature step 2")
+    _git(repo, "checkout", "-q", "main")
+    _commit(repo, "other.py", "x\n", "main moved on")
+    _git(repo, *_ID, "merge", "-q", "--no-ff", "--no-edit", "feature")
+    _git(repo, *_ID, "revert", "--no-edit", "-m", "1", "HEAD")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+    assert res.missing == ["report.md"]
+
+
+def test_branch_changes_present_no_ff_merge_then_rewrite_counts_as_landed(
+    tmp_path: Path,
+) -> None:
+    """#741's fork point exposes a --no-ff landing to the blob fallback; a later
+    rewrite of its lines must not read as a revert (#665)."""
+    repo = make_repo(tmp_path)
+    _commit(repo, "report.md", "head\n", "report base")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "report.md", "head\nfoo\nbar\n", "feature adds lines")
+    _git(repo, "checkout", "-q", "main")
+    _commit(repo, "other.py", "x\n", "main moved on")
+    _git(repo, *_ID, "merge", "-q", "--no-ff", "--no-edit", "feature")
+    _commit(repo, "report.md", "head\nFOO2\nBAR2\n", "later merge rewrites the lines")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changes_present
+    assert res.missing == []
+
+
+def test_branch_changes_present_fast_forward_and_empty_branch_stay_present(
+    tmp_path: Path,
+) -> None:
+    """An ancestor branch with no landing merge — fast-forwarded, or never
+    committed to — has nothing of its own to judge: present, as before #741."""
+    repo = make_repo(tmp_path)
+    _git(repo, "branch", "empty")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "merge", "-q", "--ff-only", "feature")
+    _commit(repo, "other.py", "x\n", "main moved on")
+    for branch in ("feature", "empty"):
+        res = branch_changes_present(subprocess_runner, repo, branch, "main")
+        assert res.changes_present, branch
+        assert res.missing == [], branch
+
+
+def _head(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _ff_landed_feature(repo: Path) -> str:
+    """`feature` forked from main, landed by `--ff-only`; returns the start commit."""
+    _commit(repo, "fix.py", "broken\n", "base")
+    start = _head(repo)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "merge", "-q", "--ff-only", "feature")
+    return start
+
+
+def test_branch_changes_present_reverted_fast_forward_with_recorded_start_is_missing(
+    tmp_path: Path,
+) -> None:
+    """#757: a fast-forward landing leaves no merge to find the fork from, so
+    only the recorded start (fr's `base_sha` at `up`) shows what the branch
+    contributed; with it, a later revert reads as missing."""
+    repo = make_repo(tmp_path)
+    start = _ff_landed_feature(repo)
+    _revert_head(repo)
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main", start=start)
+    assert not res.changes_present
+    assert res.missing == ["fix.py"]
+    assert branch_changed_paths(subprocess_runner, repo, "feature", "main", start=start) == [
+        "fix.py"
+    ]
+
+
+def test_branch_changes_present_fast_forward_with_recorded_start_stays_present(
+    tmp_path: Path,
+) -> None:
+    """The recorded start only widens what is judged: an unreverted
+    fast-forward, an empty branch (start == tip), and a start that is not an
+    ancestor of the tip (a reused branch name) all keep their verdict."""
+    repo = make_repo(tmp_path)
+    start = _ff_landed_feature(repo)
+    _commit(repo, "other.py", "x\n", "main moved on")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main", start=start)
+    assert res.changes_present
+    assert res.changed == ["fix.py"]
+    _git(repo, "branch", "empty")
+    head = _head(repo)
+    assert branch_changes_present(
+        subprocess_runner, repo, "empty", "main", start=head
+    ).changes_present
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main", start=head)
+    assert res.changes_present
+    assert res.changed == []
+
+
+def test_branch_changes_present_failed_landing_lookup_raises(tmp_path: Path) -> None:
+    """A failed `git rev-list` for the landing merge must not fall back to the
+    tip as the fork point — that reads as ALL CHANGES PRESENT (#705 shape)."""
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "fix.py", "fixed\n", "fix")
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, *_ID, "merge", "-q", "--no-ff", "--no-edit", "feature")
+
+    def runner(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+        if argv[:2] == ["git", "rev-list"]:
+            return subprocess.CompletedProcess(argv, 128, stdout="", stderr="fatal: boom\n")
+        return subprocess_runner(argv, **kw)
+
+    with pytest.raises(IsolationError, match="boom"):
+        branch_changes_present(runner, repo, "feature", "main")
+
+
+def test_branch_changes_present_three_way_revert_restoring_a_removed_line_is_missing(
+    tmp_path: Path,
+) -> None:
+    """The branch replaced a line; the three-way revert puts the old one back —
+    it adds only what the branch removed, so it is still the inverse patch."""
+    repo = make_repo(tmp_path)
+    _commit(repo, "report.md", "a\nold\nc\nd\ne\n", "report base")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "report.md", "a\nnew\nc\nd\ne\n", "feature replaces a line")
+    _squash_merge(repo, "feature", "squash feature")
+    _commit(repo, "report.md", "a\nnew\nc\nd\nE\n", "another PR edits the report")
+    _git(repo, *_ID, "revert", "--no-edit", "HEAD~1")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+    assert res.missing == ["report.md"]
+
+
+def test_branch_changes_present_three_way_revert_is_missing(tmp_path: Path) -> None:
+    """Another PR edits the path BETWEEN the landing and the revert, so the
+    revert's result is a blob the path never held: caught by its patch (#739)."""
+    repo = make_repo(tmp_path)
+    _commit(repo, "report.md", "a\nb\nc\nd\ne\n", "report base")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "report.md", "a\nfoo\nb\nc\nd\ne\n", "feature adds a line")
+    _squash_merge(repo, "feature", "squash feature")
+    _commit(repo, "report.md", "a\nfoo\nb\nc\nd\nE\n", "another PR edits the report")
+    _git(repo, *_ID, "revert", "--no-edit", "HEAD~1")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+
+
+def test_verify_merge_reverted_merge_is_not_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_repo(tmp_path)
+    _squash_report_feature(repo)
+    _revert_head(repo)
+    _with_origin(repo)
+    _git(repo, "checkout", "-q", "feature")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    monkeypatch.setattr(target, "_pr", lambda state: {"state": "MERGED", "url": "u"})
+    res = target.verify_merge(_state(repo, "feature"), default_branch="main")
+    assert res["verified"] is False
+    assert res["missing"] == ["report.md"]
+
+
+def test_verify_merge_reverted_fast_forward_uses_the_recorded_base_sha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#757 at the caller: verify_merge hands the state's `base_sha` to the
+    content check, so a reverted fast-forward is not verified."""
+    repo = make_repo(tmp_path)
+    start = _ff_landed_feature(repo)
+    _revert_head(repo)
+    _with_origin(repo)
+    _git(repo, "checkout", "-q", "feature")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    monkeypatch.setattr(target, "_pr", lambda state: {"state": "MERGED", "url": "u"})
+    state = _state(repo, "feature").model_copy(update={"base_sha": start})
+    res = target.verify_merge(state, default_branch="main")
+    assert res["verified"] is False
+    assert res["missing"] == ["fix.py"]
+
+
+# ---------- `fr archive` moves the branch's fr artifacts after merge (#598 / #665) ----------
+# The closeout's `fr archive` `git mv`s docs/superpowers/{plans,specs,journals,runs,usage}/…
+# to docs/superpowers/implemented/… on the default branch, so the branch's added
+# paths are absent from base under their ORIGINAL name.
+
+_SP = "docs/superpowers"
+_ARCHIVED_DOCS = {
+    # S5: all FIVE archived kinds, not just three — a run cursor and a usage
+    # capture behave the same as plans/specs/journals for this generic
+    # git-mv+rewrite fixture (the usage-specific RE-CAPTURE case, where the
+    # archive step doesn't just append but REPLACES bytes, gets its own test
+    # below per review S1).
+    f"{_SP}/plans/p1/01.yaml": "phase: 1\nsteps: [a, b]\n",
+    f"{_SP}/specs/s1.md": "# spec\nbody line\n",
+    f"{_SP}/journals/specs/s1.md": "# journal\nfinding one\n",
+    f"{_SP}/runs/r1.yaml": "run: r1\ncursor: deliver\n",
+    f"{_SP}/usage/r1.yaml": "run: r1\ncaptures: []\n",
+}
+
+
+def _archive_branch(repo: Path, docs: dict[str, str] | None = None) -> None:
+    _git(repo, "checkout", "-q", "-b", "feature")
+    for rel, body in (docs or _ARCHIVED_DOCS).items():
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text(body)
+    (repo / "code.py").write_text("x = 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "work")
+
+
+def _archive_on_main(repo: Path, rels: list[str], *, rewrite: dict[str, str] | None = None) -> None:
+    _git(repo, "checkout", "-q", "main")
+    for rel in rels:
+        dst = rel.replace(f"{_SP}/", f"{_SP}/implemented/", 1)
+        (repo / dst).parent.mkdir(parents=True, exist_ok=True)
+        _git(repo, "mv", rel, dst)
+        if rewrite and rel in rewrite:
+            (repo / dst).write_text(rewrite[rel])
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "archive")
+
+
+def _final(rel: str) -> str:
+    """The branch's FINAL content of an archived doc: the squash carried v1; the
+    closeout then appended a line (journal entry / cursor advance) that reaches
+    the default branch only inside the archive commit, under the implemented path."""
+    return _ARCHIVED_DOCS[rel] + "closeout line\n"
+
+
+def _merged_then_archived(repo: Path, **kw: Any) -> None:
+    _archive_branch(repo)
+    _squash_merge(repo, "feature", "squash feature")
+    _git(repo, "checkout", "-q", "feature")
+    for rel in _ARCHIVED_DOCS:
+        (repo / rel).write_text(_final(rel))
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "closeout")
+    rewrite = {rel: _final(rel) for rel in _ARCHIVED_DOCS}
+    _archive_on_main(repo, list(_ARCHIVED_DOCS), rewrite=rewrite, **kw)
+
+
+def test_branch_changes_present_archive_moved_docs_count_as_landed(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    _merged_then_archived(repo)
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changes_present
+    assert res.missing == []
+
+
+def test_verify_merge_archive_moved_docs_are_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_repo(tmp_path)
+    _merged_then_archived(repo)
+    _with_origin(repo)
+    _git(repo, "checkout", "-q", "feature")
+    target = LocalWorktreeDevcontainerTarget(repo, runner=subprocess_runner)
+    monkeypatch.setattr(target, "_pr", lambda state: {"state": "MERGED", "url": "u"})
+    res = target.verify_merge(_state(repo, "feature"), default_branch="main")
+    assert res["verified"] is True
+    assert res["missing"] == []
+
+
+def test_reap_hazard_archive_moved_docs_are_not_an_unlanded_content_hazard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _origin, _runner, target, up = _gc_env_origin(tmp_path, monkeypatch)
+    wt = up("feat/archived")
+    for rel, body in _ARCHIVED_DOCS.items():
+        (wt / rel).parent.mkdir(parents=True, exist_ok=True)
+        (wt / rel).write_text(body)
+    _commit_in_worktree(wt, "code.py", "x = 1\n")
+    _land_on_origin_main(repo, "code.py", "x = 1\n")
+    for rel in _ARCHIVED_DOCS:
+        (wt / rel).write_text(_final(rel))
+    _commit_in_worktree(wt, "closeout.txt", "closeout\n")
+    _land_on_origin_main(repo, "closeout.txt", "closeout\n")
+    for rel in _ARCHIVED_DOCS:
+        dst = repo / rel.replace(f"{_SP}/", f"{_SP}/implemented/", 1)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(_final(rel))
+    _land_on_origin_main(repo, "note.txt", "archive\n")
+    st = load_state(repo, "feat/archived")
+    assert st is not None
+    assert target._reap_hazard(st) is None
+    # a dirty worktree still hazards
+    (wt / "dirty.txt").write_text("wip\n")
+    assert target._reap_hazard(st) is not None
+
+
+def test_branch_changes_present_docs_never_on_main_under_either_path_stay_missing(
+    tmp_path: Path,
+) -> None:
+    repo = make_repo(tmp_path)
+    _archive_branch(repo)
+    _git(repo, "checkout", "-q", "main")
+    _commit(repo, "other.py", "x\n", "unrelated main commit")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+    assert f"{_SP}/plans/p1/01.yaml" in res.missing
+
+
+def test_branch_changes_present_archived_copy_with_different_content_stays_missing(
+    tmp_path: Path,
+) -> None:
+    repo = make_repo(tmp_path)
+    _archive_branch(repo)
+    _squash_merge(repo, "feature", "squash feature")
+    _git(repo, "checkout", "-q", "feature")
+    spec = f"{_SP}/specs/s1.md"
+    _commit(repo, spec, _final(spec), "closeout")
+    _archive_on_main(repo, [spec], rewrite={spec: "# something else entirely\n"})
+    _git(repo, "checkout", "-q", "main")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert spec in res.missing
+
+
+def test_branch_changes_present_orphan_code_file_still_missing_after_docs_archived(
+    tmp_path: Path,
+) -> None:
+    repo = make_repo(tmp_path)
+    _merged_then_archived(repo)
+    _git(repo, "checkout", "-q", "feature")
+    _commit(repo, "orphan.py", "late\n", "pushed after the merge")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+    assert res.missing == ["orphan.py"]
+
+
+def test_branch_changes_present_non_fr_docs_get_no_archive_alternate(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "docs").mkdir()
+    _commit(repo, "docs/guide.md", "guide\n", "add guide")
+    _git(repo, "checkout", "-q", "main")
+    (repo / "docs/implemented").mkdir(parents=True)
+    _commit(repo, "docs/implemented/guide.md", "guide\n", "elsewhere")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.missing == ["docs/guide.md"]
+
+
+def test_branch_changes_present_path_only_ever_reachable_via_the_archive_commit(
+    tmp_path: Path,
+) -> None:
+    """S2: isolates what ONLY §C (`_archived_path`) catches, distinct from what
+    §A's own multi-commit blob-equality history scan already covers for free.
+
+    Here the file's ORIGINAL path never appears ANYWHERE in the base's history
+    — not even in the squash commit — because the branch renamed it away
+    BEFORE the squash (it never landed at the original path at all, only ever
+    reaching main via a later archive-shaped commit at the implemented path
+    with DIFFERENT content). §A's same-path scan has nothing to find; only
+    checking the archived path lands it."""
+    repo = make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "code.py", "x = 1\n", "code")
+    _squash_merge(repo, "feature", "squash feature")
+    rel = f"{_SP}/plans/p2/01.yaml"
+    _git(repo, "checkout", "-q", "feature")
+    (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+    (repo / rel).write_text("phase: 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "closeout: add plan")
+    # main NEVER holds `rel` at its original path — the archive commit lands it
+    # DIRECTLY under implemented/, with content that also differs from the
+    # branch's own bytes (a closeout line the branch itself never wrote).
+    dst = rel.replace(f"{_SP}/", f"{_SP}/implemented/", 1)
+    _git(repo, "checkout", "-q", "main")
+    (repo / dst).parent.mkdir(parents=True, exist_ok=True)
+    (repo / dst).write_text("phase: 1\nclosed: true\n")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "archive")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changes_present
+    assert res.missing == []
+
+
+def test_branch_changes_present_usage_recaptured_before_archive_still_lands_via_squash_blob(
+    tmp_path: Path,
+) -> None:
+    """S1: unlike plan/spec/journal (a pure `git mv`, no rewrite), `fr archive`
+    RE-CAPTURES the usage file (`upsert_capture` can REPLACE a host's entry,
+    not just append) before moving it — so the archived path's final content
+    can differ entirely from the branch's own blob. It still lands via §A: the
+    squash commit preserves the branch's ORIGINAL blob at the original path,
+    in history, independent of what a later commit does to a different path."""
+    repo = make_repo(tmp_path)
+    rel = f"{_SP}/usage/run-1.yaml"
+    _git(repo, "checkout", "-q", "-b", "feature")
+    (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+    (repo / rel).write_text("run: run-1\ncaptures:\n- host: h-aaa\n  dollars: 1.0\n")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "usage capture")
+    _squash_merge(repo, "feature", "squash feature")
+    # A SEPARATE main-side archive commit re-captures — REPLACING the host's
+    # entry outright, not appending — then moves it.
+    _archive_on_main(
+        repo,
+        [rel],
+        rewrite={rel: "run: run-1\ncaptures:\n- host: h-aaa\n  dollars: 9.9\n"},
+    )
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert res.changes_present
+    assert res.missing == []
+
+
+def test_merged_by_content_does_not_classify_unlanded_content_as_merged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S3: `_merged_by_content` (gc's PR-less classifier, the third caller of
+    `branch_changes_present`) must not read genuinely unlanded content as
+    merged just because §A/§C now recognize MORE content as landed elsewhere —
+    an unrelated later commit on main must not paper over a file the branch
+    itself never got onto main."""
+    repo, _origin, _runner, target, up = _gc_env_origin(tmp_path, monkeypatch)
+    wt = up("feat/wip")
+    _commit_in_worktree(wt, "wip.txt", "not on main yet\n")
+    _land_on_origin_main(repo, "unrelated.txt", "unrelated\n")  # main moves on, unrelated
+
+    st = load_state(repo, "feat/wip")
+    assert st is not None
+    assert target._merged_by_content(st) is False
+
+
+def test_branch_changes_present_three_way_revert_of_a_pure_deletion_is_missing(
+    tmp_path: Path,
+) -> None:
+    """#753 review f1: the branch only REMOVED a line; the three-way revert
+    restores it. No added line to look for — the restored line is the patch."""
+    repo = make_repo(tmp_path)
+    _commit(repo, "report.md", "a\nb\nc\nd\ne\n", "report base")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "report.md", "a\nc\nd\ne\n", "feature removes b")
+    _squash_merge(repo, "feature", "squash feature")
+    _commit(repo, "report.md", "a\nc\nd\nE\n", "another PR edits the report")
+    _git(repo, *_ID, "revert", "--no-edit", "HEAD~1")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+    assert res.missing == ["report.md"]
+
+
+def test_branch_changes_present_second_landing_does_not_hide_a_reverted_first(
+    tmp_path: Path,
+) -> None:
+    """#753 review f2: the branch is --no-ff merged, that merge reverted, and the
+    same branch merged again with an unrelated file. The fork point must reach
+    back past BOTH landings, or the reverted file never enters `changed`."""
+    repo = make_repo(tmp_path)
+    _commit(repo, "a.txt", "orig\n", "base")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "a.txt", "orig\nfoo\n", "feature: a")
+    _git(repo, "checkout", "-q", "main")
+    _commit(repo, "other.py", "x\n", "main moved on")
+    _git(repo, *_ID, "merge", "-q", "--no-ff", "--no-edit", "feature")
+    _git(repo, *_ID, "revert", "--no-edit", "-m", "1", "HEAD")
+    _git(repo, "checkout", "-q", "feature")
+    _commit(repo, "b.txt", "bar\n", "feature: b")
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, *_ID, "merge", "-q", "--no-ff", "--no-edit", "feature")
+    res = branch_changes_present(subprocess_runner, repo, "feature", "main")
+    assert not res.changes_present
+    assert res.missing == ["a.txt"]

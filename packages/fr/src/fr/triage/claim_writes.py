@@ -1,0 +1,296 @@
+"""Every claim write (spec 2026-10-06-triage-claims §3.D; R2-R4, R8-R10, R17).
+
+One module owns the forge writes of claims, so the batch commands, the driver and the
+`fr triage claim` group share them. Every call re-reads the issue's comments before it
+decides, so a decision never rests on facts older than the call, and every read applies
+R17: only *trusted* authors' markers count. Writes go only through `GhClient`.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, Literal
+
+from fr.ghclient import GhClient
+from fr.labels import FR_CLAIMED, FR_IN_PROGRESS
+from fr.triage.claims import (
+    Claim,
+    Marker,
+    expired,
+    holder,
+    needs_refresh,
+    read_claims,
+    render_marker,
+    stale,
+)
+from fr.triage.errors import TriageError
+
+
+class ClaimError(TriageError):
+    """A claim write the rules refuse (a live claim to take, an untrusted own marker)."""
+
+
+@dataclass(frozen=True)
+class Held:
+    """Another scope holds the issue (R4); nothing of this scope's stands on it."""
+
+    claim: Claim
+
+
+@dataclass(frozen=True)
+class Done:
+    """What was written: a new marker, an in-place rewrite, a refresh or a release."""
+
+    action: Literal["posted", "rewritten", "refreshed", "released", "none"]
+    comment_id: int | None = None
+
+
+Outcome = Done | Held
+
+
+def _read(
+    client: GhClient, repo: str, number: int, trusted: Collection[str]
+) -> tuple[list[dict[str, Any]], list[Claim]]:
+    comments = client.list_issue_comments(repo, number)
+    return comments, read_claims(comments, trusted).claims
+
+
+def _add_label(client: GhClient, repo: str, number: int) -> None:
+    """Put `fr:claimed` on the issue (idempotent): every write that leaves an un-released
+    marker standing also leaves the label, so a reader filtering on it sees the claim."""
+    client.ensure_labels(repo, [FR_CLAIMED])
+    client.edit_issue_labels(repo, number, add=frozenset({FR_CLAIMED.name}), remove=frozenset())
+
+
+RELEASE_LABELS = frozenset({FR_CLAIMED.name, FR_IN_PROGRESS.name})
+"""What a release that unlabels takes off the issue: the claim label and the run's label."""
+
+
+def _remove_label(
+    client: GhClient,
+    repo: str,
+    number: int,
+    trusted: Collection[str],
+    labels: frozenset[str] = frozenset({FR_CLAIMED.name}),
+) -> None:
+    """Remove *labels*, then re-read: a claim that landed after the caller's read gets
+    back every label that was on the issue before the removal, in one edit (p1-r5,
+    p1-r1: a label that was never there is not invented)."""
+    present = labels
+    if labels - {FR_CLAIMED.name}:
+        present = labels & set(client.view_issue(repo, number).get("labels") or [])
+    client.edit_issue_labels(repo, number, add=frozenset(), remove=labels)
+    _, claims = _read(client, repo, number, trusted)
+    if claims:
+        restore = frozenset(present | {FR_CLAIMED.name})
+        client.ensure_labels(repo, [FR_CLAIMED])
+        client.edit_issue_labels(repo, number, add=restore, remove=frozenset())
+
+
+def _drop_orphan_label(client: GhClient, repo: str, number: int, trusted: Collection[str]) -> None:
+    """Best effort after a failed claim: remove the label this call added unless an
+    un-released claim still stands. A failure here is swallowed; the original error is
+    the one to report."""
+    try:
+        _, claims = _read(client, repo, number, trusted)
+        if not claims:
+            client.edit_issue_labels(
+                repo, number, add=frozenset(), remove=frozenset({FR_CLAIMED.name})
+            )
+    except Exception:  # noqa: BLE001 -- cleanup must not mask the original failure
+        pass
+
+
+def _own(claims: list[Claim], me: str) -> Claim | None:
+    return next((c for c in claims if c.signer == me), None)
+
+
+def _released(marker: Marker, now: datetime, by: str | None = None) -> str:
+    return render_marker(marker.model_copy(update={"released": now, "released_by": by}))
+
+
+def _posted_id(comments: Sequence[Mapping[str, Any]], body: str) -> tuple[int | None, str]:
+    """The id and author of the newest comment carrying exactly *body*."""
+    for c in reversed(comments):
+        if c.get("body") == body and isinstance(c.get("id"), int):
+            return c["id"], str(c.get("author") or "")
+    return None, ""
+
+
+def claim(
+    client: GhClient,
+    repo: str,
+    number: int,
+    *,
+    me: str,
+    batch: str,
+    expiry: timedelta,
+    now: datetime,
+    trusted: Collection[str],
+) -> Outcome:
+    """Claim issue *number* for *batch* (R2-R4).
+
+    An own un-released marker is edited in place to name *batch* (its claimed time
+    stands: the hold was continuous). Otherwise the label is added and a new marker
+    posted, then the comments are re-read and R4 applied over every un-released claim,
+    expired ones included: a writer that lost withdraws its marker and reports Held.
+    """
+    _, claims = _read(client, repo, number, trusted)
+    own = _own(claims, me)
+    rival = holder(claims, me)
+    if rival is not None:
+        if own is not None:
+            client.edit_issue_comment(repo, own.comment_id, _released(own.marker, now))
+        return Held(rival)
+    if own is not None:
+        marker = own.marker.model_copy(
+            update={"batch": batch, "heartbeat": now, "expires": now + expiry}
+        )
+        client.edit_issue_comment(repo, own.comment_id, render_marker(marker))
+        _add_label(client, repo, number)
+        return Done("rewritten", own.comment_id)
+    _add_label(client, repo, number)
+    marker = Marker(signer=me, batch=batch, claimed=now, heartbeat=now, expires=now + expiry)
+    body = render_marker(marker)
+    try:
+        client.comment_issue(repo, number, body)
+    except BaseException:
+        _drop_orphan_label(client, repo, number, trusted)
+        raise
+    comments, claims = _read(client, repo, number, trusted)
+    posted, author = _posted_id(comments, body)
+    if _own(claims, me) is None:
+        if posted is not None:
+            client.edit_issue_comment(repo, posted, _released(marker, now))
+        _drop_orphan_label(client, repo, number, trusted)
+        raise ClaimError(
+            f"{repo}#{number}: this scope's marker was posted as `{author or 'unknown'}`, "
+            "which is neither the viewer, a `pr_authors` login (.fr/triage.yaml) nor the repo's "
+            "owner, a member or a collaborator, so no reader would count it; it was withdrawn"
+        )
+    rival = holder(claims, me)
+    own = _own(claims, me)
+    assert own is not None
+    if rival is not None:
+        client.edit_issue_comment(repo, own.comment_id, _released(marker, now))
+        return Held(rival)
+    return Done("posted", own.comment_id)
+
+
+def refresh(
+    client: GhClient,
+    repo: str,
+    number: int,
+    *,
+    me: str,
+    expiry: timedelta,
+    now: datetime,
+    trusted: Collection[str],
+    due_only: bool = False,
+) -> Outcome:
+    """Edit this scope's un-released marker in place with a new heartbeat and expiry
+    (R8). When another scope's take released it, write nothing and report Held.
+    *due_only* writes only when `needs_refresh` says the heartbeat is due."""
+    _, claims = _read(client, repo, number, trusted)
+    own = _own(claims, me)
+    rival = holder(claims, me)
+    if rival is not None:
+        return Held(rival)
+    if own is None or (due_only and not needs_refresh(own, now, expiry)):
+        return Done("none")
+    marker = own.marker.model_copy(update={"heartbeat": now, "expires": now + expiry})
+    client.edit_issue_comment(repo, own.comment_id, render_marker(marker))
+    _add_label(client, repo, number)
+    return Done("refreshed", own.comment_id)
+
+
+def release(
+    client: GhClient,
+    repo: str,
+    number: int,
+    *,
+    me: str,
+    now: datetime,
+    trusted: Collection[str],
+    of: str | None = None,
+    batch: str | None = None,
+    allow: Allow = "expired",
+    unlabel: bool = False,
+) -> Outcome:
+    """Edit the claim of *of* (default: this scope) to its released form; remove
+    `fr:claimed` once no un-released claim, live or expired, remains (R10). Open or
+    closed alike. With *unlabel* (R1: `claim sync`'s releases, where the batch's run is
+    over) `fr:in-progress` comes off in the same edit; `claim release` and
+    `scope retire` leave it, as they say nothing about a run. Another scope's claim is
+    released only once expired (R9), and its released form names this scope as
+    `released_by`. With *batch*, the release is that batch's: a marker naming any other
+    batch serves it and is left standing (p1-r3)."""
+    signer = of or me
+    _, claims = _read(client, repo, number, trusted)
+    target = _own(claims, signer)
+    if target is not None and batch is not None and target.batch != batch:
+        return Done("none")
+    if target is not None and signer != me:
+        may_displace(target, now, allow, f"{repo}#{number}", "released")
+    if target is None:
+        return Done("none")  # nothing of *signer*'s stands here: nothing is written
+    by = me if signer != me else None
+    client.edit_issue_comment(repo, target.comment_id, _released(target.marker, now, by=by))
+    if not [c for c in claims if c.signer != signer]:
+        _remove_label(
+            client,
+            repo,
+            number,
+            trusted,
+            RELEASE_LABELS if unlabel else frozenset({FR_CLAIMED.name}),
+        )
+    return Done("released", target.comment_id)
+
+
+Allow = Literal["expired", "stale", "any"]
+"""Which foreign claims an operator verb may displace: `expired` (R9), `stale` (R8, the
+`--stale` override, gh#1123), or `any` (`scope retire --force`)."""
+
+
+def may_displace(c: Claim, now: datetime, allow: Allow, where: str, verb: str) -> None:
+    """Raise ClaimError unless *allow* lets this scope displace *c*. Judged on the claim
+    just re-read from the forge, so a holder that refreshed since facts wins."""
+    if allow == "any" or expired(c, now):
+        return
+    head = (
+        f"{where}: the claim of {c.signer} (batch {c.batch}) is live until {c.expires.isoformat()}"
+    )
+    if allow == "expired":
+        hint = " (stale: the operator may use --stale)" if stale(c, now) else ""
+        raise ClaimError(f"{head}; only an expired claim can be {verb}{hint}")
+    if not stale(c, now):
+        raise ClaimError(
+            f"{head} and its heartbeat ({c.heartbeat.isoformat()}) is fresh; only a stale "
+            f"claim can be {verb} with --stale"
+        )
+
+
+def take(
+    client: GhClient,
+    repo: str,
+    number: int,
+    *,
+    me: str,
+    batch: str,
+    expiry: timedelta,
+    now: datetime,
+    trusted: Collection[str],
+    allow: Allow = "expired",
+) -> Outcome:
+    """Replace another scope's EXPIRED claim with this scope's claim for *batch* (R9), or
+    a STALE one under `allow="stale"` (gh#1123). Refused otherwise; the operator's
+    decision, never automatic."""
+    _, claims = _read(client, repo, number, trusted)
+    rival = holder(claims, me)
+    if rival is None:
+        raise ClaimError(f"{repo}#{number}: no other scope holds it; nothing to take")
+    may_displace(rival, now, allow, f"{repo}#{number}", "taken")
+    client.edit_issue_comment(repo, rival.comment_id, _released(rival.marker, now, by=me))
+    return claim(client, repo, number, me=me, batch=batch, expiry=expiry, now=now, trusted=trusted)

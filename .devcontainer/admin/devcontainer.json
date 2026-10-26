@@ -1,0 +1,22 @@
+{
+  "name": "super-fr \u2014 admin",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/jsburckhardt/devcontainer-features/uv:1": {}
+  },
+  "postCreateCommand": "git config --global --add safe.directory \"$PWD\" || true; uv tool install --with 'git+https://github.com/derio-net/super-fr#subdirectory=packages/fr-claude-cloud' --with 'git+https://github.com/derio-net/super-fr#subdirectory=packages/fr-cncd' --with 'git+https://github.com/derio-net/super-fr#subdirectory=packages/fr-herdr' --with 'git+https://github.com/derio-net/super-fr#subdirectory=packages/fr-vk' 'git+https://github.com/derio-net/super-fr#subdirectory=packages/fr'",
+  "runArgs": [
+    "--env-file",
+    "${localEnv:HOME}/.config/fr/secrets/super-fr/admin.env"
+  ],
+  "containerEnv": {
+    "UV_PROJECT_ENVIRONMENT": ".venv-container"
+  },
+  "customizations": {
+    "fr": {
+      "profile": "admin",
+      "purpose": "in-container gh writes (push, PR)"
+    }
+  }
+}

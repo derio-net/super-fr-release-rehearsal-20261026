@@ -1,0 +1,345 @@
+schema_version: 2
+phase:
+  number: 7
+  title: Fix apply_cmd plan-propagation (orthogonal v2-surface bug)
+  tag: agentic
+  depends_on:
+  - 1
+  tracking_issue: https://github.com/derio-net/superpowers-for-vk/issues/167
+tasks:
+- number: 1
+  title: Propagate plan into apply() from the operator CLI
+  steps:
+  - id: P7.T1.S1
+    text: |-
+      Pin the bug with a failing test.
+
+      Background (`docs/superpowers/specs/2026-05-17-v2-bridge-rebuild-design.md`
+      doesn't cover this; surfaced during the rebuild's own dispatch on
+      2026-05-17): `src/vk/commands/apply_cmd.py:222` calls
+      `apply(d, gh)` without the `plan=plan` kwarg. Without `plan`,
+      `apply()` skips `_rerender_dependent_creates` and every
+      `IssueCreate` mutation keeps the phase-number-fallback body
+      (`- Blocked by #1` instead of `- Blocked by #<actual-issue-N>`).
+
+      The legacy bridge then body-parses `#1` etc., queries gh, finds
+      old long-closed Issues, "satisfies" the deps, and dispatches
+      phases out of order. This is exactly what happened to this very
+      plan: Phases 2/3/6 dispatched ahead of Phase 1.
+
+      Phase 1's renderer fix (vk-blocked projection) masks the damage
+      because label-gating becomes authoritative — but the body-render
+      bug remains, and any consumer that body-parses (the legacy bridge
+      in `agent-images` until Phase 6, plus any future tool) is still
+      misled. This phase removes the latent risk entirely.
+
+      Add `tests/unit/test_apply_cmd.py` (new file) with:
+
+      ```python
+      """Regression guard for the apply_cmd → apply(plan=...) propagation bug
+      surfaced during the v2-bridge-rebuild dispatch on 2026-05-17."""
+      from pathlib import Path
+      from unittest.mock import MagicMock
+
+      from vk.apply import ApplyResult
+      from vk.commands import apply_cmd
+      from vk.parser import parse
+
+
+      def test_apply_cmd_propagates_plan_to_apply(monkeypatch, tmp_path):
+          """
+          GIVEN a multi-phase plan loaded via vk.parser.parse
+          WHEN  apply_cmd's apply() invocation runs (mocked to capture kwargs)
+          THEN  the call includes plan=<plan-instance>, ensuring the renderer's
+                phase_to_issue map is built and dependent bodies are re-rendered
+                with the correct issue numbers (NOT the phase-number fallback).
+          """
+          plan = parse(Path("tests/unit/fixtures/v2_plan_multi_phase"))
+
+          captured: dict = {}
+
+          def fake_apply(d, gh, **kwargs):
+              captured["kwargs"] = kwargs
+              return ApplyResult(
+                  applied=(), failures=(), created_issues={}, dry_run=False,
+              )
+
+          monkeypatch.setattr(apply_cmd, "apply", fake_apply)
+          # Stub the gh client + reachability gate so we exercise just the
+          # apply() call site. Reuse the project's existing CliRunner shape
+          # or call _apply_one directly with mocked dependencies.
+          # (Implementing agent: read apply_cmd.py first to choose the
+          # tightest test boundary — _apply_one is the natural seam.)
+
+          # ... arrange + act here, then ...
+          assert "plan" in captured["kwargs"], (
+              "apply_cmd must pass plan= to apply() so dependent bodies "
+              "re-render with correct issue numbers"
+          )
+          assert captured["kwargs"]["plan"] is plan
+      ```
+
+      The "arrange + act" middle is left for the implementing agent —
+      read `src/vk/commands/apply_cmd.py` first to pick the right seam.
+      `_apply_one(plan_dir, gh, ..., yes=True, dry_run=False)` is the
+      natural function to invoke; everything upstream is reachability
+      gate + typer plumbing.
+
+      Run: `uv run pytest tests/unit/test_apply_cmd.py -k propagates_plan -x --no-cov`
+      Expect: RED — apply_cmd.py:222 calls `apply(d, gh)` with no kwargs.
+  - id: P7.T1.S2
+    text: |-
+      Make the test green.
+
+      Edit `src/vk/commands/apply_cmd.py:222`. Change:
+      ```python
+      result = apply(d, gh)
+      ```
+      to:
+      ```python
+      result = apply(d, gh, plan=plan)
+      ```
+
+      That's the entire functional change. `plan` is already in scope at
+      that point (loaded by `_apply_one` earlier in the same function via
+      `vk.parser.parse(plan_dir)`). The `apply()` signature already
+      accepts `plan: Plan | None = None` as a keyword-only arg; the
+      `_rerender_dependent_creates` helper is already wired and tested
+      in `tests/unit/test_v2_apply.py`. Phase 1 of this plan didn't
+      touch any of this — it's a pure operator-CLI fix.
+
+      Run: `uv run pytest tests/unit/test_apply_cmd.py tests/unit/test_v2_apply.py -x --no-cov`
+      Expect: GREEN.
+  - id: P7.T1.S3
+    text: |-
+      Integration smoke for the end-to-end behavior.
+
+      Add to `tests/integration/test_apply_cmd.py` (or wherever the
+      existing CliRunner-based integration tests live — check
+      `tests/integration/test_apply_cmd_dispatch_gate.py` for a working
+      pattern):
+
+      ```python
+      def test_apply_cmd_produces_correct_dep_refs_for_multi_phase_plan(tmp_path):
+          """
+          GIVEN a multi-phase plan with phase 2 depending on phase 1,
+                neither dispatched
+          WHEN  `vk apply --yes <plan>` runs against a FakeGhClient
+          THEN  the IssueCreate mutation for phase 2 carries a body that
+                says `- Blocked by #<phase-1-issue-number>` (NOT
+                `- Blocked by #1`).
+          (Regression guard for the 2026-05-17 dispatch incident — broken
+           bodies referenced old closed Issues and triggered out-of-order
+           dispatch.)
+          """
+          # ... set up tmp_path plan, run CliRunner against the apply
+          # subcommand with --yes, capture the FakeGhClient.calls,
+          # find the create_issue call for phase 2, parse "Blocked by"
+          # from its body kwarg.
+      ```
+
+      Run: `uv run pytest tests/integration/test_apply_cmd.py -k dep_refs -x --no-cov`
+      Expect: GREEN (with S2's fix in place).
+  - id: P7.T1.S4
+    text: |-
+      Version bump + verification + PR.
+
+      Re-sequenced 2026-05-18: Phase 7 now ships RIGHT AFTER Phase 1
+      (depends_on: [1]) instead of after Phase 6. Reason: the bug is
+      actively producing broken `Blocked by #<small-number>` refs in
+      multiple recently-dispatched plans across at least three repos
+      (agent-images, superpowers-for-vk, frank). Waiting until end of
+      rebuild means weeks of bad refs.
+
+      Version bump: NEXT PATCH version available when this phase ships.
+      Phase 1 shipped v2.1.7. If no other phase has shipped between
+      Phase 1 and Phase 7's PR open, this is `2.1.7 → 2.1.8`. If Phase 2
+      shipped first (also depends_on=[1], can race), this becomes
+      `2.1.8 → 2.1.9`. Implementing agent: check current
+      `pyproject.toml::[project].version` immediately before bumping —
+      don't hardcode a target.
+
+      Bump the three files (`pyproject.toml`, `.claude-plugin/plugin.json`,
+      `.claude-plugin/marketplace.json`). Run `uv sync`. Pre-push verify
+      per CLAUDE.md (ruff format + check, mypy, pytest).
+
+      Open PR with title:
+      `fix(apply): propagate plan to apply() so dep refs render correctly (Phase 7 of #147)`
+
+      PR body must include:
+      - Link to the 2026-05-17 dispatch incident as the originating
+        evidence (Phases 2/3/6 of this very plan dispatched ahead of
+        Phase 1; recovered by manually re-running `vk apply --yes` after
+        the writeback PR merged)
+      - Reference #147 (tracking)
+      - Note that Phase 1's renderer fix made this latent — the
+        label-gating that landed in v2.1.7 prevents the dispatch
+        damage going forward, but the body-render bug itself remained
+        until now AND already-broken bodies in existing dispatched
+        Issues need manual repair (see P7.T2 — Post-merge runbook)
+      - The before/after for the one-line change
+- number: 2
+  title: Post-merge runbook — fix already-broken bodies in existing plans
+  steps:
+  - id: P7.T2.S1
+    text: |-
+      Identify affected plans.
+
+      The bug produced `- Blocked by #<phase-number>` instead of
+      `- Blocked by #<actual-predecessor-issue-number>` in EVERY
+      multi-phase plan dispatched via `vk apply --yes` since the v2.1.0
+      release. Known affected (as of 2026-05-17):
+
+      - `derio-net/agent-images#62`: body says "blocked by #1" (phase 1
+        fallback). Identify the plan that produced this Issue (read its
+        body's `📋 Plan:` line) and re-apply that plan.
+      - `derio-net/superpowers-for-vk#163`: body says "blocked by #3"
+      - `derio-net/superpowers-for-vk#164`: body says "blocked by #4"
+      - Possibly others — sweep with:
+        ```bash
+        for repo in derio-net/agent-images derio-net/superpowers-for-vk derio-net/frank; do
+          gh issue list --repo $repo --state open --search 'in:body "Blocked by #"' \
+                        --json number,title,body \
+                        --jq '.[] | select(.body | test("Blocked by #[1-9][0-9]?(\\D|$)")) | "\(.number)\t\(.title)"'
+        done
+        ```
+        The regex matches single/double-digit refs after "Blocked by #".
+        Most legitimate cross-issue refs are 3-4 digits (recent gh issue
+        numbers), so small-number matches are almost certainly fallback
+        artifacts.
+
+      For each match: find the plan via the gh issue body's
+      `📋 Plan:` line, record its location.
+  - id: P7.T2.S2
+    text: |-
+      Re-apply each affected plan.
+
+      For each affected plan, run:
+      ```bash
+      cd <plan's repo checkout>
+      git checkout main && git pull --ff-only origin main
+      uv run vk apply --yes <plan-dir>
+      ```
+
+      Since all the plan's Issues already exist, `apply()` emits
+      `IssueBodyChange` mutations (NOT IssueCreate) — and IssueBodyChange
+      uses the body that the renderer built upfront, which IS correct
+      now that the predecessor `tracking_issue` URLs are persisted in
+      the plan yamls. So this single `apply --yes` per plan fixes ALL
+      its broken refs in one tick.
+
+      Verify each repair:
+      ```bash
+      gh issue view <issue_number> --json body --jq '.body' | grep -A2 "Dependencies"
+      ```
+      Expect: `Blocked by #<3-4-digit-issue-number>`, not `#1` / `#3` /
+      `#4` etc.
+
+      Important: this WILL also re-emit `RepoLabelEnsure` and any
+      pending `IssueLabelChange` mutations for the plan. Dry-run first
+      (`vk apply <plan-dir>` without --yes) to preview side effects per
+      plan before committing.
+  - id: P7.T2.S3
+    text: |-
+      Audit bridge log for residual fallback refs.
+
+      Tail the bridge log on the kali pod (or wherever it runs):
+      ```bash
+      tail -f ~/.willikins-agent/vk-bridge.log
+      ```
+
+      For ~3 tick cycles after the runbook, watch for any entry of the
+      form `blocked by #<small-number>` (single or low double-digit).
+      Each such entry is a plan we missed in T2.S1 — re-apply that plan.
+
+      Stop when 3 consecutive ticks show no small-number blocked-by
+      refs. That's the signal the residual fallback state is cleared.
+  - id: P7.T2.S4
+    text: |-
+      Clean up wrongly-dispatched VK cards (if any).
+
+      During the broken-bodies era, some phases got dispatched
+      out-of-order (the apply_cmd.py bug "satisfied" their fake deps
+      against unrelated closed Issues). Those phases have VK cards +
+      possibly workspaces that did wrong work before being cancelled.
+
+      For each affected card:
+        - Archive the VK card via the Vibe Kanban UI (or `mcp.update_workspace
+          (ws_id, archived=True)` and `mcp.update_issue(card_id,
+          archived=True)`)
+        - Remove `vk-synced` label from the corresponding gh Issue:
+          `gh issue edit <N> --remove-label vk-synced`
+        - On the next bridge tick, the bridge will see vk-ready (now
+          honest via Phase 1's renderer) + no vk-synced → fresh
+          dispatch with correct context
+
+      Identified wrongly-dispatched cards from the 2026-05-17 incident:
+        - `derio-net/superpowers-for-vk#153` (Phase 2 of rebuild)
+        - `derio-net/superpowers-for-vk#154` (Phase 3 of rebuild)
+        - `derio-net/superpowers-for-vk#155` (Phase 4 — re-dispatched
+          a second time when bridge fought back during label rebalance)
+        - `derio-net/superpowers-for-vk#157` (Phase 6 of rebuild)
+
+      Operator decides per-card whether to archive-and-redispatch or
+      keep the existing card (e.g., if its agent's first ~10 messages
+      look salvageable).
+  - id: P7.T2.S5
+    text: |-
+      Final close-out.
+
+      After T2.S1-S4 complete and the bridge log shows no residual
+      small-number blocked-by refs, the v2-surface body-rendering
+      problem is fully closed. Document the resolution:
+
+      - Add a CLAUDE.md note: "§Release: `git tag v<ver>` and `git push
+        origin v<ver>` are part of the version-bump checklist." (Surfaced
+        2026-05-17: Phase 1 bumped to v2.1.7 without tagging, breaking
+        downstream Dockerfile pin resolution.)
+      - If #147 (tracking) is still open, comment with a one-line
+        summary: "Phase 7 + runbook complete. Body refs restored across
+        N plans. v2 dispatch surface now honest end-to-end."
+
+      No further work.
+state:
+  steps:
+    P7.T1.S1:
+      state: x
+      ticked_at: '2026-05-18T06:41:30+00:00'
+      note: null
+    P7.T1.S2:
+      state: x
+      ticked_at: '2026-05-18T06:41:30+00:00'
+      note: null
+    P7.T1.S3:
+      state: x
+      ticked_at: '2026-05-18T06:41:31+00:00'
+      note: null
+    P7.T1.S4:
+      state: x
+      ticked_at: '2026-05-18T06:42:05+00:00'
+      note: null
+    P7.T2.S1:
+      state: '-'
+      ticked_at: '2026-05-18T06:42:17+00:00'
+      note: 'post-merge runbook: operator-driven sweep across repos for affected plans'
+    P7.T2.S2:
+      state: '-'
+      ticked_at: '2026-05-18T06:42:17+00:00'
+      note: 'post-merge runbook: re-apply affected plans after fix lands on main'
+    P7.T2.S3:
+      state: '-'
+      ticked_at: '2026-05-18T06:42:18+00:00'
+      note: 'post-merge runbook: operator monitors bridge log for residual fallback
+        refs'
+    P7.T2.S4:
+      state: '-'
+      ticked_at: '2026-05-18T06:42:18+00:00'
+      note: 'post-merge runbook: operator cleans up wrongly-dispatched VK cards'
+    P7.T2.S5:
+      state: '-'
+      ticked_at: '2026-05-18T06:42:18+00:00'
+      note: 'post-merge runbook: documentation close-out by operator'
+  completion:
+    at: '2026-05-18T06:42:22+00:00'
+    note: null
+    observed_prs: []

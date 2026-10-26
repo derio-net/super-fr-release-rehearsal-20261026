@@ -1,0 +1,495 @@
+"""`fr plan ...` CLI subcommands — wraps vk.plan_ops."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import typer
+from rich.console import Console
+from rich.markup import escape
+from rich.table import Table
+
+from fr import parse, refs
+from fr._urls import is_cross_repo_spec
+from fr.commands.common import require_migrated_layout
+from fr.journal.model import journal_path
+from fr.parser import Plan, PlanSchemaError
+from fr.plan_ops import (
+    PhaseSpec,
+    PlanEditError,
+    create,
+    rework_add_origin,
+    rework_create,
+    rework_list,
+    self_review,
+)
+from fr.plan_validator_wrapper import validator_wrapper_path
+from fr.records_commit import commit_records
+from fr.version_floor import CEILING_VERSION, PRE_4_20_PROBES, PRE_4_PROBES, admits_below
+
+console = Console()
+err_console = Console(stderr=True)
+
+# Every default below carries a DERIVED ceiling (`CEILING_VERSION`: the next
+# major after the installed fr) and a LITERAL floor. The ceiling was once a
+# literal too — `<5.0.0`, widened by hand at 4.0.0 so a plan created there could
+# pass its own version gate (2026-08-14 workflow-shapes plan, spec §5 "fr_version
+# must span the bump") — and 5.0.0 then refused every plan it wrote. The floor
+# stays literal on purpose: `scripts/floors.py` reads it to check it names the
+# release that ships the field it guards.
+DEFAULT_FR_VERSION = f">=3.0.0,<{CEILING_VERSION}"
+
+# The floor a plan that names a `workflow:` shape must carry (spec §4.A.1).
+# `PlanMeta` is extra="forbid", so fr < 4.0.0 does not skip the unknown
+# `workflow:` key — it fails the parse outright.
+#
+# What each fr actually reports (corrected in review r5-b4). Every RELEASED
+# fr 3.x validates the schema before it reads `fr_version`, so it dies on
+# pydantic's `extra_forbidden` for `workflow:` and never prints this floor:
+# a hard failure, but not a legible one. fr 4.0.0+ enforces the version gate
+# off the raw mapping FIRST (`fr.parser._enforce_fr_version`), so from here
+# on an old-reader-hostile key is reported as "requires fr_version …, but
+# installed is …". The constraint is still the plan's way of telling an
+# older fr not to try; the reason to carry it is that the NEXT field
+# addition will be announced properly, not that 3.x ever was.
+WORKFLOW_FR_VERSION = f">=4.0.0,<{CEILING_VERSION}"
+
+# The floor a plan whose phases set `files` or `estimate_lines` must carry
+# (2026-09-24 fr-goal-scope-proportion-cost spec §C). `PhaseHeader` is
+# extra="forbid", so an fr older than the release that added them fails the
+# parse instead of ignoring the keys — the same reasoning as the `workflow:`
+# floor above, one release-line later.
+SCOPE_FR_VERSION = f">=4.20.0,<{CEILING_VERSION}"
+
+
+def _admits_pre_4(constraint: str) -> bool:
+    """Does `constraint` allow an fr older than 4.0.0 to load the plan?"""
+    return admits_below(constraint, "4.0.0", PRE_4_PROBES)
+
+
+plan_app = typer.Typer(help="v2 plan editing commands.", no_args_is_help=True)
+
+
+@plan_app.callback()
+def _plan_guard() -> None:
+    """Runs before every `fr plan ...` subcommand (legacy-layout hard-stop)."""
+    require_migrated_layout()
+
+
+def _staged_among(repo_root: Path, candidates: list[Path]) -> list[Path] | None:
+    """The candidate paths that differ from HEAD in the index — what `plan_ops`
+    just staged. A foreign file it declined to touch (an untracked, non-fr
+    `scripts/validate-plans.sh`) is not staged, so it is never swept in.
+
+    `None` when git cannot answer: fail closed and commit NOTHING (p3-m3).
+    Passing the candidates on instead would hand `commit_paths` exactly the
+    foreign file this filter exists to keep out, and it would `git add` it."""
+    from fr.git import GitUnavailableError, git_answer
+
+    existing = [c for c in candidates if c.exists()]
+    rel = [str(c.resolve()) for c in existing]
+    try:
+        top = git_answer(repo_root, "rev-parse", "--show-toplevel")
+        done = git_answer(repo_root, "diff", "--cached", "--name-only", "-z", "HEAD", "--", *rel)
+    except GitUnavailableError:
+        return None
+    if top.returncode != 0 or done.returncode != 0:
+        return None
+    toplevel = Path(top.stdout.strip())
+    return [toplevel / name for name in done.stdout.split("\0") if name]
+
+
+def _commit_plan_writes(
+    repo_root: Path | None, candidates: list[Path], slug: str, verb: str
+) -> None:
+    """gh#610 §3.C: `plan_ops` stages, the CLI commits — once, never failing the write."""
+    if repo_root is None or not candidates:
+        return
+    staged = _staged_among(repo_root, candidates)
+    if staged is None:
+        err_console.print(
+            "fr: not committed (git could not say which plan files were staged); "
+            "the files are in your working tree",
+            soft_wrap=True,
+            markup=False,
+        )
+        return
+    commit_records(repo_root, staged, f"chore(fr): plan {slug} — {verb}")
+
+
+@plan_app.command("create")
+def create_cmd(
+    slug: str = typer.Option(..., "--slug", help="Plan slug (becomes folder name)."),
+    target_repo: str = typer.Option(..., "--target-repo", help="owner/repo for phases."),
+    spec: Path | None = typer.Option(
+        None, "--spec", help="Spec path relative to repo root (optional)."
+    ),
+    fr_version: str | None = typer.Option(
+        None,
+        "--fr-version",
+        help=(
+            "fr_version constraint for the plan. Effective default: "
+            f"{DEFAULT_FR_VERSION!r}, or {WORKFLOW_FR_VERSION!r} when --workflow is given."
+        ),
+    ),
+    workflow: str | None = typer.Option(
+        None,
+        "--workflow",
+        help=(
+            "Workflow shape this plan dispatches at (repo > shipped). "
+            "Omitted, the plan resolves the default phase-dispatch shape "
+            "and the key is not written at all."
+        ),
+    ),
+    phases_file: Path | None = typer.Option(
+        None, "--phases-file", help="YAML file with a list of phase specs."
+    ),
+    prose_file: Path | None = typer.Option(
+        None, "--prose-file", help="Markdown file with the plan's prose body."
+    ),
+) -> None:
+    """Scaffold a new v2 plan folder + append spec row.
+
+    --phases-file YAML shape:
+      - {number, title, tag (agentic|manual), depends_on: [N,...],
+          acceptance ([row-ids], acceptance-matrix rows this phase advances),
+          skeleton (bool, walking-skeleton marker for the first agentic phase;
+            owed only when the plan has two or more agentic phases),
+          tier (mechanical|standard|hard, harness-neutral dispatch complexity
+            hint; agentic phases should set one, see fr-plan),
+          files ([globs], repo-relative paths the phase expects to touch) and
+          estimate_lines (int, expected added+deleted lines) — proportionality
+            inputs; either one floors fr_version at 4.20.0,
+          tasks: [{number, title, steps: [{id, text}, ...]}, ...]}
+      - ...
+
+    --prose-file is the plan's narrative markdown. If omitted, a
+    minimal stub is generated.
+    """
+    import yaml
+
+    repo_root = Path.cwd()
+    phases: list[PhaseSpec] = []
+    if phases_file is not None:
+        raw = yaml.safe_load(phases_file.read_text())
+        for p in raw or []:
+            phases.append(
+                PhaseSpec(
+                    number=p["number"],
+                    title=p["title"],
+                    tag=p.get("tag", "agentic"),
+                    depends_on=tuple(p.get("depends_on") or ()),
+                    tasks=tuple(p.get("tasks") or ()),
+                    acceptance=tuple(p.get("acceptance") or ()),
+                    skeleton=bool(p.get("skeleton", False)),
+                    tier=p.get("tier"),
+                    files=tuple(p.get("files") or ()),
+                    estimate_lines=p.get("estimate_lines"),
+                )
+            )
+    prose = prose_file.read_text() if prose_file is not None else f"# {slug}\n\nPlan-level prose.\n"
+
+    # "Did the operator state a constraint?" is asked of the sentinel default
+    # (None), not of click: an explicit `--fr-version` equal to the default
+    # is byte-identical to it, and silently upgrading it would be
+    # exactly the kind of quiet substitution this phase exists to stop.
+    # (click's ParameterSource introspection would answer the same question
+    # but click is typer's transitive dep, not ours — see skills_cmd.py's
+    # duck-typing note; a bare `import click` breaks a clean `uv tool
+    # install` of fr, which has no direct click dependency.)
+    explicit = fr_version is not None
+    if workflow is not None:
+        if not explicit:
+            # No constraint stated, so the shape decides it.
+            fr_version = WORKFLOW_FR_VERSION
+        elif _admits_pre_4(fr_version):  # type: ignore[arg-type]  # explicit implies not None
+            # An explicit constraint is the operator's, so it is refused
+            # rather than silently rewritten — but one that invites fr 3.x
+            # to load a plan whose `workflow:` key it cannot parse is a
+            # promise the plan cannot keep.
+            err_console.print(
+                f"[red]error:[/red] --workflow requires an fr_version floored at 4.0.0 "
+                f"(PlanMeta forbids unknown keys, so fr < 4.0.0 cannot parse a plan "
+                f"carrying `workflow:`); got {fr_version!r}. Use "
+                f"--fr-version '{WORKFLOW_FR_VERSION}' or drop --workflow."
+            )
+            raise typer.Exit(2)
+    if any(ps.declares_scope for ps in phases):
+        # Checked after `--workflow`, whose 4.0.0 floor this one subsumes.
+        if not explicit:
+            fr_version = SCOPE_FR_VERSION
+        elif admits_below(fr_version, "4.20.0", PRE_4_20_PROBES):  # type: ignore[arg-type]
+            err_console.print(
+                f"[red]error:[/red] phases setting files/estimate_lines require an "
+                f"fr_version floored at 4.20.0 (PhaseHeader forbids unknown keys, so an "
+                f"older fr cannot parse them); got {fr_version!r}. Use "
+                f"--fr-version '{SCOPE_FR_VERSION}' or drop the fields."
+            )
+            raise typer.Exit(2)
+    if fr_version is None:
+        fr_version = DEFAULT_FR_VERSION
+
+    try:
+        plan = create(
+            repo_root=repo_root,
+            slug=slug,
+            spec=str(spec) if spec else None,
+            target_repo=target_repo,
+            fr_version=fr_version,
+            phases=phases,
+            prose=prose,
+            workflow=workflow,
+            warn=lambda msg: err_console.print(f"[yellow]warning:[/yellow] {msg}"),
+        )
+        console.print(f"created plan: {plan.dir}")
+    except PlanEditError as e:
+        err_console.print(f"[red]error:[/red] {escape(str(e))}")
+        raise typer.Exit(2) from e
+    candidates = [
+        plan.dir,
+        journal_path(repo_root, "plan", slug),
+        validator_wrapper_path(repo_root),
+    ]
+    if spec is not None:
+        candidates.append((repo_root / spec).resolve())
+    _commit_plan_writes(repo_root, candidates, slug, "create")
+
+
+@plan_app.command("edit")
+def edit(
+    plan_dir: Path = typer.Argument(..., help="Path to plan folder."),
+    tick_step: str | None = typer.Option(None, "--tick", help="Step ID to tick (P<n>.T<n>.S<n>)."),
+    state: str = typer.Option("x", "--state", help="State for --tick: x | -"),
+    note: str | None = typer.Option(None, "--note", help="Note (required for --state -)"),
+    complete_phase_n: int | None = typer.Option(
+        None, "--complete-phase", help="Phase number to mark complete."
+    ),
+) -> None:
+    """Mutate plan state — tick a step OR complete a phase."""
+    if (tick_step is None) == (complete_phase_n is None):
+        err_console.print("Provide exactly one of --tick or --complete-phase")
+        raise typer.Exit(2)
+
+    # spec 2026-09-25 §5.C.6: a one-entry record through the step-record engine.
+    from fr.record import apply as engine
+    from fr.record.model import CompleteItem, StepRecord, TickItem
+
+    if tick_step is not None:
+        if state not in ("x", "-"):
+            err_console.print(f"--state must be 'x' or '-', got {state!r}")
+            raise typer.Exit(2)
+        if state == "-" and not note:
+            err_console.print("[red]error:[/red] --state - (skipped) requires --note")
+            raise typer.Exit(2)
+        try:
+            item = TickItem(id=tick_step, state=state, note=note)  # type: ignore[arg-type]
+        except ValueError as e:
+            err_console.print(f"[red]error:[/red] step id {tick_step!r} not found in any phase")
+            raise typer.Exit(2) from e
+        record = StepRecord(ticks=(item,))
+        verb = f"tick {tick_step}" if state == "x" else f"skip {tick_step}"
+        line = f"ticked {tick_step} → {state}"
+    else:
+        assert complete_phase_n is not None
+        record = StepRecord(complete=CompleteItem(phase=complete_phase_n, note=note))
+        verb = f"complete phase {complete_phase_n}"
+        line = f"phase {complete_phase_n}: marked complete"
+    resolved = plan_dir.resolve()
+    try:
+        repo_root = parse(resolved).repo_root or resolved
+    except Exception as e:  # noqa: BLE001 — the verb's own parse error, as before
+        err_console.print(f"[red]error:[/red] {escape(str(e))}")
+        raise typer.Exit(2) from e
+    try:
+        engine.apply_record(
+            repo_root,
+            None,
+            record,
+            target=engine.RecordTarget(
+                plan_dir=resolved, message=f"chore(fr): plan {resolved.name} — {verb}"
+            ),
+        )
+    except engine.RecordRefusedError as e:
+        err_console.print(f"[red]error:[/red] {escape(str(e))}")
+        raise typer.Exit(2) from e
+    console.print(line)
+    if complete_phase_n is not None:
+        _acceptance_flip_nudge(plan_dir, complete_phase_n)
+
+
+def _plan_repo_root(plan_dir: Path) -> Path | None:
+    try:
+        return parse(plan_dir).repo_root
+    except Exception:  # noqa: BLE001 — the write landed; an unreadable plan just skips the commit
+        return None
+
+
+def _acceptance_flip_nudge(plan_dir: Path, phase_n: int) -> None:
+    """A completed phase whose linked acceptance rows are still
+    `not-implemented` gets a warning naming them (2026-07-04 spec, fr-execute
+    integration). Best-effort: a broken plan or matrix must never block the
+    completion that already happened."""
+    try:
+        plan = parse(plan_dir)
+        phase = next(p for p in plan.phases if p.phase.number == phase_n)
+        ids = phase.phase.acceptance
+        if not ids or plan.repo_root is None:
+            return
+        from fr.acceptance.model import load_matrix
+
+        matrix_path = plan.repo_root / "docs" / "acceptance" / "matrix.yaml"
+        if not matrix_path.exists():
+            return
+        status_by_id = {r.id: r.status for r in load_matrix(matrix_path).rows}
+        unflipped = [rid for rid in ids if status_by_id.get(rid) == "not-implemented"]
+        if unflipped:
+            typer.echo(
+                f"warning: phase {phase_n} completed but its acceptance rows are "
+                f"still not-implemented: {', '.join(unflipped)} — flip them "
+                f"(edit status + cite the test refs) or record why in notes."
+            )
+    except Exception as e:  # noqa: BLE001 — nudge only, never a gate
+        typer.echo(f"warning: acceptance flip-nudge skipped ({e})")
+
+
+@plan_app.command("rework")
+def rework(
+    parent_plan_dir: Path = typer.Argument(
+        ..., help="Path to parent plan folder (Complete + archived)."
+    ),
+) -> None:
+    """Scaffold a sibling rework plan + append spec row."""
+    try:
+        plan = rework_create(parent_plan_dir)
+        console.print(f"created rework plan: {plan.dir}")
+    except PlanEditError as e:
+        err_console.print(f"[red]error:[/red] {escape(str(e))}")
+        raise typer.Exit(2) from e
+    candidates = [plan.dir]
+    spec_path = _same_repo_spec_path(plan)
+    if spec_path is not None:
+        candidates.append(spec_path)
+    _commit_plan_writes(plan.repo_root, candidates, plan.dir.name, "rework")
+
+
+def _same_repo_spec_path(plan: Plan) -> Path | None:
+    """The spec file `rework_create` appended its row to, if it could find one."""
+    if plan.repo_root is None or not plan.meta.spec or is_cross_repo_spec(plan.meta.spec):
+        return None
+    try:
+        return refs.resolve_spec_ref(plan.meta.spec, plan.repo_root).path
+    except Exception:  # noqa: BLE001 — the write landed; an unresolvable spec is just not committed
+        return None
+
+
+@plan_app.command("rework-add")
+def rework_add(
+    rework_dir: Path = typer.Argument(..., help="Rework plan folder."),
+    item: str = typer.Option(..., "--item", help="Origin item description."),
+    source: str = typer.Option(..., "--source", help="Where the item came from."),
+    track: str = typer.Option(
+        ...,
+        "--track",
+        help=(
+            "Free-form. Canonical: development | operations | decision. "
+            "Compounds like 'decision → development' or 'development (future-triggered)' OK."
+        ),
+    ),
+) -> None:
+    """Append an origin item to a rework plan's _meta.origin_items."""
+    try:
+        new_id = rework_add_origin(rework_dir, item=item, source=source, track=track)
+        console.print(f"added origin item #{new_id}")
+    except PlanEditError as e:
+        err_console.print(f"[red]error:[/red] {escape(str(e))}")
+        raise typer.Exit(2) from e
+    resolved = rework_dir.resolve()
+    _commit_plan_writes(
+        _plan_repo_root(resolved), [resolved / "_meta.yaml"], resolved.name, "rework-add"
+    )
+
+
+@plan_app.command("rework-list")
+def rework_list_cmd(
+    include_archived: bool = typer.Option(
+        False, "--include-archived", help="Also scan archived-plans/"
+    ),
+) -> None:
+    """List rework plans in the current repo."""
+    repo_root = Path.cwd()
+    records = rework_list(repo_root, include_archived=include_archived)
+    if not records:
+        console.print("no rework plans found.")
+        return
+    table = Table(title="Rework plans")
+    table.add_column("Parent")
+    table.add_column("N", justify="right")
+    table.add_column("Status")
+    table.add_column("Open steps", justify="right")
+    table.add_column("Origin items", justify="right")
+    table.add_column("By track")
+    table.add_column("Folder")
+    for r in records:
+        track_summary = ", ".join(f"{t}={n}" for t, n in r.by_track) if r.by_track else "—"
+        table.add_row(
+            r.parent_slug,
+            str(r.rework_number),
+            r.status,
+            str(r.open_steps),
+            str(r.origin_item_count),
+            track_summary,
+            str(r.folder_path),
+        )
+    console.print(table)
+
+
+@plan_app.command("self-review")
+def self_review_cmd(
+    plan_dir: Path = typer.Argument(..., help="Path to plan folder."),
+) -> None:
+    """Soft lints beyond schema validation."""
+    try:
+        plan = parse(plan_dir)
+    except PlanSchemaError as e:
+        err_console.print(f"[red]parse error:[/red] {escape(str(e))}")
+        raise typer.Exit(2) from e
+
+    issues = self_review(plan)
+    if not issues:
+        console.print("[green]self-review passed[/green]")
+        return
+    for issue in issues:
+        # `escape`, because a lint message is data, not markup. Rich reads
+        # `[...]` as a style tag and silently DROPS it: the #428 verdict's
+        # "move the dispatch into a [manual] phase" rendered as "into a
+        # phase", i.e. the escape route the message offers disappeared —
+        # and so did every issue's own "[error]"/"[warn]" severity prefix.
+        console.print(escape(str(issue)))
+    if any(issue.severity == "error" for issue in issues):
+        raise typer.Exit(1)
+
+
+@plan_app.command("proportionality")
+def proportionality_cmd(
+    plan_dir: Path = typer.Argument(..., help="Path to plan folder."),
+    base: str | None = typer.Option(
+        None,
+        "--base",
+        help="Ref to diff from (via its merge-base with HEAD). Default: the remote default branch.",
+    ),
+) -> None:
+    """Compare the branch's diff with the plan: unreferenced new files,
+    out-of-plan touches, size vs estimate. A report, never a gate — always
+    exits 0 once the plan parses (an unreadable plan is not a report)."""
+    from fr.git import repo_root as git_repo_root
+    from fr.proportionality import build_report
+
+    try:
+        plan = parse(plan_dir)
+    except PlanSchemaError as e:
+        err_console.print(f"[red]parse error:[/red] {escape(str(e))}")
+        raise typer.Exit(2) from e
+    root = plan.repo_root or git_repo_root()
+    # Plain echo, not rich: the report is pasted into a PR body verbatim, and
+    # rich would read `[...]` as markup and re-wrap long lines.
+    typer.echo(build_report(root, plan, base), nl=False)

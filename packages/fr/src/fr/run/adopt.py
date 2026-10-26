@@ -1,0 +1,1116 @@
+"""Adoption — in-flight work acquires a cursor (2026-08-30 spec §3.E).
+
+A node's installed `fr` changes mid-flight. The migration framework brings the
+*artifacts* up to date; this module answers the other half of the operator's
+ask — "I do want an adoption path of in-flight work as well" — by reconstructing
+a run cursor from artifacts that already exist:
+
+    | Observed                        | Cursor lands on                  |
+    | spec only                       | plan                             |
+    | plan exists, no phase complete   | implement                        |
+    | some phases complete             | implement (per-phase state kept) |
+    | all phases complete, no PR       | review                           |
+    | PR open                          | deliver                          |
+
+Three things this module deliberately does NOT do:
+
+1. **It does not fork a second way to write a run file.** It builds a
+   `RunState` out of the same `fr.run.model` types `fr run start` uses and
+   saves it through the same `save_run_state`. It sets an *initial* state; it
+   never reimplements a transition. `_complete_step` in `fr.commands.run_cmd`
+   remains the only implementation of the done/failed cursor asymmetry, and an
+   adopted run moves from here on exactly like a started one.
+2. **It does not decide anything the plan already decides.** "Is this phase
+   done?" is `fr.render.plan_locally_complete` — the same offline predicate the
+   archive gate, the `fr status` sweep and the unarchived-plans tripwire use.
+   "Does this plan already have a run?" is `fr.archive.find_run_for_plan`,
+   which matches on the recorded `emitted.plan` rather than on a name.
+3. **It never runs as a side effect.** `adoptable_plans` is a read; only
+   `adopt_run` writes, and its callers are the explicit `fr run adopt` command
+   and `fr migrate artifacts --adopt`. The CLI-entry migration gate *reports*
+   the offer and stops there — an operator typing `fr status` must not
+   discover new git-tracked files.
+
+**Why an adopted run records its emitted spec and plan.** Archival keys on
+`emitted.plan` (2026-08-14 spec §4.B): a run id is `<date>-<flattened-branch>`
+and a plan slug is authored independently, so a name-keyed match silently never
+fires. A run adopted without those recordings would be a run that never
+archives with its plan.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import re
+import subprocess
+from collections.abc import Callable, Collection, Sequence
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+
+from fr.journal.model import (
+    JournalEntry,
+    JournalParseError,
+    parse_journal,
+    phase_finding_states,
+    resolve_journal_read_path,
+    reviews_phase,
+    unauthorized_fixes,
+)
+from fr.parser import Plan, PlanSchemaError, parse
+from fr.render import plan_locally_complete
+from fr.run import units
+from fr.run.historical import HISTORICAL_REVIEWER, findings_witness, historical_review_refusal
+from fr.run.model import (
+    RunState,
+    RunStateError,
+    StepRecord,
+    UnitRecord,
+    current_run_schema_version,
+    load_run_state,
+    run_path,
+    save_run_state,
+    validate_run_id,
+)
+from fr.workflow.model import Step, WorkflowError, WorkflowManifest
+from fr.workflow.resolve import resolve_workflow
+
+__all__ = [
+    "AdoptError",
+    "Adoption",
+    "Superseded",
+    "carry_forward",
+    "open_holds",
+    "MANUAL_ITEM",
+    "PLANS_REL",
+    "adopt_run",
+    "adoptable_plans",
+    "adoption_offer_lines",
+    "default_pr_state",
+    "infer_adoption",
+    "plan_phase_numbers",
+    "plan_phase_tags",
+]
+
+MANUAL_ITEM = "manual"
+"""The unit STATE of a phase the run deliberately never dispatched.
+
+Both writers of a group's unit states use this one spelling — `fr run advance`
+(`fr.commands.run_cmd._advance_group`) and adoption's `build_run_state` — so
+a resumed run cannot disagree with a started one about which phases were
+skipped and why (#496, spec §3.D.3). It is a vocabulary, not a field: no
+schema change and no artifact version bump follow from it.
+"""
+
+DEFAULT_WORKFLOW = "fr-goal"
+"""The `unit: run` shape a run cursor belongs to, when `--workflow` is absent.
+
+NOT `fr.workflow.resolve.workflow_for_plan`, which answers a different
+question — the granularity a plan *dispatches* at, defaulting to the
+`unit: phase` sub-shape whose only step is `implement`. A cursor over that
+shape could never land on `plan`, `review` or `deliver`.
+
+The two defaults are contrasted in full at
+`fr.workflow.shapes.FR_GOAL_PHASE_DISPATCH`'s docstring — one place, so the
+distinction cannot be half-remembered in two (review r5-e3).
+"""
+
+PLANS_REL = Path("docs") / "superpowers" / "plans"
+
+PrStateFn = Callable[[str], str | None]
+"""`url -> "OPEN" | "CLOSED" | "MERGED" | None`, the vocabulary of
+`GhClient.pr_status_by_url`. `None` means *undeterminable*, not "no PR"."""
+
+
+class AdoptError(Exception):
+    """Adoption could not produce a run. The CLI maps it to exit 2."""
+
+
+@dataclass
+class Superseded:
+    """What `adopt_run(..., supersede=True)` found and did over an existing run
+    — an outparam, like `notes`: the CLI previews from it and commits from it."""
+
+    old: str
+    """The run id replaced."""
+    holds: list[tuple[str, str, str | None, str | None]] = field(default_factory=list)
+    """`(step, unit key, agent, session)` of each open attempt the carry closes."""
+    removed: list[Path] = field(default_factory=list)
+    """Files this removed (the old cursor, the old usage file after its move)."""
+    written: list[Path] = field(default_factory=list)
+    """Files this wrote beyond the new cursor (the moved usage file)."""
+    written_new: bool = False
+    """False under a preview, where nothing was written."""
+
+
+@dataclass(frozen=True)
+class Adoption:
+    """What was observed, before any run file exists."""
+
+    cursor: str
+    spec: str | None = None
+    """Repo-relative spec path, when one is resolvable."""
+    plan: str | None = None
+    """Repo-relative plan-dir path, when a plan exists."""
+    pr: str | None = None
+    """PR url, recorded only when it was OBSERVED open."""
+    phases: dict[str, str] = field(default_factory=dict)
+    """`phase/<n>` -> `done` | `pending`, for every phase of the plan.
+
+    Lifecycle only. It answers "has this phase's work happened?" and the
+    inference table below reads it for exactly that — a `tag: manual` phase
+    is `pending` until it is ticked, which is why an unticked manual phase
+    still lands the cursor on `implement` rather than declaring the plan
+    finished (2026-08-14 §4.C: `[manual]` is a routing attribute, not a
+    lifecycle state).
+    """
+    manual: tuple[int, ...] = ()
+    """Phase numbers whose `tag` is `manual` — the ROUTING fact, kept apart
+    from the lifecycle one above (#496, spec §3.D.3).
+
+    `build_run_state` records these as `phase/<n>: manual` instead of a
+    `phase/<n>/<member>` item, because the fan-out will never dispatch them.
+    Separate from `phases` on purpose: the two answer different questions and
+    fusing them would make an unticked trailing manual phase look like an
+    unfinished plan to the inference table, or a ticked front-loaded one look
+    like a phase this run implemented.
+    """
+    notes: tuple[str, ...] = ()
+    """Lines the CLI prints — how a judgement was reached, or could not be."""
+
+
+# --- inference ------------------------------------------------------------
+
+
+def _completed_phases(plan: Plan) -> dict[str, str]:
+    return {
+        f"phase/{p.phase.number}": ("done" if plan_locally_complete(p) else "pending")
+        for p in plan.phases
+    }
+
+
+def infer_adoption(
+    *,
+    plan: Plan | None = None,
+    spec_rel: str | None = None,
+    plan_rel: str | None = None,
+    pr_url: str | None = None,
+    pr_state: PrStateFn | None = None,
+) -> Adoption:
+    """The inference table, and nothing else — pure, no I/O of its own.
+
+    Two states the spec's table does not name, decided here:
+
+    - **A plan folder with no phase files at all** (a skeleton `fr plan
+      create` wrote before any phase) is *in flight*, cursor `implement`.
+      `all(...)` over an empty sequence is vacuously true, so the opposite
+      reading would call an empty plan finished; `completed_unarchived_plans`
+      already guards the same trap with `plan.phases and all(...)`, and this
+      agrees with it rather than inventing a second answer.
+    - **An open PR over a plan whose phases are NOT all complete** does not
+      reach `deliver`. The table's last two rows are one observation refined:
+      "all phases complete" plus "and there is a PR". An open PR over
+      unfinished work is a phase PR, not the delivery, and jumping the cursor
+      to `deliver` would declare the implementation over.
+    """
+    if plan is None:
+        return Adoption(cursor="plan", spec=spec_rel)
+
+    phases = _completed_phases(plan)
+    manual = tuple(sorted(p.phase.number for p in plan.phases if p.phase.tag == "manual"))
+    if not phases or any(v == "pending" for v in phases.values()):
+        return Adoption(
+            cursor="implement", spec=spec_rel, plan=plan_rel, phases=phases, manual=manual
+        )
+
+    if pr_url is None:
+        return Adoption(
+            cursor="review",
+            spec=spec_rel,
+            plan=plan_rel,
+            phases=phases,
+            manual=manual,
+            notes=(
+                "every phase is complete and no PR was named (--pr <url>), so the cursor "
+                "lands on `review`; pass --pr if one is already open.",
+            ),
+        )
+
+    observed = pr_state(pr_url) if pr_state is not None else None
+    if observed == "OPEN":
+        return Adoption(
+            cursor="deliver",
+            spec=spec_rel,
+            plan=plan_rel,
+            pr=pr_url,
+            phases=phases,
+            manual=manual,
+        )
+    if observed is None:
+        # Fail soft, downward. `pr_status_by_url` returns None for every
+        # not-found/error condition — offline, no credentials, a deleted PR —
+        # so "cannot tell" must never be reported as `deliver`. The cursor
+        # lands on the row we CAN justify and says why.
+        return Adoption(
+            cursor="review",
+            spec=spec_rel,
+            plan=plan_rel,
+            phases=phases,
+            manual=manual,
+            notes=(
+                f"could not determine the state of {pr_url} (offline, or the host "
+                "declined) — the cursor lands on `review`, the last row that is "
+                "observable without the network.",
+            ),
+        )
+    return Adoption(
+        cursor="review",
+        spec=spec_rel,
+        plan=plan_rel,
+        phases=phases,
+        manual=manual,
+        notes=(f"{pr_url} is {observed}, not open — the cursor lands on `review`.",),
+    )
+
+
+# --- building the run -----------------------------------------------------
+
+
+def _step_emitting(manifest: WorkflowManifest, artifact: str) -> str | None:
+    """The last step of the shape that declares `emits: [<artifact>]`."""
+    found: str | None = None
+    for step in manifest.steps:
+        if artifact in step.emits:
+            found = step.id
+    return found
+
+
+def _fan_out_step(manifest: WorkflowManifest) -> str | None:
+    for step in manifest.steps:
+        if step.for_each == "phase":
+            return step.id
+    return None
+
+
+def plan_phase_tags(repo_root: Path, plan_rel: str) -> dict[int, str]:
+    """Phase number -> `phase.tag` for the plan at repo-relative `plan_rel`.
+
+    The tag-aware source of "which phases exist" (#496, 2026-09-20 spec
+    §3.D.3). `for_each: phase` enumerates the **agentic** ones and records the
+    rest as `phase/<n>: manual`, so the fan-out needs the typed set, not bare
+    numbers — the narrowing that produced #496 was reading this plan for its
+    phase numbers and discarding the tag that was right there.
+
+    Raises `AdoptError` naming the path when the plan cannot be parsed
+    (fail-closed, like every other unreadable-artifact path in this package).
+    """
+    try:
+        plan = parse(repo_root / plan_rel)
+    except PlanSchemaError as e:
+        raise AdoptError(f"{plan_rel} is not a parseable plan: {e}") from e
+    return {p.phase.number: p.phase.tag for p in plan.phases}
+
+
+def plan_phase_numbers(repo_root: Path, plan_rel: str) -> list[int]:
+    """Sorted phase numbers of the plan at repo-relative `plan_rel` — every
+    phase, whatever its tag.
+
+    Delegates to `plan_phase_tags` so there is ONE plan-reading path behind
+    both questions. A caller that wants only the dispatchable phases filters
+    the tags itself rather than re-deriving the phase list; the plan on disk
+    is the one source of which phases exist, so a phase added mid-run is a
+    new item, not a silent skip.
+    """
+    return sorted(plan_phase_tags(repo_root, plan_rel))
+
+
+def _with_unit_states(record: StepRecord, states: dict[str, str]) -> StepRecord:
+    """`record` carrying `states` — a one-line seam so adoption names the
+    accessor layer once and phase 3 changes nothing here."""
+    return units.with_unit_states(record, dict(states))
+
+
+def build_run_state(
+    manifest: WorkflowManifest,
+    adoption: Adoption,
+    *,
+    run_id: str,
+    branch: str,
+    started: str,
+    journal: Sequence[JournalEntry] = (),
+    visual_phases: Collection[int] = (),
+    notes: list[str] | None = None,
+    prior: RunState | None = None,
+) -> RunState:
+    """An adopted `RunState`: the cursor, everything before it `done`, the
+    cursor and everything after it `pending`.
+
+    One rule, deliberately — a step is `done` iff the observed state proves the
+    run got past it. Marking the cursor step `running` would claim a dispatch
+    that never happened, and `fr run advance` would then refuse to dispatch it.
+
+    Artifacts are attached to the step the SHAPE says emits them (`spec` to
+    `brainstorm`, `plan` to `plan`, `pr` to `deliver` in the shipped fr-goal
+    manifest), so the recording matches what a real run of that shape would
+    have written. A shape with no such step still gets them, on the cursor
+    step: archival depends on `emitted.plan` existing SOMEWHERE in the file,
+    and losing it to a shape's authoring choice would strand the plan.
+    """
+    ids = [s.id for s in manifest.steps]
+    group_id = _fan_out_step(manifest)
+    group = next((s for s in manifest.steps if s.id == group_id), None)
+    grouped = group is not None and bool(group.steps)
+    cursor = adoption.cursor
+    if cursor == "review" and "review" not in ids and grouped:
+        # A grouped shape has no trailing `review` step — per-phase review
+        # lives INSIDE the fan-out. An all-complete plan would otherwise be
+        # unadoptable ("no step 'review'"), so the cursor lands on the group
+        # with the review members still pending; the next `advance` dispatches
+        # them. Fail soft, downward, per `infer_adoption`'s doctrine.
+        assert group is not None
+        cursor = group.id
+        adoption = replace(
+            adoption,
+            cursor=cursor,
+            notes=adoption.notes
+            + (
+                "every phase is implement-complete but the shape reviews "
+                f"per phase inside {cursor!r} — the cursor lands there with "
+                "the review members pending.",
+            ),
+        )
+    if cursor not in ids:
+        raise AdoptError(
+            f"workflow {manifest.workflow!r} has no step {cursor!r} — the "
+            f"observed state infers that cursor (steps: {', '.join(ids)}). A `unit: "
+            f"{manifest.unit}` shape is not a run-level shape; adopt against a "
+            f"`unit: run` shape such as {DEFAULT_WORKFLOW!r}."
+        )
+    cursor_index = ids.index(cursor)
+
+    emitted: dict[str, dict[str, str]] = {}
+    for artifact, value in (("spec", adoption.spec), ("plan", adoption.plan), ("pr", adoption.pr)):
+        if value is None:
+            continue
+        target = _step_emitting(manifest, artifact) or adoption.cursor
+        emitted.setdefault(target, {})[artifact] = value
+
+    items_step = (group_id or cursor) if adoption.phases else None
+    # #496 (spec §3.D.3): a manual phase is recorded as the flat
+    # `phase/<n>: manual`, never as a member item, because the fan-out will
+    # never dispatch it — `advance` writes exactly this, so a resumed run and
+    # a started one agree. Keyed on `tag` alone, never on completion: a
+    # ticked front-loaded manual phase waits on nobody (review `r4-f1`) but
+    # is still not work this run did, and `done` would claim a dispatch that
+    # never happened.
+    manual = {f"phase/{n}" for n in adoption.manual}
+    if grouped and adoption.phases:
+        # Adoption reconstructs implement progress, never review outcomes: a
+        # ticked-complete phase proves its implement member, so the items key
+        # on the FIRST member and the review members stay pending for the next
+        # `advance` to dispatch.
+        assert group is not None
+        first = group.steps[0].id
+        items_map = {
+            (key if key in manual else f"{key}/{first}"): (MANUAL_ITEM if key in manual else value)
+            for key, value in adoption.phases.items()
+        }
+    else:
+        items_map = {
+            key: (MANUAL_ITEM if key in manual else value) for key, value in adoption.phases.items()
+        }
+
+    # The unit states go on through `fr.run.units` rather than into a field:
+    # adoption is the FIRST writer of them (2026-08-30 §3.E — a half-implemented
+    # plan has to record WHICH phases are already done, or the cursor says
+    # `implement` and loses everything that made the adoption worth having), and
+    # it writes NO attempts, because fr never dispatched those phases. An empty
+    # history is the honest record of that; inventing an attempt to look uniform
+    # would be the fabrication spec §3 forbids.
+    steps = {
+        step.id: _with_unit_states(
+            StepRecord(
+                state="done" if index < cursor_index else "pending",
+                emitted=emitted.get(step.id) or None,
+                members=[m.id for m in step.steps] or None,
+            ),
+            items_map if step.id == items_step else {},
+        )
+        for index, step in enumerate(manifest.steps)
+    }
+    state = RunState(
+        # Born stamped with the version this fr writes — an adopted cursor is
+        # a new artifact, not an old one, so it must not arrive stale.
+        schema_version=current_run_schema_version(),
+        run=run_id,
+        workflow=f"{manifest.workflow}@{manifest.schema_version}",
+        branch=branch,
+        started=started,
+        cursor=adoption.cursor,
+        steps=steps,
+    )
+    if grouped and adoption.phases:
+        assert group is not None
+        state = _infer_historical_reviews(
+            state,
+            manifest,
+            group,
+            adoption,
+            journal=journal,
+            visual_phases=frozenset(visual_phases),
+            notes=notes,
+            prior=prior,
+        )
+    return state
+
+
+def _infer_historical_reviews(
+    state: RunState,
+    manifest: WorkflowManifest,
+    group: Step,
+    adoption: Adoption,
+    *,
+    journal: Sequence[JournalEntry],
+    visual_phases: frozenset[int],
+    notes: list[str] | None,
+    prior: RunState | None = None,
+) -> RunState:
+    """R8 (spec 2026-10-05-run-upgrade-midflight §D): a complete phase whose
+    plan journal holds a review satisfying the historical bound, with no
+    finding against it still open and none fixed without the operator, gets
+    its review member `done` as `{review, reviewer: historical, findings}`.
+    Every other phase's review member stays pending, and a note says why.
+    When that leaves every unit of the group done, the group is done and the
+    cursor moves to the step after it."""
+    review = next((m for m in group.steps if "review" in m.evidence), None)
+    if review is None:
+        return state
+    entries = list(journal)
+    unauthorized = set(unauthorized_fixes(entries))
+    record = state.steps[group.id]
+    said: list[str] = []
+    manual = set(adoption.manual)
+    # What clause 2 reads: the new cursor holds no attempts, so a superseded
+    # cursor's steps stand in for it.
+    seen = state.model_copy(update={"steps": {**state.steps, **(prior.steps if prior else {})}})
+    for item, value in adoption.phases.items():
+        n = int(item.removeprefix("phase/"))
+        if value != "done" or n in manual:
+            continue
+        candidates = [e for e in entries if reviews_phase(e, n)]
+        if not candidates:
+            said.append(f"no `kind=review` entry for phase {n} — its review stays pending.")
+            continue
+        if n in visual_phases:
+            said.append(f"phase {n} owes visual evidence — its review stays pending.")
+            continue
+        refusals = [
+            historical_review_refusal(
+                seen, n, e, owes_visual=False, review_key=f"{item}/{review.id}"
+            )
+            for e in reversed(candidates)
+        ]
+        chosen = next(
+            (e for e, r in zip(reversed(candidates), refusals, strict=True) if r is None), None
+        )
+        if chosen is None:
+            said.append(f"phase {n}'s review is not historical: {refusals[0]}.")
+            continue
+        states = phase_finding_states(entries, n)
+        still_open = [fid for fid, st in states.items() if st == "open"]
+        if still_open:
+            said.append(f"phase {n} has open findings: {', '.join(still_open)}.")
+            continue
+        unauth = [fid for fid in states if fid in unauthorized]
+        if unauth:
+            said.append(f"phase {n} has findings fixed without the operator: {', '.join(unauth)}.")
+            continue
+        key = f"{item}/{review.id}"
+        record = units.with_unit_state(record, key, "done")
+        record = units.with_evidence(
+            record,
+            key,
+            {
+                "review": chosen.id,
+                "reviewer": HISTORICAL_REVIEWER,
+                "findings": findings_witness(states),
+            },
+        )
+    steps = {**state.steps, group.id: record}
+    ids = [s.id for s in manifest.steps]
+    cursor = state.cursor
+    settled = all(
+        value == "done"
+        and (
+            int(item.removeprefix("phase/")) in manual
+            or all(units.unit_state(record, f"{item}/{m.id}") == "done" for m in group.steps)
+        )
+        for item, value in adoption.phases.items()
+    )
+    if cursor == group.id and settled and ids.index(cursor) + 1 < len(ids):
+        cursor = ids[ids.index(cursor) + 1]
+        steps[group.id] = record.model_copy(update={"state": "done"})
+        said.append(
+            f"every phase was reviewed before this cursor existed — the cursor lands on {cursor!r}."
+        )
+    if notes is not None:
+        notes.extend(said)
+    return state.model_copy(update={"steps": steps, "cursor": cursor})
+
+
+# --- carry-forward (spec 2026-10-05-run-upgrade-midflight §C) ----------------
+
+
+def open_holds(state: RunState) -> list[tuple[str, str, str | None, str | None]]:
+    """`(step id, unit key, agent, session)` of every attempt still open — the
+    holds `carry_forward` closes as `abandoned`, listed so the preview can name
+    whose work a supersede cuts off."""
+    found: list[tuple[str, str, str | None, str | None]] = []
+    for step_id, record in state.steps.items():
+        for key in units.unit_keys(record):
+            held = units.open_attempt(record, key)
+            if held is not None:
+                found.append((step_id, key, held.agent, held.session))
+    return found
+
+
+def _carry_unit(old: UnitRecord, fresh: UnitRecord | None, *, now: str) -> UnitRecord:
+    """One carried unit: the old attempts (an open one closed `abandoned`), the
+    old state when it was `done` (or `manual`), else the inference's, else
+    `pending`; the old evidence when the old unit was done (real evidence beats
+    an inferred historical one), else the inference's when it set any."""
+    attempts = tuple(
+        a.model_copy(update={"returned": now, "outcome": "abandoned"})
+        if a.returned is None and not a.synthesized
+        else a
+        for a in old.attempts
+    )
+    state: str | None
+    if old.state is None:
+        state = None
+    elif old.state in ("done", "manual"):
+        state = old.state
+    elif fresh is not None and fresh.state is not None:
+        state = fresh.state
+    else:
+        state = "pending"
+    if fresh is not None and fresh.state == "manual":
+        state = "manual"
+    keep_old = old.state == "done" or fresh is None or not fresh.evidence
+    evidence = old.evidence if keep_old and old.evidence else (fresh.evidence if fresh else None)
+    return UnitRecord.model_validate(
+        {
+            "state": state,
+            "attempts": [a.model_dump(exclude_none=True) for a in attempts],
+            "evidence": evidence,
+        }
+    )
+
+
+def _carried_key_exists(key: str, step_id: str, members: list[str] | None) -> bool:
+    """Is `key` a unit the current shape still has under `step_id`?"""
+    parts = key.split("/")
+    if parts[0] == "step":
+        return key == f"step/{step_id}"
+    if parts[0] != "phase" or len(parts) < 2 or not parts[1].isdigit():
+        return False
+    if len(parts) == 2:
+        return True
+    return members is not None and "/".join(parts[2:]) in members
+
+
+def carry_forward(old: RunState, new: RunState, *, now: str) -> RunState:
+    """`new` with every fact of `old` that is still meaningful in `new`'s shape
+    merged in (R6): gate clearance and who answered it, emitted keys `new` lacks,
+    EVERY unit whose step and member `new` still has (with attempts and evidence),
+    `driver`, and the `at` of a step both call `done`. Pure.
+
+    An open attempt arrives with `returned=now` and `outcome=abandoned` — what
+    `fr run claim --abandoned` writes — so the result holds nothing and `advance`
+    can re-brief. Steps and members `new` no longer has are dropped."""
+    steps: dict[str, StepRecord] = {}
+    for step_id, fresh in new.steps.items():
+        prior = old.steps.get(step_id)
+        if prior is None:
+            steps[step_id] = fresh
+            continue
+        update: dict[str, object] = {}
+        if prior.gate is not None:
+            update["gate"] = prior.gate
+        if prior.answered_by is not None:
+            update["answered_by"] = prior.answered_by
+        if prior.emitted:
+            update["emitted"] = {**prior.emitted, **(fresh.emitted or {})}
+        if prior.state == "done" and fresh.state == "done" and prior.at is not None:
+            update["at"] = prior.at
+        record = fresh.model_copy(update=update)
+        for key in units.unit_keys(prior):
+            unit = units.unit_record(prior, key)
+            if unit is None or not _carried_key_exists(key, step_id, fresh.members):
+                continue
+            record = units.with_unit_record(
+                record, key, _carry_unit(unit, units.unit_record(fresh, key), now=now)
+            )
+        steps[step_id] = record
+    return new.model_copy(update={"steps": steps, "driver": old.driver or new.driver})
+
+
+def _rel(repo_root: Path, path: Path) -> str:
+    try:
+        return path.resolve().relative_to(repo_root.resolve()).as_posix()
+    except ValueError as e:
+        raise AdoptError(f"{path} is not inside the repo at {repo_root}") from e
+
+
+ARCHIVE_SEGMENT = "implemented"
+
+
+def _check_live_plan_location(repo_root: Path, target: Path) -> None:
+    """The plan must be a LIVE plan of THIS repo (review r5-e4).
+
+    `_rel` already refuses a target outside the repo, which covers traversal.
+    Two more shapes need saying out loud:
+
+    - a directory that merely happens to hold a `_meta.yaml` (a scratch copy, a
+      vendored tree) — adoption would write a run about a plan `fr archive`,
+      `fr apply` and the bridge will never see, because none of them look
+      outside `docs/superpowers/plans/`;
+    - an **archived** plan under `implemented/` — archived work is not in
+      flight, `implemented/` is frozen (2026-08-30 spec §2), and a cursor over
+      completed work is exactly the noise §3.E says adoption must not create.
+    """
+    rel = Path(_rel(repo_root, target))
+    if ARCHIVE_SEGMENT in rel.parts:
+        raise AdoptError(
+            f"{rel} is an archived plan — adoption gives a cursor to work in flight, "
+            "and archived plans are frozen (they record what shipped)"
+        )
+    if rel.parent != PLANS_REL:
+        raise AdoptError(
+            f"{rel} is not a plan of this repo: a plan folder lives directly under "
+            f"{PLANS_REL.as_posix()}/"
+        )
+
+
+def _observe(repo_root: Path, target: Path) -> tuple[Plan | None, str | None, str | None]:
+    """`(plan, spec_rel, plan_rel)` for an adoption target.
+
+    The target is a **plan dir** in the normal case. A **spec file** is also
+    accepted, because the table's first row — "spec only" — is a state in
+    which no plan dir exists to point at; refusing it would make the row
+    unreachable through the command that implements the table.
+    """
+    if target.is_dir() and (target / "_meta.yaml").is_file():
+        _check_live_plan_location(repo_root, target)
+        try:
+            plan = parse(target)
+        except PlanSchemaError as e:
+            raise AdoptError(f"{target} is not a parseable plan: {e}") from e
+        return plan, plan.spec_path, _rel(repo_root, target)
+    if target.is_file() and target.suffix == ".md":
+        return None, _rel(repo_root, target), None
+    raise AdoptError(
+        f"{target} is neither a plan folder (a directory with _meta.yaml) nor a spec "
+        "markdown file — `fr run adopt` reconstructs a cursor from artifacts that "
+        "already exist"
+    )
+
+
+def current_branch(repo_root: Path) -> str | None:
+    """The checked-out branch, or `None` (detached HEAD, not a repo, no git)."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return out if out and out != "HEAD" else None
+
+
+def default_pr_state(repo_root: Path) -> PrStateFn:
+    """PR state via the host adapter, not a `gh` subprocess.
+
+    `GhClient.pr_status_by_url` exists for exactly this question and is
+    implemented for GitHub, GitLab and Gitea, so adoption inherits multi-backend
+    support instead of hardcoding one host's CLI. It already fails soft
+    (`None` on any not-found/error condition); this keeps that contract by
+    swallowing transport failures too — an adoption must not die because the
+    network is down, it must fall back to the row it can justify.
+    """
+
+    def observe(url: str) -> str | None:
+        try:
+            from fr.hostclient import client_for
+
+            info = client_for(repo_root).pr_status_by_url(url)
+        except Exception:
+            return None
+        if not info:
+            return None
+        state = info.get("state")
+        return state if isinstance(state, str) else None
+
+    return observe
+
+
+_PR_URL_RE = re.compile(
+    r"^https?://[^/]+/(?P<repo>.+?)(?:/-)?/(?:pull|pulls|merge_requests)/\d+/?$"
+)
+"""`<host>/<owner>/<name>/{pull,pulls,-/merge_requests}/<n>` — the three PR-URL
+shapes `fr.hostclient` already speaks (2026-07-09 multi-backend spec). GitLab
+subgroups make `<repo>` more than two segments, hence the non-greedy `.+?`."""
+
+
+def _pr_repo(pr_url: str) -> str | None:
+    """The `owner/name` a PR URL names, or `None` when it is unreadable."""
+    m = _PR_URL_RE.match(pr_url.strip())
+    return m.group("repo") if m else None
+
+
+def _check_pr_repo(pr_url: str, target_repo: str) -> None:
+    """`--pr` must name a PR in the plan's own repo (review r5-e4).
+
+    "This PR delivers this plan" is what the flag asserts. A PR in another
+    repo does not, and recording it lands the cursor on `deliver` pointing at
+    somebody else's work — a wrong answer that looks like a right one. A URL
+    this parser cannot read at all is left alone: `infer_adoption` already
+    degrades unreadable PR state to `review` with a note, which is the
+    conservative direction.
+    """
+    pr_repo = _pr_repo(pr_url)
+    if pr_repo is None:
+        return
+    if pr_repo != target_repo:
+        raise AdoptError(
+            f"--pr names a PR in {pr_repo!r}, but this plan targets {target_repo!r}. "
+            "A run's PR is the one delivering ITS plan."
+        )
+
+
+def adopt_run(
+    repo_root: Path,
+    target: Path,
+    *,
+    branch: str | None = None,
+    run_id: str | None = None,
+    workflow: str | None = None,
+    pr_url: str | None = None,
+    pr_state: PrStateFn | None = None,
+    shipped_root: Path | None = None,
+    notes: list[str] | None = None,
+    supersede: bool = False,
+    dry_run: bool = False,
+    superseded: Superseded | None = None,
+) -> RunState:
+    """Reconstruct and save a run cursor for `target`. Returns the saved state.
+
+    `supersede` (spec 2026-10-05-run-upgrade-midflight §C) replaces the plan's
+    existing run: the old cursor is parsed and carried forward
+    (`carry_forward`), its file removed, its usage file moved to the new id. With
+    no existing run it is a plain adopt. `dry_run` previews that replacement —
+    nothing is written — and is ignored when there is nothing to replace.
+    `superseded` is the outparam describing it.
+
+    The run file is written beside the artifacts it describes — in
+    `repo_root`, never through `ensure_run_workspace`. `fr run start` enters
+    isolation because a run being *born* has no workspace yet; an adopted run
+    describes work already under way, so its workspace is wherever those
+    artifacts are. Provisioning a worktree (or starting a container) as a side
+    effect of adopting would be the reverse of the §4.B rule it looks like:
+    the run belongs with its plan, and the plan is here.
+
+    `notes` is an outparam (the `failures` shape `fr_dispatch.discover_plans`
+    already uses): the inference's own explanations of what it could not
+    observe, appended in order, for the caller to print. They are not part of
+    the run file — a run file records where the cursor is, not why.
+    """
+    plan, spec_rel, plan_rel = _observe(repo_root, target)
+
+    resolved_branch = branch or current_branch(repo_root)
+    if not resolved_branch:
+        raise AdoptError(
+            "could not determine the branch to adopt onto (detached HEAD, or not a git "
+            "checkout) — pass --branch <b>"
+        )
+
+    name = workflow or DEFAULT_WORKFLOW
+    try:
+        manifest = resolve_workflow(name, repo_root, shipped_root=shipped_root)
+    except WorkflowError as e:
+        raise AdoptError(str(e)) from e
+
+    old_id: str | None = None
+    old_state: RunState | None = None
+    if plan_rel is not None:
+        # IDEMPOTENT (review r5-e4). A plan that already has a run has a
+        # cursor; minting a second splits the control log in two, and
+        # `fr archive` moves only the one it finds. Matched by `emitted.plan`,
+        # the same data `fr archive` keys on — never by a name convention.
+        from fr.archive import find_run_for_plan
+
+        existing = find_run_for_plan(repo_root, Path(plan_rel))
+        if existing is not None:
+            if not supersede:
+                raise AdoptError(
+                    f"{plan_rel} already has a run: {existing}. Inspect it with "
+                    f"`fr run status {existing}`, move it onto the current shape with "
+                    f"`fr run reshape {existing}`, or replace it with "
+                    f"`fr run adopt {plan_rel} --supersede` (carries its gate answers, "
+                    "units and evidence forward)."
+                )
+            old_id = existing
+            old_state = _owning_old_cursor(repo_root, existing, plan_rel)
+            _refuse_live_step_records(repo_root, existing)
+
+    if pr_url is not None and plan is not None:
+        _check_pr_repo(pr_url, plan.meta.target_repo)
+
+    adoption = infer_adoption(
+        plan=plan,
+        spec_rel=spec_rel,
+        plan_rel=plan_rel,
+        pr_url=pr_url,
+        pr_state=pr_state if pr_state is not None else default_pr_state(repo_root),
+    )
+
+    # Imported here, not at module scope: `fr.commands.run_cmd` imports this
+    # module for the `fr run adopt` command, so a top-level import is a cycle.
+    # Same seam-not-copy reasoning as `fr.run.workspace._select_target` — the
+    # run-id derivation must stay identical to `fr run start`'s.
+    from fr.commands.run_cmd import derive_run_id
+
+    try:
+        # Same gate `fr run start` applies (review r5-b1): `--run-id` is
+        # operator input and becomes a path segment. `derive_run_id`'s output
+        # always passes, so this only fires on an explicit override.
+        rid = validate_run_id(run_id) if run_id else derive_run_id(resolved_branch)
+    except RunStateError as e:
+        raise AdoptError(str(e)) from e
+    path = run_path(repo_root, rid)
+    # The same-day case: the derived path IS the old cursor's, and overwriting
+    # it is the point. Any OTHER existing path still refuses.
+    if path.exists() and not (old_id is not None and rid == old_id):
+        raise AdoptError(
+            f"run {rid!r} already exists at {path} — adoption reconstructs a cursor for "
+            "work that has none; use `fr run status` to see the one that exists"
+        )
+
+    if notes is not None:
+        notes.extend(adoption.notes)
+
+    journal, visual_phases = _review_inputs(repo_root, plan_rel, adoption, notes)
+    started = _dt.datetime.now(_dt.UTC).replace(microsecond=0).isoformat()
+    state = build_run_state(
+        manifest,
+        adoption,
+        run_id=rid,
+        branch=resolved_branch,
+        started=started,
+        journal=journal,
+        visual_phases=visual_phases,
+        notes=notes,
+        prior=old_state,
+    )
+    if old_id is None or old_state is None:
+        save_run_state(repo_root, state)
+        return state
+
+    # The carried units are applied AFTER inference (§D): a review the old
+    # cursor resolved keeps its real evidence over an inferred historical one.
+    state = carry_forward(old_state, state, now=started)
+    effects = superseded if superseded is not None else Superseded(old=old_id)
+    effects.old = old_id
+    effects.holds = open_holds(old_state)
+    moved = _usage_move(repo_root, old_id, rid)
+    if dry_run:
+        return state
+    save_run_state(repo_root, state)
+    effects.written_new = True
+    if old_id != rid:
+        run_path(repo_root, old_id).unlink()
+        effects.removed.append(run_path(repo_root, old_id))
+    if moved is not None:
+        src, dst = moved
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
+        effects.removed.append(src)
+        effects.written.append(dst)
+    return state
+
+
+def _readable_old_cursor(repo_root: Path, run_id: str) -> RunState:
+    """The run `--supersede` replaces, parsed with the CURRENT model. One fr
+    cannot read refuses: carrying forward from a file it cannot read would be a
+    guess, and `fr migrate artifacts --yes` is the fix."""
+    try:
+        return load_run_state(repo_root, run_id)
+    except RunStateError as e:
+        raise AdoptError(
+            f"run {run_id!r} was written for a different fr and cannot be read by this "
+            f"one ({e}) — carrying its facts forward would be a guess. Run "
+            "`fr migrate artifacts --yes` first, then retry."
+        ) from e
+
+
+def _owning_old_cursor(repo_root: Path, run_id: str, plan_rel: str) -> RunState:
+    """The cursor `--supersede` replaces — and proof that the file it will read,
+    carry from and DELETE is the one that names this plan (reviews p3-r1, p3-r2).
+
+    `find_run_for_plan` returns the `run:` string from inside the matching file,
+    not that file's name. Used as a path segment unchecked, a crafted `run:
+    ../…` steers the read, the unlink and the usage rename outside `runs/`; and a
+    file whose name disagrees with its `run:` sends all three to a DIFFERENT
+    run's file. So: the id must be a valid run id, and `runs/<id>.yaml` must
+    itself record this plan — otherwise refuse, touching nothing."""
+    try:
+        validate_run_id(run_id)
+    except RunStateError as e:
+        raise AdoptError(
+            f"the run file that names {plan_rel} records an invalid run id {run_id!r} "
+            f"({e}) — fr will not build a path from it. Inspect docs/superpowers/runs/ "
+            "by hand."
+        ) from e
+    mismatch = AdoptError(
+        f"a run file names {plan_rel} with `run: {run_id}`, but "
+        f"{run_path(repo_root, run_id).relative_to(repo_root)} is not that cursor — "
+        "a run file whose name disagrees with its `run:` field. Superseding would "
+        "read and delete the wrong file; rename the file to match its `run:` first."
+    )
+    if not run_path(repo_root, run_id).is_file():
+        raise mismatch
+    state = _readable_old_cursor(repo_root, run_id)
+    owns = any(
+        (record.emitted or {}).get("plan", "").rstrip("/") == plan_rel.rstrip("/")
+        for record in state.steps.values()
+    )
+    if state.run != run_id or not owns:
+        raise mismatch
+    return state
+
+
+def _refuse_live_step_records(repo_root: Path, run_id: str) -> None:
+    """A step record under `<old>.records/` is work in hand whose `run:` names the
+    old id. `pr-body.md` is a rendering, not a record."""
+    from fr.record.model import records_dir
+
+    folder = records_dir(repo_root, run_id)
+    if not folder.is_dir():
+        return
+    live = sorted(p.name for p in folder.iterdir() if p.is_file() and p.name != "pr-body.md")
+    if live:
+        raise AdoptError(
+            f"run {run_id!r} has a live step record ({', '.join(live)} under "
+            f"{folder.relative_to(repo_root).as_posix()}/) — work in hand that names it. "
+            "Resolve it (`fr run resolve --record`) or delete it, then retry."
+        )
+
+
+def _usage_move(repo_root: Path, old_id: str, new_id: str) -> tuple[Path, Path] | None:
+    """`(old usage file, new usage file)` when the old run has one that must move
+    to the new id; refuses (before anything is written) when the destination
+    already exists."""
+    from fr.usage.file import usage_path
+
+    if old_id == new_id:
+        return None
+    src, dst = usage_path(repo_root, old_id), usage_path(repo_root, new_id)
+    if not src.is_file():
+        return None
+    if dst.exists():
+        raise AdoptError(
+            f"{dst} already exists — the usage file of run {old_id!r} cannot move onto it. "
+            "Pick another --run-id, or remove that file."
+        )
+    return src, dst
+
+
+def _review_inputs(
+    repo_root: Path, plan_rel: str | None, adoption: Adoption, notes: list[str] | None
+) -> tuple[list[JournalEntry], frozenset[int]]:
+    """What R8's inference reads from disk: the plan journal's entries (the
+    reader the resolve-time evidence gate uses) and the complete phases that
+    owe `visual` evidence. Fail-soft and downward: an unreadable journal infers
+    no review, an unreadable matrix or plan counts the phase as owing visual."""
+    if plan_rel is None:
+        return [], frozenset()
+    from fr.run.visual import VisualRefusedError, owed_for_unit
+
+    entries: list[JournalEntry] = []
+    path = resolve_journal_read_path(repo_root, "plan", Path(plan_rel).name)
+    if path.is_file():
+        try:
+            entries = parse_journal(path.read_text())
+        except (JournalParseError, OSError) as e:
+            if notes is not None:
+                notes.append(f"the plan journal {path} is unreadable ({e}) — no review inferred.")
+    visual: set[int] = set()
+    for item, value in adoption.phases.items():
+        n = int(item.removeprefix("phase/"))
+        if value != "done":
+            continue
+        try:
+            if owed_for_unit(repo_root, plan_rel=plan_rel, phase=n, spec_rel=None):
+                visual.add(n)
+        except VisualRefusedError:
+            visual.add(n)
+    return entries, frozenset(visual)
+
+
+# --- what the migration offers -------------------------------------------
+
+
+def adoptable_plans(repo_root: Path) -> tuple[Path, ...]:
+    """Live plan dirs that are in flight and have no run — the offer set.
+
+    Excluded, each for its own reason:
+
+    - **Complete plans.** Spec §3.E: "A plan whose work is finished gets no
+      run — a cursor over completed work is noise." Completeness is
+      `plan_locally_complete` over every phase, the same offline definition
+      `completed_unarchived_plans` uses.
+    - **Plans that already have a run**, found by `emitted.plan` rather than by
+      slug (`fr.archive.find_run_for_plan`).
+    - **Unparseable plans.** A malformed or version-excluded plan is a
+      different problem, and must not wedge a migration that is otherwise fine.
+    - **Archived plans**, structurally: only `docs/superpowers/plans/` is
+      walked.
+    """
+    from fr.archive import find_run_for_plan
+
+    plans_dir = repo_root / PLANS_REL
+    if not plans_dir.is_dir():
+        return ()
+
+    offers: list[Path] = []
+    for plan_dir in sorted(plans_dir.iterdir()):
+        if not (plan_dir / "_meta.yaml").is_file():
+            continue
+        try:
+            plan = parse(plan_dir)
+        except PlanSchemaError:
+            continue
+        if plan.phases and all(plan_locally_complete(p) for p in plan.phases):
+            continue
+        if find_run_for_plan(repo_root, PLANS_REL / plan_dir.name) is not None:
+            continue
+        offers.append(plan_dir)
+    return tuple(offers)
+
+
+def adoption_offer_lines(repo_root: Path) -> tuple[str, ...]:
+    """The offer, as text. Reports; never adopts (spec §3.E: "offered, not
+    forced"). Shared by the CLI-entry gate and `fr migrate artifacts` so the
+    two cannot describe the same situation differently."""
+    try:
+        plans = adoptable_plans(repo_root)
+    except Exception:  # pragma: no cover — a broken tree must not wedge a command
+        return ()
+    if not plans:
+        return ()
+    lines = [
+        f"  {len(plans)} in-flight plan(s) have no run cursor. Adoption is offered, not forced:"
+    ]
+    lines.extend(f"    fr run adopt {(PLANS_REL / p.name).as_posix()}" for p in plans)
+    return tuple(lines)

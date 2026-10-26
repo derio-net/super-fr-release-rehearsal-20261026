@@ -1,0 +1,796 @@
+"""The evidence gate — a `review` unit cannot reach `done` without proof.
+
+Spec `2026-09-20-unit-record-unification-design.md` §4.E, phase 5. The defect
+this closes is gh#430: `review-phase` is a `kind: agent` step, so an agent that
+skipped the review entirely resolved it *identically* to one that did the work.
+"Review skipped" and "review passed clean" were the same state on the cursor.
+
+After this, they are different states: `done` WITH evidence, versus a unit that
+cannot reach `done` at all.
+
+The rule the gate applies is gh#517's own (`fr.journal.model.reviews_phase`,
+which `reviewed_phases` is built from) — a `kind=review` entry carrying
+`phase=N`. Two gates (`fr journal check --require-reviews` for plans with no
+cursor, `fr run resolve` for those with one), ONE rule, ONE verifier: any other
+arrangement means a finding, or another phase's review, satisfies one gate and
+not the other.
+
+Three invariants this file exists to hold:
+
+1. **A shape declaring no `evidence:` resolves exactly as before** — the gate
+   is opt-in per step, so a consumer repo's own workflow is untouched.
+2. **Reviews from before the gate are debt, never failures.** The migration
+   cannot invent evidence and does not try; `fr run check` reports them and its
+   EXIT CODE IS UNCHANGED (asserted literally, both ways).
+3. **Manifest drift does not trip on a new FIELD.** Drift compares step and
+   member IDS. A cursor in flight when the shipped shape grows `evidence:` must
+   keep advancing — this branch already lost a cursor to drift once, when a
+   whole new STEP was added, and a field must not repeat it.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from fr.run import units
+from fr.run.model import load_run_state
+from fr.test_support import build_plan_journal
+
+from tests.unit.test_run_cli import (
+    _invoke,
+    _repo,
+    _squash,
+    _started_grouped_with_plan,
+    _write_shape,
+)
+
+PLAN_SLUG = "2026-05-09-fixture-minimal"
+
+
+def _shape(*, evidence: bool, deliver: str = "true") -> str:
+    """The grouped shape of `test_run_cli.py`, with or without an `evidence:`
+    declaration on its review member — the SAME step and member ids either
+    way, so the pair is exactly "one optional field appeared"."""
+    review_extra = "        evidence: [review]\n" if evidence else ""
+    return f"""
+workflow: grouped
+schema: 1
+unit: run
+steps:
+  - id: plan
+    kind: agent
+    emits: [plan]
+  - id: implement
+    kind: agent
+    needs: [plan]
+    for_each: phase
+    emits: [journal:plan]
+    steps:
+      - id: code
+        kind: agent
+        needs: [plan]
+        emits: [journal:plan]
+      - id: peer-review
+        kind: agent
+        needs: [journal:plan]
+        emits: [journal:plan]
+{review_extra}  - id: deliver
+    kind: cli
+    run: "{deliver}"
+    needs: [journal:plan]
+"""
+
+
+def _journal(repo: Path) -> Path:
+    """A plan journal carrying one real review of phase 1, one review of
+    phase 2, and one finding tagged phase 1 — the three shapes the verifier
+    has to tell apart."""
+    return build_plan_journal(
+        repo,
+        PLAN_SLUG,
+        [
+            {"kind": "review", "id": "rev-p1", "phase": 1, "title": "phase 1 review"},
+            {"kind": "review", "id": "rev-p2", "phase": 2, "title": "phase 2 review"},
+            {
+                "kind": "finding",
+                "id": "f-p1",
+                "phase": 1,
+                "state": "open",
+                "title": "a finding raised during phase 1",
+            },
+        ],
+    )
+
+
+def _at_the_review(tmp_path: Path, *, evidence: bool, deliver: str = "true") -> tuple[Path, Path]:
+    """A run parked with `phase/1/peer-review` dispatched and running."""
+    repo = _repo(tmp_path)
+    shipped = tmp_path / "shipped"
+    _write_shape(shipped, "grouped", _shape(evidence=evidence, deliver=deliver))
+    _started_grouped_with_plan(repo, shipped)
+    _journal(repo)
+    assert _invoke(repo, shipped, ["run", "advance", "r1"]).exit_code == 0  # code
+    assert (
+        _invoke(
+            repo,
+            shipped,
+            ["run", "resolve", "r1", "--step", "code", "--item", "phase/1", "--state", "done"],
+        ).exit_code
+        == 0
+    )
+    assert _invoke(repo, shipped, ["run", "advance", "r1"]).exit_code == 0  # peer-review
+    return repo, shipped
+
+
+def _resolve_review(repo: Path, shipped: Path, *extra: str, state: str = "done"):
+    return _invoke(
+        repo,
+        shipped,
+        [
+            "run",
+            "resolve",
+            "r1",
+            "--step",
+            "peer-review",
+            "--item",
+            "phase/1",
+            "--state",
+            state,
+            *extra,
+        ],
+    )
+
+
+def _review_unit(repo: Path):
+    record = load_run_state(repo, "r1").steps["implement"]
+    return record, "phase/1/peer-review"
+
+
+# --- the field itself ------------------------------------------------------
+
+
+def test_step_evidence_parses_and_defaults_to_empty() -> None:
+    from fr.workflow.model import parse_manifest
+
+    manifest = parse_manifest(_shape(evidence=True))
+    implement = next(s for s in manifest.steps if s.id == "implement")
+    review = next(m for m in implement.steps if m.id == "peer-review")
+    code = next(m for m in implement.steps if m.id == "code")
+    assert review.evidence == ("review",)
+    assert code.evidence == ()
+    assert implement.evidence == ()
+
+
+# --- `workflow-without-evidence-unchanged` ---------------------------------
+
+
+def test_a_shape_declaring_no_evidence_resolves_exactly_as_before(tmp_path: Path) -> None:
+    """The gate is opt-in per step. A repo-authored workflow that never asks
+    for evidence must not acquire a new refusal — so the bare resolve that
+    worked before this phase still works, and records no evidence."""
+    repo, shipped = _at_the_review(tmp_path, evidence=False)
+
+    result = _resolve_review(repo, shipped)
+
+    assert result.exit_code == 0, result.output
+    record, key = _review_unit(repo)
+    assert units.unit_state(record, key) == "done"
+    assert units.evidence_of(record, key) == {}
+
+
+def test_evidence_offered_to_a_step_that_declares_none_is_refused(tmp_path: Path) -> None:
+    """Symmetric with `--emitted` on a non-emitting step: recorded silently,
+    it would read as a verified obligation the shape never asked for."""
+    repo, shipped = _at_the_review(tmp_path, evidence=False)
+
+    result = _resolve_review(repo, shipped, "--evidence", "review=rev-p1")
+
+    assert result.exit_code == 2, result.output
+    assert "declares no evidence" in _squash(result.output)
+
+
+# --- `run-unit-review-evidence` --------------------------------------------
+
+
+def test_resolve_done_refuses_without_evidence_and_names_the_flag(tmp_path: Path) -> None:
+    """gh#430, closed: the skipped review can no longer reach `done`."""
+    repo, shipped = _at_the_review(tmp_path, evidence=True)
+
+    result = _resolve_review(repo, shipped)
+
+    assert result.exit_code == 2, result.output
+    squashed = _squash(result.output)
+    assert "--evidence review=<journal-entry-id>" in squashed
+    # And it wrote NOTHING: the unit is still running, not half-resolved.
+    record, key = _review_unit(repo)
+    assert units.unit_state(record, key) == "running"
+
+
+def test_a_real_review_is_accepted_and_stored_on_the_unit(tmp_path: Path) -> None:
+    repo, shipped = _at_the_review(tmp_path, evidence=True)
+
+    result = _resolve_review(repo, shipped, "--evidence", "review=rev-p1")
+
+    assert result.exit_code == 0, result.output
+    record, key = _review_unit(repo)
+    assert units.unit_state(record, key) == "done"
+    assert units.evidence_of(record, key) == {"review": "rev-p1"}
+
+
+def test_failed_needs_no_evidence(tmp_path: Path) -> None:
+    """A failed review unit met no obligation — there is nothing to evidence."""
+    repo, shipped = _at_the_review(tmp_path, evidence=True)
+
+    result = _resolve_review(repo, shipped, state="failed")
+
+    assert result.exit_code == 0, result.output
+    record, key = _review_unit(repo)
+    assert units.unit_state(record, key) == "failed"
+    assert units.evidence_of(record, key) == {}
+
+
+# --- `run-review-evidence-cannot-be-faked` ---------------------------------
+
+
+def test_a_finding_entry_is_not_evidence_of_a_review(tmp_path: Path) -> None:
+    """`f-p1` carries `phase=1` and was written during phase 1. It is still
+    not a review — the same narrowing `reviewed_phases` already applies."""
+    repo, shipped = _at_the_review(tmp_path, evidence=True)
+
+    result = _resolve_review(repo, shipped, "--evidence", "review=f-p1")
+
+    assert result.exit_code == 2, result.output
+    squashed = _squash(result.output)
+    assert "f-p1" in squashed
+    assert "kind=review" in squashed
+    record, key = _review_unit(repo)
+    assert units.unit_state(record, key) == "running"
+
+
+def test_another_phases_review_is_not_evidence(tmp_path: Path) -> None:
+    """Otherwise ONE review would satisfy every phase a plan ever grows —
+    the exact hole `--require-reviews` exists to close."""
+    repo, shipped = _at_the_review(tmp_path, evidence=True)
+
+    result = _resolve_review(repo, shipped, "--evidence", "review=rev-p2")
+
+    assert result.exit_code == 2, result.output
+    assert "rev-p2" in _squash(result.output)
+
+
+def test_an_id_no_journal_entry_carries_is_refused_naming_the_journal(tmp_path: Path) -> None:
+    repo, shipped = _at_the_review(tmp_path, evidence=True)
+
+    result = _resolve_review(repo, shipped, "--evidence", "review=no-such-entry")
+
+    assert result.exit_code == 2, result.output
+    squashed = _squash(result.output)
+    assert "no-such-entry" in squashed
+    assert PLAN_SLUG in squashed
+
+
+def test_an_obligation_the_step_never_declared_is_refused(tmp_path: Path) -> None:
+    repo, shipped = _at_the_review(tmp_path, evidence=True)
+
+    result = _resolve_review(
+        repo, shipped, "--evidence", "review=rev-p1", "--evidence", "vibes=rev-p1"
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "vibes" in _squash(result.output)
+
+
+@pytest.mark.parametrize("pair", ["review", "=rev-p1", "review="])
+def test_a_malformed_evidence_pair_is_refused(tmp_path: Path, pair: str) -> None:
+    repo, shipped = _at_the_review(tmp_path, evidence=True)
+
+    result = _resolve_review(repo, shipped, "--evidence", pair)
+
+    assert result.exit_code == 2, result.output
+    assert "--evidence" in _squash(result.output)
+
+
+def test_the_same_obligation_given_twice_is_refused(tmp_path: Path) -> None:
+    repo, shipped = _at_the_review(tmp_path, evidence=True)
+
+    result = _resolve_review(
+        repo, shipped, "--evidence", "review=rev-p1", "--evidence", "review=rev-p2"
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "twice" in _squash(result.output)
+
+
+def test_a_flat_step_declaring_evidence_is_refused_rather_than_recorded(tmp_path: Path) -> None:
+    """Fail-closed. `review` evidence is verified against a PHASE, and a flat
+    `step/<id>` unit names none — so fr says it cannot verify rather than
+    storing an id nothing checked."""
+    repo = _repo(tmp_path)
+    shipped = tmp_path / "shipped"
+    _write_shape(
+        shipped,
+        "flat",
+        """
+workflow: flat
+schema: 1
+unit: spec
+steps:
+  - id: audit
+    kind: agent
+    needs: [spec]
+    evidence: [review]
+""",
+    )
+    _invoke(repo, shipped, ["run", "start", "flat", "--branch", "b", "--run-id", "r1"])
+    _invoke(repo, shipped, ["run", "advance", "r1"])
+
+    result = _invoke(repo, shipped, ["run", "resolve", "r1", "--step", "audit", "--state", "done"])
+
+    assert result.exit_code == 2, result.output
+    assert "cannot verify" in _squash(result.output)
+
+
+# --- manifest drift: a FIELD is not a step ---------------------------------
+
+
+def test_adding_evidence_to_a_member_does_not_strand_an_in_flight_cursor(
+    tmp_path: Path,
+) -> None:
+    """The hazard this phase had to prove it avoids.
+
+    Drift compares step and member IDS, not fields. A run started against the
+    shape WITHOUT `evidence:` keeps advancing after the shipped shape grows it
+    — and the very next review it resolves DOES need evidence, which is spec
+    §4.I's "reviews still to come in that same run do need evidence".
+    """
+    repo, shipped = _at_the_review(tmp_path, evidence=False)
+
+    # The plugin updates underneath the run: same ids, one new field.
+    _write_shape(shipped, "grouped", _shape(evidence=True))
+
+    bare = _resolve_review(repo, shipped)
+    assert bare.exit_code == 2, bare.output
+    squashed = _squash(bare.output)
+    assert "different version" not in squashed  # NOT a drift refusal
+    assert "--evidence review=<journal-entry-id>" in squashed
+
+    evidenced = _resolve_review(repo, shipped, "--evidence", "review=rev-p1")
+    assert evidenced.exit_code == 0, evidenced.output
+    record, key = _review_unit(repo)
+    assert units.evidence_of(record, key) == {"review": "rev-p1"}
+
+
+# --- `run-legacy-reviews-not-retro-failed` ---------------------------------
+
+
+def _pre_gate_cursor(tmp_path: Path, *, deliver: str = "true") -> tuple[Path, Path]:
+    """A cursor whose review unit reached `done` BEFORE the gate existed —
+    built the only honest way, by resolving it against the shape that had no
+    `evidence:` and then updating the shape underneath it."""
+    repo, shipped = _at_the_review(tmp_path, evidence=False, deliver=deliver)
+    assert _resolve_review(repo, shipped).exit_code == 0
+    _write_shape(shipped, "grouped", _shape(evidence=True, deliver=deliver))
+    return repo, shipped
+
+
+def test_a_pre_gate_review_is_reported_as_debt_and_check_still_exits_zero(
+    tmp_path: Path,
+) -> None:
+    repo, shipped = _pre_gate_cursor(tmp_path)
+
+    result = _invoke(repo, shipped, ["run", "check", "r1"])
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "implement: phase/1/peer-review is done, unevidenced (predates the evidence gate)"
+        in _squash(result.output)
+    )
+
+
+def test_the_check_exit_code_is_unchanged_by_unevidenced_units(tmp_path: Path) -> None:
+    """Asserted as a literal, both ways: `check` is a narrow freshness gate,
+    and debt must not move its verdict in either direction. A failed cursor
+    still exits 1 while carrying the same unevidenced line."""
+    # `deliver` fails, so the cursor sits on a failed step while the
+    # unevidenced review is still on the record.
+    repo, shipped = _pre_gate_cursor(tmp_path, deliver="false")
+    assert _invoke(repo, shipped, ["run", "advance", "r1"]).exit_code == 1
+
+    result = _invoke(repo, shipped, ["run", "check", "r1"])
+
+    assert result.exit_code == 1, result.output
+    assert "unevidenced (predates the evidence gate)" in _squash(result.output)
+
+
+def test_status_shows_the_debt_and_the_evidence(tmp_path: Path) -> None:
+    repo, shipped = _pre_gate_cursor(tmp_path)
+
+    debt = _invoke(repo, shipped, ["run", "status", "r1"])
+    assert debt.exit_code == 0, debt.output
+    assert "unevidenced (predates the evidence gate)" in _squash(debt.output)
+
+    # And a unit that DOES carry evidence names it.
+    repo2, shipped2 = _at_the_review(tmp_path / "second", evidence=True)
+    assert _resolve_review(repo2, shipped2, "--evidence", "review=rev-p1").exit_code == 0
+    shown = _invoke(repo2, shipped2, ["run", "status", "r1"])
+    assert shown.exit_code == 0, shown.output
+    assert "evidence: review=rev-p1" in _squash(shown.output)
+
+
+_FLAT_EVIDENCE_SHAPE = """
+workflow: flat-evidence
+schema: 1
+unit: spec
+steps:
+  - id: brainstorm
+    kind: agent
+    emits: [spec]
+  - id: spec-review
+    kind: agent
+    needs: [spec]
+    emits: [journal:spec]
+    evidence: [review, reviewer]
+"""
+
+
+def _at_flat_spec_review(tmp_path: Path, *, with_evidence: bool) -> tuple[Path, Path]:
+    repo = _repo(tmp_path)
+    shipped = tmp_path / "shipped"
+    shape = _FLAT_EVIDENCE_SHAPE
+    if not with_evidence:
+        shape = shape.replace("    evidence: [review, reviewer]\n", "")
+    _write_shape(shipped, "flat-evidence", shape)
+    assert (
+        _invoke(
+            repo,
+            shipped,
+            ["run", "start", "flat-evidence", "--branch", "b", "--run-id", "r1"],
+        ).exit_code
+        == 0
+    )
+    assert _invoke(repo, shipped, ["run", "advance", "r1"]).exit_code == 0
+    emitted = repo / "spec.md"
+    emitted.write_text("# Spec\n")
+    assert (
+        _invoke(
+            repo,
+            shipped,
+            [
+                "run",
+                "resolve",
+                "r1",
+                "--step",
+                "brainstorm",
+                "--state",
+                "done",
+                "--answered-by",
+                "agent",
+                "--emitted",
+                "spec=spec.md",
+            ],
+        ).exit_code
+        == 0
+    )
+    assert _invoke(repo, shipped, ["run", "advance", "r1"]).exit_code == 0
+    if with_evidence:
+        from fr.journal.model import JournalEntry, append_journal_entry, journal_path
+
+        slug = "spec"
+        append_journal_entry(
+            journal_path(repo, "spec", slug),
+            slug,
+            JournalEntry(
+                kind="review",
+                scope="spec",
+                id="flat-review",
+                created=load_run_state(repo, "r1").steps["spec-review"].at,
+                title="reviewed spec",
+                body="No findings.",
+            ),
+        )
+        assert (
+            _invoke(
+                repo,
+                shipped,
+                [
+                    "run",
+                    "resolve",
+                    "r1",
+                    "--step",
+                    "spec-review",
+                    "--state",
+                    "done",
+                    "--evidence",
+                    "review=flat-review",
+                    "--evidence",
+                    "reviewer=reviewer-1",
+                ],
+            ).exit_code
+            == 0
+        )
+    else:
+        assert (
+            _invoke(
+                repo,
+                shipped,
+                [
+                    "run",
+                    "resolve",
+                    "r1",
+                    "--step",
+                    "spec-review",
+                    "--state",
+                    "done",
+                ],
+            ).exit_code
+            == 0
+        )
+        _write_shape(shipped, "flat-evidence", _FLAT_EVIDENCE_SHAPE)
+    return repo, shipped
+
+
+def test_flat_agent_step_evidence_debt_appears_in_check_and_status(tmp_path: Path) -> None:
+    repo, shipped = _at_flat_spec_review(tmp_path, with_evidence=False)
+
+    check = _invoke(repo, shipped, ["run", "check", "r1"])
+    status = _invoke(repo, shipped, ["run", "status", "r1"])
+
+    expected = "step/spec-review is done, unevidenced (predates the evidence gate)"
+    assert check.exit_code == 0, check.output
+    assert expected in _squash(check.output)
+    assert status.exit_code == 0, status.output
+    status_text = _squash(status.output)
+    assert "step/spec-review:" in status_text
+    assert "unevidenced (predates the evidence gate)" in status_text
+
+
+def test_flat_agent_step_with_evidence_has_no_debt(tmp_path: Path) -> None:
+    repo, shipped = _at_flat_spec_review(tmp_path, with_evidence=True)
+
+    check = _invoke(repo, shipped, ["run", "check", "r1"])
+    status = _invoke(repo, shipped, ["run", "status", "r1"])
+
+    assert check.exit_code == 0, check.output
+    assert "unevidenced" not in _squash(check.output)
+    assert status.exit_code == 0, status.output
+    assert "evidence: review=flat-review reviewer=reviewer-1" in _squash(status.output)
+    assert "unevidenced" not in _squash(status.output)
+
+
+def test_a_migrated_real_cursor_reports_its_pre_gate_reviews_as_debt(tmp_path: Path) -> None:
+    """End to end on the REAL captured cursor of this very feature's run,
+    which carries `phase/1/review-phase: done` and `phase/2/review-phase:
+    done` with no evidence — exactly spec §4.I's upgrade day.
+
+    The shape is the SHIPPED `fr-goal`, which after this phase declares
+    `evidence: [review]` on `review-phase`. Nothing invents evidence for
+    those two, `check` names both, and its exit code is 0.
+    """
+    from tests.unit.test_run_upgrade_in_flight import HELD, _in_flight, _migrate
+
+    repo, shipped, run_id = _in_flight(tmp_path, HELD)
+    _migrate(repo)
+
+    result = _invoke(repo, shipped, ["run", "check", run_id])
+
+    assert result.exit_code == 0, result.output
+    squashed = _squash(result.output)
+    for n in (1, 2):
+        assert (
+            f"implement: phase/{n}/review-phase is done, unevidenced "
+            "(predates the evidence gate)" in squashed
+        )
+
+
+# --- `proportionality`: derived delivery evidence (2026-09-24 spec §C) -----
+
+_DELIVER_SHAPE = """
+workflow: grouped
+schema: 1
+unit: run
+steps:
+  - id: plan
+    kind: agent
+    emits: [plan]
+  - id: deliver
+    kind: agent
+    needs: [plan]
+    evidence: [tests, proportionality]
+"""
+
+
+def _git(root: Path, *args: str) -> str:
+    import subprocess
+
+    return subprocess.run(
+        ["git", "-C", str(root), *args], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _at_deliver(tmp_path: Path, *, with_origin: bool = True) -> tuple[Path, Path]:
+    """`step/deliver` opened on a run whose workspace has a bare `origin`
+    carrying `main`, and one commit of work on the branch."""
+    repo = _repo(tmp_path)
+    if with_origin:
+        bare = tmp_path / "origin.git"
+        _git(tmp_path, "init", "-q", "--bare", str(bare))
+        _git(repo, "remote", "add", "origin", str(bare))
+        _git(repo, "push", "-q", "origin", "main")
+    (repo / "feature.py").write_text("print('x')\n")
+    _git(repo, "add", "feature.py")
+    _git(repo, "commit", "-qm", "work")
+    shipped = tmp_path / "shipped"
+    _write_shape(shipped, "grouped", _DELIVER_SHAPE)
+    _started_grouped_with_plan(repo, shipped)
+    # The report reads the plan at HEAD (review p3-f4), as delivery commits it.
+    _git(repo, "add", "docs/superpowers/plans")
+    _git(repo, "commit", "-qm", "plan")
+    assert _invoke(repo, shipped, ["run", "advance", "r1"]).exit_code == 0  # deliver
+    # Written after the unit opened, so the unobservable `tests` path accepts it.
+    (repo / "suite.log").write_text("1 passed\n")
+    return repo, shipped
+
+
+def _deliver(repo: Path, shipped: Path, *evidence: str):
+    extra = [x for e in evidence for x in ("--evidence", e)]
+    return _invoke(
+        repo, shipped, ["run", "resolve", "r1", "--step", "deliver", "--state", "done", *extra]
+    )
+
+
+def test_deliver_derives_and_stores_the_proportionality_witness(tmp_path: Path) -> None:
+    """Stored as `<merge-base>:<sha256>` of the very report the command prints
+    at that merge-base — the orchestrator pastes that report into the PR body,
+    and the hash is what makes "the report we saw" checkable later."""
+    import hashlib
+
+    from fr.parser import parse
+    from fr.proportionality import build_report
+
+    repo, shipped = _at_deliver(tmp_path)
+
+    result = _deliver(repo, shipped, "tests=suite.log")
+
+    assert result.exit_code == 0, result.output
+    # A flat unit names no phase; `proportionality` is not phase evidence.
+    assert "names no phase" not in _squash(result.output)
+    record = load_run_state(repo, "r1").steps["deliver"]
+    stored = units.evidence_of(record, "step/deliver")["proportionality"]
+    merge_base = _git(repo, "merge-base", "HEAD", "origin/main")
+    report = build_report(repo, parse(repo / "docs/superpowers/plans" / PLAN_SLUG), None)
+    assert stored == f"{merge_base}:{hashlib.sha256(report.encode()).hexdigest()}"
+    assert report.splitlines()[0].count(merge_base) == 1
+
+
+def test_a_caller_supplied_proportionality_is_refused_as_derived(tmp_path: Path) -> None:
+    repo, shipped = _at_deliver(tmp_path)
+
+    result = _deliver(repo, shipped, "tests=suite.log", "proportionality=deadbeef:00")
+
+    assert result.exit_code == 2, result.output
+    assert "not yours to pass" in _squash(result.output)
+    assert "proportionality" in _squash(result.output)
+
+
+def test_deliver_does_not_ask_the_caller_for_proportionality(tmp_path: Path) -> None:
+    """Missing `tests` is refused naming only `tests` — a derived obligation
+    is never one the operator is told to pass."""
+    repo, shipped = _at_deliver(tmp_path)
+
+    result = _deliver(repo, shipped)
+
+    assert result.exit_code == 2, result.output
+    assert "--evidence tests=" in _squash(result.output)
+    assert "--evidence proportionality" not in _squash(result.output)
+
+
+def _drop_local_main(tmp_path: Path) -> None:
+    """Leave the base clone with no `main` (or `master`) branch at all."""
+    base = tmp_path / "base"
+    _git(base, "checkout", "-q", "-b", "parking")
+    _git(base, "branch", "-q", "-D", "main")
+
+
+def test_deliver_with_no_determinable_base_is_refused_naming_it(tmp_path: Path) -> None:
+    """Fail-closed like `findings`: a witness needs a merge-base, and fr
+    will not record one it could not compute. No remote, no isolation start
+    commit, no local default branch: nothing left to fall back to."""
+    repo, shipped = _at_deliver(tmp_path, with_origin=False)
+    _drop_local_main(tmp_path)
+
+    result = _deliver(repo, shipped, "tests=suite.log")
+
+    assert result.exit_code == 2, result.output
+    out = _squash(result.output)
+    assert "proportionality" in out
+    assert "isolation start commit" in out and "local default branch" in out
+
+
+def test_deliver_without_a_remote_falls_back_to_the_local_default_branch(
+    tmp_path: Path,
+) -> None:
+    """gh#768: a repo with no fetchable remote could never resolve `deliver`
+    (`fr run resolve` takes no --base). The local default branch is the last
+    fallback, and the resolve says which base it used."""
+    repo, shipped = _at_deliver(tmp_path, with_origin=False)
+
+    result = _deliver(repo, shipped, "tests=suite.log")
+
+    assert result.exit_code == 0, result.output
+    assert "base main (local default branch)" in _squash(result.output)
+    stored = units.evidence_of(load_run_state(repo, "r1").steps["deliver"], "step/deliver")
+    assert stored["proportionality"].startswith(_git(repo, "merge-base", "HEAD", "main") + ":")
+
+
+def test_deliver_without_a_remote_prefers_the_isolation_start_commit(tmp_path: Path) -> None:
+    """The commit `fr isolation up` cut the branch from beats a guessed local
+    default branch: a stacked branch's base is not `main`."""
+    from fr.isolation.types import IsolationState, save_state
+
+    repo, shipped = _at_deliver(tmp_path, with_origin=False)
+    start = _git(repo, "rev-parse", "HEAD~2")
+    _drop_local_main(tmp_path)
+    save_state(
+        IsolationState(
+            repo_root=tmp_path / "base",
+            branch="b",
+            worktree=repo,
+            profile="host",
+            target="worktree",
+            created_at="2026-10-02T00:00:00+00:00",
+            base_sha=start,
+        )
+    )
+
+    result = _deliver(repo, shipped, "tests=suite.log")
+
+    assert result.exit_code == 0, result.output
+    assert f"base {start[:12]} (isolation start commit)" in _squash(result.output)
+    stored = units.evidence_of(load_run_state(repo, "r1").steps["deliver"], "step/deliver")
+    assert stored["proportionality"].startswith(start + ":")
+
+
+_TWO_DERIVED_SHAPE = """
+workflow: grouped
+schema: 1
+unit: run
+steps:
+  - id: plan
+    kind: agent
+    emits: [plan]
+  - id: deliver
+    kind: agent
+    needs: [plan]
+    evidence: [tests, proportionality, single-phase]
+"""
+
+
+def test_every_derived_witness_is_evaluated_and_every_refusal_reported(
+    tmp_path: Path,
+) -> None:
+    """gh#768: the first derived refusal used to exit, so every witness after
+    it went unevaluated and the operator learned of the next blocker only
+    after fixing the first. Now each is derived and all refusals print."""
+    from tests.unit.test_run_cli import _plan_with_tags
+
+    repo = _repo(tmp_path)
+    (repo / "feature.py").write_text("print('x')\n")
+    _git(repo, "add", "feature.py")
+    _git(repo, "commit", "-qm", "work")
+    _drop_local_main(tmp_path)
+    shipped = tmp_path / "shipped"
+    _write_shape(shipped, "grouped", _TWO_DERIVED_SHAPE)
+    plan_rel = _plan_with_tags(repo, [(1, "agentic", ()), (2, "agentic", ())])
+    _started_grouped_with_plan(repo, shipped, plan_rel)
+    _git(repo, "add", "docs/superpowers")
+    _git(repo, "commit", "-qm", "plan")
+    assert _invoke(repo, shipped, ["run", "advance", "r1"]).exit_code == 0
+    (repo / "suite.log").write_text("1 passed\n")
+
+    result = _deliver(repo, shipped, "tests=suite.log")
+
+    assert result.exit_code == 2, result.output
+    out = _squash(result.output)
+    assert "cannot derive proportionality evidence" in out
+    assert "single-phase: the light shape takes one agentic phase" in out

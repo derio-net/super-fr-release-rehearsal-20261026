@@ -1,0 +1,576 @@
+# The declared harness-parity matrix — 2026-09-18 harness-parity-matrix
+# spec §3.A/§3.E. States are filled from the ACTUAL registration files, not
+# from issue #436's table (already stale — it lists fr-acceptance-nag as
+# absent on Hermes; .hermes/config.snippet.yaml registers it on
+# pre_llm_call):
+#   - claude-code: plugins/super-fr/hooks/hooks.json
+#   - hermes:      .hermes/config.snippet.yaml
+#   - opencode:    packages/fr-opencode-plugin/src/index.ts
+#
+# Every codex/copilot-cli cell is `unsupported` (spec non-goals — neither
+# harness is supported yet). Every `partial`/`advisory` cell carries a
+# `scope_note`. Phase 2 (`fr.harness.observe`/`check`) is what mechanically
+# re-derives the claude-code/hermes/opencode cells from these files and
+# fails CI on drift — this file is the DECLARATION, not self-checking yet.
+schema: 1
+surfaces:
+  # --- hook rows: one per shipped plugins/super-fr/hooks/*.sh ---------------
+
+  - id: fr-acceptance-nag
+    kind: hook
+    script: fr-acceptance-nag.sh
+    summary: Nags the operator toward `fr acceptance status` at session start.
+    harnesses:
+      claude-code: {state: enforced}
+      opencode: {state: absent}
+      hermes: {state: enforced}
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: fr-binary-pin
+    kind: hook
+    script: fr-binary-pin.sh
+    summary: >-
+      The shell and the integrations run the same fr (super-fr#746). The fr the
+      hooks/plugin resolve is exported to the shell as FR_HARNESS_FR, and fr
+      refuses at CLI entry when a PATH-reached fr disagrees (a venv fr warns).
+    harnesses:
+      claude-code:
+        state: partial
+        scope_note: >-
+          SessionStart writes the pin to $CLAUDE_ENV_FILE, which Claude Code
+          sources before every Bash command (hook unit-tested in
+          tests/unit/test_hooks_binary_pin.py). That a live session's shell
+          then carries the pin is not yet live-proven; and only an fr that
+          ships this check can refuse — an older global fr runs unchecked.
+      opencode:
+        state: partial
+        scope_note: >-
+          pin.ts adds FR_HARNESS_FR via `shell.env`, from the plugin's own
+          `fr --identity` (bun-tested, test/pin.test.ts); not live-proven, and,
+          as on Claude Code, an fr older than the check does not refuse.
+      hermes:
+        state: absent
+        scope_note: >-
+          no hook ships an env into Hermes' `terminal` tool, so nothing pins
+          the fr there.
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: fr-isolation-guard
+    kind: hook
+    script: fr-isolation-guard.sh
+    summary: Gates Bash commands to keep a live pipeline inside its own repo/worktree.
+    harnesses:
+      claude-code: {state: enforced}
+      opencode: {state: absent}
+      hermes:
+        state: partial
+        scope_note: >-
+          git/gh MUTATIONS only — read-only and unknown commands pass, where the
+          Claude hook denies every base-repo-cwd command. Also marker-based
+          rather than pipeline-sentinel-based (Hermes has no Skill PostToolUse
+          to write a sentinel).
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: fr-isolation-required
+    kind: hook
+    script: fr-isolation-required.sh
+    summary: Edits to tracked source must happen inside an fr-isolation workspace.
+    harnesses:
+      claude-code: {state: enforced}
+      opencode:
+        state: partial
+        scope_note: >-
+          All file-writing tools, including nested arguments and patch-body
+          targets, are gated (index.test.ts); bash remains ungated (#436).
+          Delivered to consumers by install.sh
+          (scripts/deliver-opencode-plugin.sh, gh#563); the real opencode
+          binary loads the delivered copy and that copy refuses a base-clone
+          edit (tests/integration/test_opencode_plugin_live.py, CI). A
+          model-driven session's tool call reaching the hook was shown live
+          on 1.18.32 through the project-local copy (acceptance row
+          opencode-isolation-enforcement); the delivered copy is the same
+          module, and only its load path is new.
+      hermes:
+        state: partial
+        scope_note: >-
+          the `pre_tool_call` hook (.hermes/config.snippet.yaml) gates
+          `write_file` and `patch` only; `terminal`/`execute_code` writes
+          reach only `fr-isolation-guard.sh`, which sees git/gh mutations
+          alone — a shell redirect into the base clone is not gated (#561)
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: fr-merged-pr-push-guard
+    kind: hook
+    script: fr-merged-pr-push-guard.sh
+    summary: Refuses a push/commit against a branch whose PR already merged.
+    harnesses:
+      claude-code: {state: enforced}
+      opencode: {state: absent}
+      hermes: {state: enforced}
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: fr-phase-executor-guard
+    kind: hook
+    script: fr-phase-executor-guard.sh
+    summary: Refuses dispatching fr-phase-executor, or the read-only fr-spec-reviewer, into its own fresh worktree (super-fr#420; the reviewer since spec 2026-09-24 §E).
+    harnesses:
+      claude-code: {state: enforced}
+      opencode: {state: absent}
+      hermes: {state: absent}
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: fr-pipeline-sentinel
+    kind: hook
+    script: fr-pipeline-sentinel.sh
+    summary: Marks a session as running an fr pipeline after a Skill invocation.
+    harnesses:
+      claude-code: {state: enforced}
+      opencode: {state: absent}
+      hermes: {state: absent}
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: fr-run-idle-guard
+    kind: hook
+    script: fr-run-idle-guard.sh
+    summary: >-
+      Keeps an fr run going: ending a turn on a run that is advanceable with
+      nobody working on it hands back the next command (gh#518). The predicate
+      is `fr run check --idle`; each adapter is as strong as its harness allows.
+    harnesses:
+      claude-code: {state: enforced}
+      opencode:
+        state: partial
+        scope_note: >-
+          CONTINUES rather than blocks — OpenCode cannot refuse a stop, so on
+          `session.idle` the plugin sends the next command back into the
+          session (`/session/{id}/prompt_async`). The event and the endpoint
+          were verified in `@opencode-ai/sdk` type definitions on the authoring
+          machine — versions 1.17.15, 1.1.27 and 1.0.23, all three carrying
+          both. 1.18.31 is the opencode BINARY's version, not an SDK copy on
+          disk here; this note said "the installed 1.18.31 SDK types" until
+          phase 6 went looking. That a plugin-originated prompt on idle
+          actually EXECUTES is NOT live-proven (the gh#494 standard) — a green
+          `bun test` does not show it. Delivered to consumers by install.sh
+          since gh#563, as the same module as the edit gate.
+      hermes:
+        state: absent
+        scope_note: >-
+          Hermes' stop events are reportedly observe-only (non-blocking). NOT
+          verified — Hermes is not installed on the authoring machine. With no
+          adapter, fr-goal's prose is all there is on Hermes.
+      codex:
+        state: unsupported
+        scope_note: >-
+          Reportedly has a block-capable stop hook; not installed on the
+          authoring machine, unverified. A block-tier adapter is small once the
+          harness is onboarded — it only has to call `fr run check --idle`.
+      copilot-cli:
+        state: unsupported
+        scope_note: >-
+          Reportedly blocks on `agentStop`. Copilot CLI 1.0.84's hooks system
+          WAS verified installed on the authoring machine; `agentStop`'s
+          blocking semantics were not. A block-tier adapter is small once the
+          harness is onboarded.
+
+  - id: fr-session-bind
+    kind: hook
+    script: fr-session-bind.sh
+    summary: Binds a harness session id to the isolation workspace it is using, on `fr isolation up|exec` and on `fr run start`.
+    harnesses:
+      claude-code: {state: enforced}
+      opencode: {state: absent}
+      hermes: {state: absent}
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: fr-session-unbind
+    kind: hook
+    script: fr-session-unbind.sh
+    summary: Releases a session's isolation-workspace binding at session end.
+    harnesses:
+      claude-code: {state: enforced}
+      opencode: {state: absent}
+      hermes: {state: absent}
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: fr-worktree-create
+    kind: hook
+    script: fr-worktree-create.sh
+    summary: Routes a harness's own worktree-creation flow through fr-isolation.
+    harnesses:
+      claude-code: {state: enforced}
+      opencode: {state: absent}
+      hermes: {state: absent}
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: fr-worktree-remove
+    kind: hook
+    script: fr-worktree-remove.sh
+    summary: Cleans up fr-isolation state when a harness removes its worktree.
+    harnesses:
+      claude-code: {state: enforced}
+      opencode: {state: absent}
+      hermes: {state: absent}
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  # --- interaction rows (spec §3.E) ------------------------------------------
+
+  - id: operator-gate
+    kind: interaction
+    summary: A `gate operator` run step blocks until a human answers via the harness's own question tool. On claude-code `fr run resolve` VERIFIES it — an answered AskUserQuestion in the session transcript since the gate blocked, else refused (bypass only via `--no-questions --reason`, recorded); with no readable transcript `fr run advance` degrades loudly instead (debug journal 2026-09-21 C1).
+    harnesses:
+      claude-code:
+        state: enforced
+        modes:
+          host-worktree: {state: enforced}
+          devcontainer:
+            state: enforced
+            scope_note: >-
+              enforced because `fr run` resolves on the host, where the session
+              transcript is — the host-side rule refuses it inside the container
+          external: {state: enforced, scope_note: "harness and fr share the container, and its transcript"}
+      opencode:
+        state: partial
+        scope_note: >-
+          verified in fixture tests, not yet live: `fr run resolve` reads the
+          `question` tool's parts in the run session of opencode.db
+          (tests/unit/test_run_observed_opencode.py,
+          test_run_observed_gate_opencode.py) and refuses a gate with no
+          answered round. Stays `partial` until the post-merge acceptance row
+          `opencode-observe-take10-rerun` is run live; without the plugin's
+          session id the gate is unobserved and `answered_by` must be stated.
+      hermes:
+        state: advisory
+        scope_note: delegate_task has no operator-question primitive — the gate is prose only
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: out-of-scope-operator-guard
+    kind: interaction
+    summary: A finding resolved `out-of-scope` may be moved to `fixed` only by the operator — the `fixed` record must carry `answered_by=operator`, else `fr journal check` and the review-phase findings gate report an unauthorized fix (the rule is in the journal fold, so it holds on every harness and for both `fr journal resolve` and `fr journal add --resolves`). What differs is the CLAIM. On claude-code `--answered-by operator` is verified against the session transcript — no answered question since the out-of-scope record, and the write is refused; an unreadable transcript records it with a warning (spec 2026-09-24 §A).
+    harnesses:
+      claude-code:
+        state: enforced
+        modes:
+          host-worktree: {state: enforced}
+          devcontainer:
+            state: enforced
+            scope_note: >-
+              enforced because `fr run` resolves on the host, where the session
+              transcript is — the host-side rule refuses it inside the container
+          external: {state: enforced, scope_note: "harness and fr share the container, and its transcript"}
+      opencode:
+        state: partial
+        scope_note: >-
+          `--answered-by operator` is verified against the `question` parts in
+          the run session's opencode.db where fr can read them (fixture tests
+          of the guard itself: tests/unit/test_journal_operator_guard_opencode.py
+          — refused with no answered round since the out-of-scope record,
+          accepted with one; the round reader:
+          tests/unit/test_run_observed_opencode.py); until the post-merge row
+          `opencode-observe-take10-rerun` runs live it stays `partial`, and an
+          unreadable store records the claim as stated
+      hermes:
+        state: advisory
+        scope_note: delegate_task has no operator-question primitive — `--answered-by operator` is recorded as stated; the fold still refuses a fix that does not carry it
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: spec-review-independence
+    kind: interaction
+    summary: fr-goal's `spec-review` is done by a dispatched, read-only `fr-spec-reviewer` subagent — a context separate from the orchestrator that wrote the spec (spec 2026-09-24 §E, gh#593 option 2). `fr run resolve --step spec-review --state done` verifies its evidence against the spec journal on every harness (a `kind=review` entry created after the step opened; spec findings closed, out-of-scope, or deferred). What differs is `reviewer=<agent-id>`. On claude-code it must name a subagent this session dispatched after the step opened (`subagent_dispatch_since`), so the orchestrator — which has no agent id — can never pass; an unreadable transcript records it as claimed with a warning.
+    harnesses:
+      claude-code:
+        state: enforced
+        modes:
+          host-worktree: {state: enforced}
+          devcontainer:
+            state: enforced
+            scope_note: >-
+              enforced because `fr run` resolves on the host, where the session
+              transcript is — the host-side rule refuses it inside the container
+          external: {state: enforced, scope_note: "harness and fr share the container, and its transcript"}
+      opencode:
+        state: partial
+        scope_note: >-
+          `reviewer=<agent-id>` is checked against the `task` parts of the run
+          session in opencode.db (a tiered `fr-spec-reviewer-hard` counts;
+          fixture tests tests/unit/test_run_observed_resolve_opencode.py).
+          Stays `partial` until the post-merge row
+          `opencode-observe-take10-rerun` runs live
+      hermes:
+        state: advisory
+        scope_note: no dispatch reader for delegate_task — `reviewer=<agent-id>` is recorded as claimed, with a warning; the spec-journal review and findings checks still hold
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: deliver-tests-provenance
+    kind: interaction
+    summary: fr-goal's `deliver` names the log of a full suite the ORCHESTRATOR itself ran during delivery (`--evidence tests=<log>`, debug journal 2026-09-21 C5). `fr run resolve --step deliver` ties the log's bytes to one of the orchestrator's own completed shell commands that wrote it (`>`, `>>` or `tee`) since the unit opened, read from the harness's session store; a log composed with an edit tool, written by a subagent, or by a failing command is refused. On every harness, a log under `docs/superpowers/runs/*.records/` is refused and `fr validate artifacts` flags any non-record file there (gh#638). An unreadable session store records the log as unverified with a warning, never silently.
+    harnesses:
+      claude-code:
+        state: enforced
+        modes:
+          host-worktree: {state: enforced}
+          devcontainer:
+            state: enforced
+            scope_note: >-
+              enforced because `fr run` resolves on the host, where the session
+              transcript is — the host-side rule refuses it inside the container
+          external: {state: enforced, scope_note: "harness and fr share the container, and its transcript"}
+        scope_note: >-
+          the transcript's main-thread Bash tool_use/tool_result pair, is_error
+          not true; live-verified 2026-09-26 (a redirect-written log matched, a
+          Write-tool log did not)
+      opencode:
+        state: enforced
+        modes:
+          host-worktree: {state: enforced}
+          devcontainer:
+            state: enforced
+            scope_note: >-
+              enforced because `fr run` resolves on the host, where opencode.db
+              is — the host-side rule refuses it inside the container
+          external: {state: enforced, scope_note: "harness and fr share the container, and its database"}
+        scope_note: >-
+          `bash` tool parts in opencode.db, status completed and exit 0, in a
+          top-level session (a `task` subagent is a child session). Pinned to
+          the run session when the plugin exports its id
+          (`run-session-identity`); without it ANY top-level session active
+          since the unit opened counts, as before. Live-verified 2026-09-26 on 1.18.32 (a
+          bash-redirect log matched, a write-tool log did not). A suite the
+          long-command rule detached with `&` is windowed until the first later
+          command of the orchestrator's that names the log prints its `exit=N`
+          line, and only when N is 0 (gh#719): OpenCode records no completion
+          event, but it records that command's output
+      hermes:
+        state: unsupported
+        scope_note: >-
+          dropped by operator decision 2026-09-26 (gh#638): no reader for
+          Hermes' session store is built or planned; a tests= log is recorded
+          unverified with a warning naming this row. The .records/ refusal is
+          harness-neutral and still applies
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: visual-evidence
+    kind: interaction
+    summary: A unit owing a `visual` acceptance row (spec 2026-09-28-ui-visual-evidence §C) resolves `done` only through a step record whose `visual:` section names screenshots covering every state and interaction the row declares — image files that exist, are non-empty, are git-ignored or outside the repo and never under `<run>.records/`, and (at review-phase and deliver) were written since the unit opened. `fr run resolve` then reads the witness transcript — the implement-phase holder's subagent file (the orchestrator's when inline), the review-phase reviewer's, deliver's orchestrator stream — for an image read of each shot, and a shell call naming any capture script, since the unit opened. `--evidence visual=` is refused as derived. An unreadable transcript records the witness `unobserved` with a warning; the file checks still apply.
+    harnesses:
+      claude-code:
+        state: enforced
+        modes:
+          host-worktree: {state: enforced}
+          devcontainer:
+            state: enforced
+            scope_note: >-
+              enforced because `fr run` resolves on the host, where the session
+              transcript is — shots must sit where the host sees them (a
+              git-ignored dir of the bind-mounted worktree, not the container's /tmp)
+          external: {state: enforced, scope_note: "harness and fr share the container, and its transcript"}
+        scope_note: >-
+          file-read tool_use blocks (`Read`, alias-normalised) naming the shot,
+          in the subagent file `attribute_dispatches` pairs to the holder or
+          reviewer, or in the orchestrator's own stream
+      opencode:
+        state: partial
+        scope_note: >-
+          `read` and `bash` parts of the owing session (the reviewer's or
+          holder's child, else the run session) in opencode.db witness the
+          image reads and the capture script (fixture tests in
+          tests/unit/test_run_evidence_visual.py). Stays `partial` until the
+          post-merge row `opencode-observe-take10-rerun` runs live
+      hermes:
+        state: advisory
+        scope_note: >-
+          no session-store reader, so the image-read and script checks record
+          as unobserved; the file checks apply
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: phase-sequence
+    kind: interaction
+    summary: fr run enforces spec/plan before implementation (`implement` declares `needs [spec, plan]`).
+    harnesses:
+      claude-code: {state: enforced}
+      opencode: {state: enforced}
+      hermes: {state: enforced}
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: subagent-dispatch
+    kind: interaction
+    summary: The pipeline's ability to hand a phase to a subagent for isolated execution. Dispatch is the default wherever a harness has a primitive, at roughly 7x the cost of running the phase inline; fr-goal §5's dispatch clause is the one home for the measured figures and the rule. Every dispatch is now recorded fr-side per unit — `fr run advance` opens a DispatchRecord carrying the agent type, the resolved model and the harness that resolved it, `fr run claim --agent <id>` names the holder in that harness's own id vocabulary, `fr run resolve` closes it — so this row points at observable state in the run cursor (`fr run status`, `fr run check`) instead of resting entirely on the skill prose being followed, and a still-held unit is refused a second dispatch identically on every harness (gh-503, gh-499). WHEN that holder can be named is not identical — see `dispatch-holder-identity`.
+    harnesses:
+      claude-code: {state: enforced}
+      opencode: {state: enforced}
+      hermes: {state: enforced}
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: dispatch-holder-identity
+    kind: interaction
+    summary: WHEN the agent holding a dispatched unit becomes nameable (`fr run claim --agent <id>`). Separate from subagent-dispatch on purpose — dispatch is enforced wherever a primitive exists, but the moment its holder can be named depends on whether the harness's dispatch call returns at once or blocks. What does NOT vary — fr opens the record at `fr run advance` with the harness it detected and the tier's model, and that open record refuses a second dispatch whether or not anyone has claimed it.
+    harnesses:
+      claude-code:
+        state: advisory
+        scope_note: >-
+          the holder is NAMEABLE in flight — the Agent call returns a task id at
+          once and the child runs in the background, observed live 2026-09-21 —
+          but nothing blocks an unclaimed dispatch: claiming is skill prose, and
+          `fr run check` reports an unclaimed record as debt, never as a failure
+      opencode:
+        state: partial
+        scope_note: >-
+          the task tool BLOCKS and returns the child session id only with the
+          result, so the holder is claimed when the call returns and is not
+          nameable while the unit is held — live 2026-09-21, status from inside
+          the child read "HELD BY an unclaimed agent (opencode, <model>)". The
+          unclaimed record still refuses a second dispatch, and harness and
+          model are recorded at dispatch. fr-opencode-plugin now claims from
+          the child on its first tool call (`fr run claim --open-unit`, gh#530):
+          observed live 2026-09-27 on OpenCode 1.18.32, the claim landed about
+          3-6 s after dispatch, and the child's own first `fr run status` read
+          "HELD BY agent ses_… (opencode, <model>)" with the tier agent
+          recorded. Still partial, not enforced: the claim is fail-open, so an
+          `fr` on OpenCode's PATH too old to know `--open-unit` leaves the unit
+          unclaimed until the call returns, and nothing refuses that. The
+          claim's session is now the TOP-LEVEL run session (`run-session-identity`):
+          a claim made from a child still lands on the run's own record
+          (fixture tests: tests/unit/test_run_observed_resolve_opencode.py).
+      hermes:
+        state: partial
+        scope_note: >-
+          the record and the refusal are the same harness-neutral CLI, but when
+          `delegate_task` yields its handle has not been observed live, so
+          nothing here claims the holder is nameable in flight
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: run-session-identity
+    kind: interaction
+    summary: Which session is "the run's" (spec 2026-10-02-opencode-observe-2 §B). `fr run start`/`advance` record the TOP-LEVEL session of the calling process, and every gate that reads a transcript or session store (`operator-gate`, `spec-review-independence`, `visual-evidence`, `deliver-tests-provenance`) reads that session — never a child's, even when a subagent runs the command. Claude Code names its session in the environment; OpenCode's super-fr plugin exports it into `bash` (`FR_OPENCODE_SESSION_ID`, via `shell.env`) and fr walks `parent_id` up to the root. Not a hook, so `fr harness parity` observes nothing for it and `session.ts` carries no parity marker.
+    harnesses:
+      claude-code: {state: enforced}
+      opencode:
+        state: partial
+        scope_note: >-
+          verified in fixture tests, not yet live (tests/unit/test_run_observed_opencode.py,
+          test_run_observed_resolve_opencode.py); a plugin older than this
+          release exports no id, and the gates then read as unobserved or
+          fall back to the unscoped reading. Stays `partial` until the
+          post-merge row `opencode-observe-take10-rerun` runs live
+      hermes:
+        state: absent
+        scope_note: no session reader exists for Hermes, so no gate observes a session there
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: status-line
+    kind: interaction
+    summary: A harness status line surfaces fr session/branch/isolation state via fr-statusline-segment.sh.
+    harnesses:
+      claude-code: {state: enforced}
+      opencode:
+        state: partial
+        scope_note: fr-statusline-segment.sh is harness-neutral (stdin or --cwd) and callable today; no renderer/registration ships for OpenCode
+      hermes:
+        state: partial
+        scope_note: same segment script callable; no renderer/registration ships for Hermes
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: usage-capture
+    kind: interaction
+    summary: A run's cost is persisted in `docs/superpowers/usage/<run-id>.yaml` (spec 2026-09-25-lean-cost-aware-process §5.B) — one capture per host, taken at `fr run resolve --step deliver`, at the first resolve on a host with no capture yet, and at `fr archive`, each committed with the cursor and never failing its step. Read on any checkout by `fr run cost`. Captures read the harness's own session store, so `fr run` / `fr usage` execute on the harness host (§5.B.6); the per-mode cells below say where that is. Replaces `main-session-cost` (run 7 removed `StepRecord.main_session`).
+    harnesses:
+      claude-code:
+        state: partial
+        scope_note: >-
+          implemented and unit-tested over captured transcripts; the live
+          walk that verifies it is owed (phase 4 of the plan)
+        modes:
+          host-worktree: {state: partial, scope_note: "harness and fr share the host; live walk owed (phase 4)"}
+          devcontainer:
+            state: partial
+            scope_note: >-
+              fr run executes on the host, where the transcripts are — refused
+              inside the container (bridge + in-process check); live walk owed
+          external:
+            state: partial
+            scope_note: >-
+              harness and fr both run in the container; an ephemeral pod loses
+              its transcripts at teardown, so capture-before-teardown (deliver,
+              a new host's first resolve, archive) is what keeps its figures
+      opencode:
+        state: partial
+        scope_note: >-
+          implemented; $0 for free models, estimated for Copilot-routed ones;
+          the live walk that verifies it is owed (phase 4). The session fr
+          records for a run is now the top-level run session
+          (`run-session-identity`), so the usage window follows the same
+          session the gates read
+        modes:
+          host-worktree: {state: partial, scope_note: "read from the host's SQLite session store; live walk owed"}
+          devcontainer:
+            state: partial
+            scope_note: >-
+              fr run executes on the host, where opencode.db is — refused
+              inside the container; live walk owed
+          external:
+            state: partial
+            scope_note: >-
+              the store is inside the pod and lost at teardown; capture-before-
+              teardown (deliver, a new host's first resolve, archive) keeps it
+      hermes:
+        state: partial
+        scope_note: >-
+          implemented, not live-verified (pod-only, no walk scheduled);
+          per-message attribution is coarse (one token count per message);
+          ACP sessions report zero tokens (hermes-agent#6775)
+        modes:
+          host-worktree: {state: partial, scope_note: "implemented, not live-verified"}
+          devcontainer: {state: partial, scope_note: "implemented, not live-verified; fr run on the host"}
+          external:
+            state: partial
+            scope_note: >-
+              the usual Hermes shape (a prepared pod); state.db is lost at
+              teardown, so capture-before-teardown is what keeps its figures
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}
+
+  - id: model-binding-probe
+    kind: interaction
+    summary: A tier binding is probed live with the provider (`fr models set`/`check`, `fr run start`, and before every tiered dispatch in `fr run advance`); a dead one is replaced by fixed rules — asked of the operator on a terminal or at fr-goal's question gate, decided and journalled by fr mid-run within R4's autonomous bound, refused otherwise (spec 2026-10-06-model-binding-churn).
+    harnesses:
+      claude-code:
+        state: absent
+        scope_note: >-
+          not probed: `claude -p` is forbidden in package source
+          (no-claude-p-batch), and the Agent tool takes family aliases, so
+          bindings report `unprobed` and are never substituted
+      opencode:
+        state: partial
+        scope_note: >-
+          verified against a stub `opencode` and a scripted prober only
+          (tests/unit/test_run_binding_guard.py, tests/scenarios/model-binding-*.sh):
+          the dead-model classifier against a real provider and the
+          mid-session agent-file pickup after an autonomous substitution stay
+          unproven until the post-merge row `model-binding-live-opencode` runs
+      hermes:
+        state: absent
+        scope_note: >-
+          not probed: Hermes has no probe surface on the operator's hosts, so
+          bindings report `unprobed` and are never substituted
+      codex: {state: unsupported}
+      copilot-cli: {state: unsupported}

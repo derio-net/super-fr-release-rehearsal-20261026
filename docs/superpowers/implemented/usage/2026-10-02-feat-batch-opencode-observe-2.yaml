@@ -1,0 +1,68 @@
+schema_version: 1
+run: 2026-10-02-feat-batch-opencode-observe-2
+captures:
+- host: h-e3ebbedf
+  harness: claude-code
+  mode: host-worktree
+  captured_at: '2026-10-06T20:31:44+00:00'
+  at:
+  - resolve:brainstorm
+  - deliver
+  - closeout
+  - backfill
+  sessions:
+  - session: 09d1a452-b1b7-4a1d-9f98-bd936dcf38f5
+    role: main
+    models:
+      claude-opus-5-5:
+        input: 1160
+        cache_write: 2248049
+        cache_read: 88507699
+        output: 138419
+        usd: 0.0
+        usd_source: exact
+      claude-sonnet-5-5:
+        input: 250
+        cache_write: 260029
+        cache_read: 22347225
+        output: 1347
+        usd: 0.0
+        usd_source: exact
+    activity:
+      implementation:
+        usd: 0.0
+        turns: 429
+      other:
+        usd: 0.0
+        turns: 172
+      paperwork:
+        usd: 0.0
+        turns: 108
+    steps:
+      (outside run):
+        usd: 0.0
+        turns: 15
+      brainstorm:
+        usd: 0.0
+        turns: 32
+      spec-review:
+        usd: 0.0
+        turns: 68
+      plan:
+        usd: 0.0
+        turns: 9
+      implement:
+        usd: 0.0
+        turns: 561
+      deliver:
+        usd: 0.0
+        turns: 8
+    briefs:
+      aa757024dd89e3547: 3047
+      phase/1/implement-phase: 3218
+      phase/1/review-phase: 2830
+      phase/2/implement-phase: 3644
+      phase/2/review-phase: 3521
+      phase/3/implement-phase: 4575
+      phase/3/review-phase: 4106
+      ad1573f2f137e0ec5: 5618

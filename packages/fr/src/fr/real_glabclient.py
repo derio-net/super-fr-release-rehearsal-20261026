@@ -1,0 +1,518 @@
+"""Production GlabClient — wraps the `glab` CLI for GitLab-backed repos.
+
+Conforms to `fr.ghclient.GhClient` structurally (Python Protocols don't
+care about import names — see the design doc §3 for why the Protocol
+stays named `GhClient`). Read methods (`view_issue`, `list_linked_prs`)
+shape glab's JSON output into the contract that `observe`/`diff` expect.
+Write methods delegate to `fr.glab`'s helpers, mirroring
+`fr.real_ghclient.RealGhClient`'s structure so the two files diff cleanly.
+
+GitLab-specific shape differences absorbed here (not leaked into shared
+code — see docs/superpowers/specs/
+2026-07-09-multi-backend-git-host-adapters-design.md §4):
+- Issue state is lowercase `opened`/`closed` (not GitHub's `OPEN`/`CLOSED`).
+- Issue `labels` come back as a plain string array, not `[{name: ...}]`.
+- `list_linked_prs` uses the REST `related_merge_requests` endpoint via
+  `glab api` (no GraphQL query needed here, simpler than GitHub's path) —
+  the repo path must be URL-encoded (`group/proj` -> `group%2Fproj`).
+- Pipeline status is its own vocabulary (`success`/`failed`/`running`/
+  `pending`/`created`/`canceled`/`skipped`), coerced by `_coerce_ci_state`
+  — a separate table from `real_ghclient.py`'s GraphQL-enum one.
+- Contents lookups (`glab api projects/:id/repository/files/:path`)
+  return base64-encoded content, unlike GitHub's raw-media-type trick —
+  `read_file` decodes it explicitly.
+"""
+
+from __future__ import annotations
+
+import base64
+import functools
+import json
+import re
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, Concatenate, ParamSpec, TypeVar, cast
+from urllib.parse import quote
+
+from fr import glab as _glab
+from fr.ghclient import CommandRunner, UnsupportedBatchOps, filter_issues_by_body, run_cli
+from fr.labels import LabelDef
+
+# GitLab-specific MR URL shape — deliberately NOT in the shared fr._urls
+# (that module is issue-URL-only, and this pattern is GitLab-only: neither
+# GitHub nor Gitea PR URLs need this class of parsing since `gh pr view`
+# accepts a bare URL directly and Gitea's adapter builds its own simpler
+# parse — see real_teaclient.py). Mirrors _urls.py's lazy-quantifier +
+# optional `-/`-infix technique for the same reason (GitLab subgroups
+# nest arbitrarily, and the dash infix is optional across GitLab versions).
+# The repo capture excludes `:` and `@`: no GitLab path holds them, and a
+# capture that could would hand glab's `--repo` a URL or `user@host:` remote,
+# which glab follows to that host past the trust gate (gh#1014 review).
+_MR_URL_RE = re.compile(r"^https://[^/]+/([^:@]+?)(?:/-)?/merge_requests/(\d+)/?$")
+
+# GitLab's contents endpoint REQUIRES `ref`; GitHub's equivalent does
+# not, which is why this adapter was written without one (gh-486).
+# HEAD is the server's own default branch, so one call works on a
+# `master` instance and a `main` one alike — live-proven 2026-09-19
+# against a master-default self-hosted instance (spec §2.A).
+_CONTENTS_REF = "HEAD"
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _hosted(
+    method: Callable[Concatenate[RealGlabClient, _P], _R],
+) -> Callable[Concatenate[RealGlabClient, _P], _R]:
+    """Run the host trust gate (`fr.glab.host_env`, gh#1014) BEFORE `method`'s
+    body, as `fr.real_ghclient._hosted` does for gh: five methods soft-fail on
+    `GlabError`, and would otherwise turn a refused host into "no MR" / "no
+    file". Every public method carries it;
+    `test_every_public_glab_method_refuses_an_unknown_host_before_any_process`
+    keeps it that way."""
+
+    @functools.wraps(method)
+    def wrapper(self: RealGlabClient, /, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        _glab.host_env(self._host)
+        return method(self, *args, **kwargs)
+
+    return wrapper
+
+
+class RealGlabClient(UnsupportedBatchOps):
+    """Wraps `fr.glab` to satisfy the `GhClient` Protocol for GitLab repos.
+
+    `host` names a self-hosted instance and is carried into every glab
+    call this client makes (as the child's GITLAB_HOST — see
+    `fr.glab._run_glab`), an injected runner's included. `None`, the
+    default, leaves glab's own host resolution alone. A host glab is not
+    logged into is never threaded: each call fails closed with
+    `GlabHostRefusedError` (gh#1014). The client is deliberately dumb about where the
+    host came from: `fr.hostclient.client_for` resolves it from a
+    checkout, `fr_vk.pr_observe` from a bare PR URL, and neither
+    provenance changes what this class does with it (gh-486; spec §4.C).
+    """
+
+    backend = "gitlab"  # §3.J batch operations: declared unsupported (gh#611)
+
+    def __init__(self, *, host: str | None = None) -> None:
+        self._host = host
+
+    def _glab(self, args: list[str]) -> str:
+        """Every direct `glab` invocation this class makes goes through
+        here, so the host is applied in exactly ONE place. A method added
+        later cannot forget it — which it could when each call site
+        repeated `host=self._host` by hand."""
+        return _glab._run_glab(args, host=self._host)
+
+    def _api(self, endpoint: str) -> str:
+        """`glab api <endpoint>` — the shape four of the five read paths
+        use. Kept separate from `_glab` only to stop `["api", ...]` being
+        re-spelled at each call site."""
+        return self._glab(["api", endpoint])
+
+    @_hosted
+    def view_issue(self, repo: str, number: int) -> dict[str, Any]:
+        raw = cast("dict[str, Any]", _glab.view_issue(repo, number, host=self._host))
+        labels_raw = raw.get("labels", []) or []
+        labels = [
+            lbl["name"] if isinstance(lbl, dict) and "name" in lbl else lbl for lbl in labels_raw
+        ]
+        assignees_raw = raw.get("assignees", []) or []
+        assignees = [
+            a["username"] for a in assignees_raw if isinstance(a, dict) and "username" in a
+        ]
+        return {
+            "state": "CLOSED" if raw.get("state") == "closed" else "OPEN",
+            "labels": labels,
+            "assignees": assignees,
+            "body": raw.get("description", "") or "",
+        }
+
+    @_hosted
+    def list_linked_prs(self, repo: str, issue_number: int) -> list[dict[str, Any]]:
+        """Return MRs related to this Issue, shaped for `observe._to_pr_observation`.
+
+        Uses the REST `related_merge_requests` endpoint (a dedicated
+        GitLab API, simpler than GitHub's GraphQL path). Fails soft: an
+        unreachable query shouldn't blow up `fr apply --dry-run`.
+        """
+        encoded_repo = quote(repo, safe="")
+        try:
+            out = self._api(f"projects/{encoded_repo}/issues/{issue_number}/related_merge_requests")
+        except _glab.GlabError:
+            return []
+        nodes = json.loads(out) if out else []
+        result: list[dict[str, Any]] = []
+        for n in nodes:
+            raw_state = n.get("state", "opened")
+            merged = raw_state == "merged"
+            state = "CLOSED" if raw_state in ("merged", "closed", "locked") else "OPEN"
+            pipeline = n.get("pipeline") or {}
+            ci = _coerce_ci_state(pipeline.get("status", ""))
+            result.append(
+                {
+                    "url": n.get("web_url", ""),
+                    "state": state,
+                    "merged": merged,
+                    "draft": bool(n.get("draft", False)),
+                    "ci": ci,
+                }
+            )
+        return result
+
+    @_hosted
+    def pr_status_by_url(self, url: str) -> dict[str, Any] | None:
+        """`glab mr view` does NOT accept a bare URL (its usage is
+        `{<id> | <branch>}` — verified directly against the installed
+        binary's `--help`), so the MR url is parsed into (repo, iid)
+        first. Fails soft: None on any error or unparseable URL."""
+        m = _MR_URL_RE.match(url)
+        if not m:
+            return None
+        repo, iid = m.group(1), m.group(2)
+        try:
+            out = self._glab(["mr", "view", iid, "--repo", repo, "--output", "json"])
+        except _glab.GlabHostRefusedError:
+            raise  # a refusal is not "no MR" (gh#1014)
+        except _glab.GlabError:
+            return None
+        raw = json.loads(out)
+        raw_state = raw.get("state", "opened")
+        if raw_state == "merged":
+            state = "MERGED"
+        elif raw_state in ("closed", "locked"):
+            state = "CLOSED"
+        else:
+            state = "OPEN"
+        return {"state": state, "draft": bool(raw.get("draft", False))}
+
+    @_hosted
+    def pr_body(self, ref: str, *, cwd: Path) -> str:
+        """The MR's `description`. A URL is parsed into (repo, iid), as in
+        `pr_status_by_url` — `glab mr view` takes no URL; an iid or branch
+        is resolved by glab from the checkout at `cwd`. Raises GlabError."""
+        m = _MR_URL_RE.match(ref)
+        if m:
+            args = ["mr", "view", m.group(2), "--repo", m.group(1), "--output", "json"]
+            out = _glab._run_glab(args, host=self._host)
+        else:
+            args = ["mr", "view", ref, "--output", "json"]
+            out = _glab._run_glab(args, host=self._host, cwd=cwd)
+        # Exit 0 with output fr cannot read is still the forge's failure: the
+        # deliver gate refuses on a GlabError and would crash on anything else.
+        try:
+            raw = json.loads(out)
+        except json.JSONDecodeError as exc:
+            raise _glab.GlabError(f"unreadable `glab mr view` output: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise _glab.GlabError("unreadable `glab mr view` output: not a JSON object")
+        return str(raw.get("description") or "")
+
+    @_hosted
+    def edit_issue_labels(
+        self,
+        repo: str,
+        number: int,
+        *,
+        add: frozenset[str],
+        remove: frozenset[str],
+    ) -> None:
+        _glab.swap_issue_labels(
+            repo=repo,
+            number=number,
+            add=sorted(add),
+            remove=sorted(remove),
+            host=self._host,
+        )
+
+    @_hosted
+    def edit_issue_state(
+        self,
+        repo: str,
+        number: int,
+        *,
+        state: str,
+        reason: str | None = None,
+    ) -> None:
+        if state == "CLOSED":
+            _glab.close_issue(repo=repo, number=number, host=self._host)
+            return
+        if state == "OPEN":
+            _glab.reopen_issue(repo=repo, number=number, host=self._host)
+            return
+        raise ValueError(f"unknown issue state: {state!r}")
+
+    @_hosted
+    def edit_issue_body(self, repo: str, number: int, body: str) -> None:
+        _glab.edit_issue_body(repo=repo, number=number, body=body, host=self._host)
+
+    @_hosted
+    def create_issue(
+        self,
+        repo: str,
+        *,
+        title: str,
+        body: str,
+        labels: frozenset[str],
+    ) -> str:
+        return _glab.create_issue(
+            repo=repo,
+            title=title,
+            body=body,
+            labels=sorted(labels),
+            host=self._host,
+        )
+
+    @_hosted
+    def ensure_labels(self, repo: str, labels: list[Any]) -> None:
+        """Coerce `list[str]` or `list[LabelDef]` to LabelDefs, then delegate."""
+        defs: list[LabelDef] = []
+        for lbl in labels:
+            if isinstance(lbl, LabelDef):
+                defs.append(lbl)
+            elif isinstance(lbl, str):
+                defs.append(LabelDef(name=lbl, color="ededed", description=""))
+            else:
+                name = getattr(lbl, "name", None) or lbl["name"]
+                color = getattr(lbl, "color", None) or lbl.get("color", "ededed")
+                description = getattr(lbl, "description", None) or lbl.get("description", "")
+                defs.append(LabelDef(name=name, color=color, description=description))
+        _glab.ensure_labels(repo=repo, labels=defs, host=self._host)
+
+    @_hosted
+    def comment_issue(self, repo: str, number: int, body: str) -> None:
+        """Post a comment via `glab issue note` (glab's name for gh's
+        `issue comment` — verified directly against `glab issue --help`)."""
+        self._glab(["issue", "note", str(number), "--repo", repo, "--message", body])
+
+    @_hosted
+    def authenticated_login(self) -> str:
+        out = self._api("user")
+        try:
+            return str(json.loads(out)["username"])
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise _glab.GlabError(f"unreadable `glab api user` output: {exc}") from exc
+
+    @_hosted
+    def edit_issue(self, repo: str, number: int, *, title: str, body: str) -> None:
+        _glab.edit_issue(repo=repo, number=number, title=title, body=body, host=self._host)
+
+    @_hosted
+    def close_issue(self, repo: str, number: int, comment: str) -> None:
+        self._glab(["issue", "note", str(number), "--repo", repo, "--message", comment])
+        _glab.close_issue(repo=repo, number=number, host=self._host)
+
+    @_hosted
+    def list_open_issues_with_body(
+        self, repo: str, *, search: tuple[str, ...], limit: int
+    ) -> list[dict[str, Any]]:
+        """Open issues via the issues API, `per_page` pages until *limit* is read."""
+        raw: list[dict[str, Any]] = []
+        page = 1
+        while len(raw) < limit:
+            per = min(100, limit - len(raw))
+            out = self._api(
+                f"projects/{quote(repo, safe='')}/issues?state=opened&order_by=created_at&sort=asc"
+                f"&per_page={per}&page={page}"
+            )
+            try:
+                got = json.loads(out) if out.strip() else []
+            except json.JSONDecodeError as exc:
+                raise _glab.GlabError(f"unreadable `glab api` issues output: {exc}") from exc
+            if not isinstance(got, list):
+                raise _glab.GlabError("unreadable `glab api` issues output: not a JSON list")
+            for i in got:
+                if isinstance(i, dict):
+                    raw.append(
+                        {
+                            "number": i.get("iid"),
+                            "title": i.get("title") or "",
+                            "body": i.get("description") or "",
+                            "labels": [str(x) for x in (i.get("labels") or [])],
+                            "author": {"login": (i.get("author") or {}).get("username", "")},
+                        }
+                    )
+            if len(got) < per:
+                break
+            page += 1
+        return filter_issues_by_body(raw, search, limit)
+
+    @_hosted
+    def edit_pr(self, repo: str, number: int, *, body: str) -> None:
+        self._glab(["mr", "update", str(number), "--repo", repo, "--description", body])
+
+    @_hosted
+    def open_pr_in_repo(self, repo: str, branch: str) -> dict[str, Any] | None:
+        out = self._glab(
+            ["mr", "list", "--repo", repo, "--source-branch", branch, "--output", "json"]
+        )
+        try:
+            mrs = json.loads(out) if out.strip() else []
+        except json.JSONDecodeError as exc:
+            raise _glab.GlabError(f"unreadable `glab mr list` output: {exc}") from exc
+        if not isinstance(mrs, list):
+            return None
+        for mr in mrs:
+            src = mr.get("source_project_id") if isinstance(mr, dict) else None
+            if src is not None and src == mr.get("target_project_id"):
+                return {"number": int(mr["iid"]), "url": str(mr.get("web_url") or "")}
+        return None
+
+    @_hosted
+    def create_pr(
+        self, repo: str, *, head: str, base: str, title: str, body: str, draft: bool
+    ) -> dict[str, Any]:
+        argv = ["mr", "create", "--repo", repo, "--source-branch", head, "--target-branch", base]
+        argv += ["--title", title, "--description", body, "--yes"]
+        if draft:
+            argv.append("--draft")
+        out = self._glab(argv)
+        found = re.search(r"\S+/-/merge_requests/(\d+)", out)
+        if found is None:
+            raise _glab.GlabError(f"`glab mr create` printed no MR URL: {out.strip()!r}")
+        return {"number": int(found.group(1)), "url": found.group(0)}
+
+    @_hosted
+    def default_branch(self, *, cwd: Path, run: CommandRunner | None = None) -> str | None:
+        argv = ["glab", "repo", "view", "-F", "json", "--jq", ".default_branch"]
+        _glab.check_argv(argv[1:], self._host)
+        result = (run or run_cli)(
+            argv,
+            cwd=cwd,
+            env=_glab.host_env(self._host),
+        )
+        out = (result.stdout or "").strip()
+        # glab's --jq already extracts the bare branch name — no prefix to strip
+        return out if result.returncode == 0 and out else None
+
+    @_hosted
+    def pr_for_branch(
+        self, branch: str, *, cwd: Path, run: CommandRunner | None = None
+    ) -> dict[str, Any] | None:
+        """`glab mr view <branch>` — a single-shot query like gh's (`glab mr
+        view` accepts a bare branch name directly, per its own `--help`,
+        unlike the URL case in `pr_status_by_url`)."""
+        argv = ["glab", "mr", "view", branch, "--output", "json"]
+        _glab.check_argv(argv[1:], self._host)
+        result = (run or run_cli)(
+            argv,
+            cwd=cwd,
+            env=_glab.host_env(self._host),
+        )
+        if result.returncode != 0 or not (result.stdout or "").strip():
+            return None
+        try:
+            raw = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(raw, dict):
+            return None
+        raw_state = raw.get("state", "opened")
+        if raw_state == "merged":
+            state = "MERGED"
+        elif raw_state in ("closed", "locked"):
+            state = "CLOSED"
+        else:
+            state = "OPEN"
+        return {
+            "state": state,
+            "url": raw.get("web_url", ""),
+            "mergedAt": raw.get("merged_at"),
+            "updatedAt": raw.get("updated_at"),
+        }
+
+    @_hosted
+    def issues_enabled(self, repo: str | None = None) -> bool | None:
+        """`issues_enabled` of GitLab's `projects/:id` object, via `glab api`."""
+        if not repo:
+            return None
+        try:
+            raw = json.loads(self._api(f"projects/{quote(repo, safe='')}"))
+        except (_glab.GlabError, ValueError, OSError):
+            return None
+        value = raw.get("issues_enabled") if isinstance(raw, dict) else None
+        return value if isinstance(value, bool) else None
+
+    @_hosted
+    def file_exists(self, repo: str, path: str) -> bool:
+        """Contents-API existence probe via `glab api
+        projects/:id/repository/files/:path?ref=HEAD`. A NOT-FOUND reads
+        as absent — the safe direction for spec-archival callers; any
+        other error propagates, because a malformed or unauthorized
+        request is not an absent file (gh-486).
+
+        `ref` is MANDATORY on this endpoint; without it GitLab answers 400
+        and this probe reported that as "absent" (gh-486)."""
+        encoded_repo = quote(repo, safe="")
+        encoded_path = quote(path, safe="")
+        try:
+            self._api(
+                f"projects/{encoded_repo}/repository/files/{encoded_path}?ref={_CONTENTS_REF}"
+            )
+            return True
+        except _glab.GlabError as exc:
+            if _glab.is_not_found(exc):
+                return False
+            raise
+
+    @_hosted
+    def list_dir(self, repo: str, path: str) -> list[str]:
+        """Entry names under `path` via the repository tree endpoint.
+        `[]` on a NOT-FOUND — same fail-soft posture as `file_exists`;
+        any other error propagates, because a malformed or unauthorized
+        request is not an empty directory (gh-486).
+        `ref` isn't required here (unlike the contents endpoints) — the
+        tree endpoint already defaults to the project's default branch —
+        but is pinned for consistency, live-proven not to regress
+        against a master-default instance 2026-09-19 (spec §2.A)."""
+        encoded_repo = quote(repo, safe="")
+        encoded_path = quote(path, safe="")
+        try:
+            out = self._api(
+                f"projects/{encoded_repo}/repository/tree?path={encoded_path}&ref={_CONTENTS_REF}"
+            )
+        except _glab.GlabError as exc:
+            if _glab.is_not_found(exc):
+                return []
+            raise
+        entries = json.loads(out) if out else []
+        return [e["name"] for e in entries if isinstance(e, dict) and "name" in e]
+
+    @_hosted
+    def read_file(self, repo: str, path: str) -> str:
+        """Raw file text via the repository files endpoint. GitLab's API
+        returns base64-encoded content (unlike GitHub's raw-media-type
+        trick) — decoded here.
+
+        `ref` is MANDATORY on this endpoint; without it GitLab answers 400
+        and this method raised on every real instance (gh-486)."""
+        encoded_repo = quote(repo, safe="")
+        encoded_path = quote(path, safe="")
+        out = self._api(
+            f"projects/{encoded_repo}/repository/files/{encoded_path}?ref={_CONTENTS_REF}"
+        )
+        data = json.loads(out)
+        content = data.get("content", "")
+        return base64.b64decode(content).decode("utf-8")
+
+
+_CI_PASS = {"success"}
+_CI_FAIL = {"failed", "canceled"}
+_CI_PENDING = {"running", "pending", "created"}
+
+
+def _coerce_ci_state(status: str) -> str:
+    """Map GitLab's pipeline-status vocabulary -> fr's PASS/FAIL/PENDING/NONE.
+
+    A distinct table from `real_ghclient.py`'s GraphQL-enum one — GitLab's
+    pipeline states are lowercase and named differently (e.g. `skipped`
+    maps to NONE here, not FAIL, since a skipped pipeline signals nothing
+    ran rather than a failure)."""
+    if status in _CI_PASS:
+        return "PASS"
+    if status in _CI_FAIL:
+        return "FAIL"
+    if status in _CI_PENDING:
+        return "PENDING"
+    return "NONE"

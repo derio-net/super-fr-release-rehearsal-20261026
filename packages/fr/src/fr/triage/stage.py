@@ -1,0 +1,65 @@
+"""Stages are derived, never set (spec §3.E, decision d3).
+
+Pure functions over the facts models: the page is read-only, and "moving" an
+issue means doing the work and re-running `collect`.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Literal
+
+from fr.labels import FR_IN_PROGRESS
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from fr.triage.model import Issue, PullRequest
+
+Stage = Literal["closed", "merged", "pr-ready", "pr-draft", "in-progress", "blocked", "backlog"]
+
+# Most advanced first. The ONE ordering: `derive_stage`, the collector's
+# most-advanced-PR rule and the page's display order all read it. `in-progress`
+# (the `fr:in-progress` label a batch dispatch sets, spec 2026-09-25-triage-batches
+# §3.E) sits below every PR stage and above `blocked`.
+STAGES: tuple[Stage, ...] = (
+    "closed",
+    "merged",
+    "pr-ready",
+    "pr-draft",
+    "in-progress",
+    "blocked",
+    "backlog",
+)
+
+
+IN_FLIGHT: frozenset[Stage] = frozenset({"pr-draft", "pr-ready", "in-progress"})
+"""The issue stages that count as work in flight (the board's figure and snapshots)."""
+
+
+def pr_stage(pr: PullRequest) -> Stage | None:
+    """The stage one PR would give an open issue; a closed, unmerged PR gives none."""
+    if pr.state == "MERGED":
+        return "merged"
+    if pr.state == "OPEN":
+        return "pr-draft" if pr.is_draft else "pr-ready"
+    return None
+
+
+def pr_rank(pr: PullRequest) -> int:
+    """Sort key, lower is more advanced — the position of `pr_stage` in `STAGES`."""
+    stage = pr_stage(pr)
+    return STAGES.index(stage) if stage is not None else len(STAGES)
+
+
+def derive_stage(issue: Issue, prs: Iterable[PullRequest]) -> Stage:
+    """The stage of *issue* given the PRs that name it; the most advanced PR wins."""
+    if issue.state == "closed":
+        return "closed"
+    from_prs = [s for s in map(pr_stage, prs) if s is not None]
+    if from_prs:
+        return min(from_prs, key=STAGES.index)
+    if FR_IN_PROGRESS.name in issue.labels:
+        return "in-progress"
+    if any(label.lower() == "blocked" for label in issue.labels):
+        return "blocked"
+    return "backlog"

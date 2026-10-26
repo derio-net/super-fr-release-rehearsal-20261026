@@ -1,0 +1,39 @@
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "check-change-fragment.py"
+spec = importlib.util.spec_from_file_location("check_change_fragment", SCRIPT)
+assert spec and spec.loader
+guard = importlib.util.module_from_spec(spec)
+sys.modules["check_change_fragment"] = guard
+spec.loader.exec_module(guard)
+
+
+def test_requires_bump_for_shipped_surfaces() -> None:
+    assert guard.requires_bump("packages/fr/src/fr/cli.py")
+    assert guard.requires_bump("packages/fr-opencode-plugin/src/index.ts")
+    assert guard.requires_bump("plugins/super-fr/skills/fr-goal/SKILL.md")
+    assert guard.requires_bump("plugins/super-fr/rules/fr-isolation-required.md")
+    assert guard.requires_bump("scripts/install.sh")
+
+
+def test_ignores_docs_tests_and_manifests() -> None:
+    assert not guard.requires_bump("README.md")
+    assert not guard.requires_bump("AGENTS.md")
+    assert not guard.requires_bump("tests/unit/test_version.py")
+    assert not guard.requires_bump(".github/workflows/ci.yml")
+    assert not guard.requires_bump("packages/fr-opencode-plugin/package.json")
+
+
+def test_every_plugins_skills_require_a_bump() -> None:
+    assert guard.requires_bump("plugins/super-fr-dispatch/skills/fr-dispatch/SKILL.md")
+
+
+def test_only_super_frs_rules_and_real_skill_dirs_require_a_bump() -> None:
+    assert not guard.requires_bump("plugins/super-fr-dispatch/rules/x.md")
+    assert not guard.requires_bump("plugins/super-fr/.claude-plugin/plugin.json")
+    assert not guard.requires_bump("plugins/x/.claude-plugin/skills/y")
+    assert not guard.requires_bump("plugins/skills/y")

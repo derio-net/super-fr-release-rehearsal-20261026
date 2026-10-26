@@ -1,0 +1,76 @@
+# Acceptance Matrix — Backfill Rule (repo-wide)
+
+## Rule
+
+`docs/acceptance/matrix.yaml` is the registry of business-level acceptance
+tests × verification levels × automation status. **Any PR that does one of
+the following updates the matrix in the SAME PR:**
+
+- adds or changes a spec `## Test Plan` (new spec ⇒ new rows; the CI
+  staleness guard fails a spec with a Test Plan that no row cites)
+- adds tests that verify an existing row (add the ref to `levels`, move
+  `status` up: `not-implemented` → `unwired` → `ci`/`scheduled`)
+- ships a surface or capability a `not-implemented` row waits on
+- changes CI workflows that run matrix-referenced checks
+- discovers a red acceptance: set `status: failing` — the
+  `acceptance-report` workflow then FAILS by design until it is fixed or
+  re-classified with reasoning in `notes`
+
+Statuses move **explicitly, never silently** — and they move with
+`fr acceptance set-status`, never a hand-edit: `ci` | `scheduled` (automated
+— the safe end) · `walked` (proven live, dated by its latest passing walk —
+`set-status --walk … --status walked` is the move after a walk) · `manual` (a
+process that is never automatable) · `unwired` (a test exists, not in CI —
+debt) · `walk-owed` (a live or post-merge walk is owed — debt) ·
+`not-implemented` (nothing exists — debt) · `failing` (fails CI). The debt set
+is `DEBT_STATUSES` (`fr.acceptance.model`); `walked` and `manual` are listed,
+never debt. The old `skipped` (matrix v4) is refused by name — `fr migrate
+artifacts --yes` splits it.
+
+## How
+
+- Add rows: `fr acceptance add --id ... --capability ... --acceptance ...
+  --origin <repo>:<path> --level unit=<repo>:<path> --status ... --notes ...`
+  (`add` CREATES; re-adding an existing id is refused, exit 2.)
+- Move a status: `fr acceptance set-status --id ... --status ...
+  --notes "<why it moved>" [--level unit=<repo>:<path>]` — the whole
+  documented transition in one command: it rewrites the row in place, adds
+  the evidence refs, and regenerates all three committed reports. `--notes`
+  is required (a status that moved for no recorded reason is the silent
+  change this rule forbids), and an unknown id or status is refused rather
+  than created. `--drop-level <level>=<ref>` (repeatable) removes a stale
+  evidence ref in the same rewrite — pair it with `--level` to re-point a
+  row in one call — and is refused (exit 2, nothing changed) when the ref is
+  not on the row or is also named in `--level`. The matrix is a registry of
+  CURRENT state, so this mutates;
+  its journal counterpart `fr journal resolve` appends instead, because a
+  journal is a log.
+- Anchor a Python ref on the test's NAME, never its line:
+  `<repo>:tests/x.py#test_y` or `#TestX::test_y` (pytest's node spelling). A
+  `#L<n>` slides onto whatever test lands there next, silently — 27 of this
+  matrix's 78 had, by the time gh#531 measured it. `add` / `set-status` refuse
+  a new one; `check` fails one, and a name that no longer resolves;
+  `fr migrate artifacts --yes` converts existing ones where the line still
+  sits in a test.
+- Check: `fr acceptance check` (refs, staleness, statuses; exit 2 on
+  `failing`). Nag: `fr acceptance status` — **any agent session in this repo
+  runs `fr acceptance status --brief` at session start** (Claude Code does it
+  automatically via the super-fr SessionStart hook; other harnesses honor
+  this line).
+- Reports: THREE **committed, tracked** renderings of `matrix.yaml`, kept in
+  sync — `docs/acceptance/report_local.html` (local links, viewable from a
+  checkout), `docs/acceptance/report_linked.html` (github.com blob links), and
+  `docs/acceptance/report_linked.md` (the linked report as **Markdown**, which
+  github.com renders inline — committed `.html` is shown as source, not
+  rendered). `fr acceptance add` regenerates **all three**; drift (incl.
+  hand-edited status flips) is gated by `fr acceptance check` itself — it fails
+  when any committed report is missing or stale — plus `fr acceptance report
+  --check` and the report-sync tripwire. Regenerate by hand with `fr acceptance
+  report --deterministic` (writes all three) and commit them. `docs/acceptance/
+  report.html` is a separate **ad-hoc, gitignored** render: `fr acceptance
+  report` (no flag) writes it git-stamped honoring `--link-mode` (github in CI,
+  local otherwise); links resolve relative to sibling checkouts
+  (`--sibling-root`, default `..`).
+- CI: `.github/workflows/acceptance-report.yml` gates every PR and every push to main,
+  writes a Markdown summary to each Actions run (PR, main), uploads the
+  GitHub-linked report artifact, and upserts the weekly "Acceptance debt" issue.

@@ -1,0 +1,1053 @@
+"""`scripts/release.py` (spec 2026-09-26-version-bump-churn §3.C, §3.E, §5, §7 items 4-5).
+
+Every case runs in temp git repos under `tmp_path` — a bare `origin` plus a
+working clone seeded with a minimal copy of the version surfaces — never this
+checkout. The bump, the `uv lock --check` and every `gh` call are injected, so
+no real `uv` or `gh` runs and nothing reaches a real remote.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import re
+import subprocess
+import sys
+from collections.abc import Callable
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[2]
+SCRIPT = REPO / "scripts" / "release.py"
+spec = importlib.util.spec_from_file_location("release_script", SCRIPT)
+assert spec and spec.loader
+release = importlib.util.module_from_spec(spec)
+sys.modules["release_script"] = release
+spec.loader.exec_module(release)
+
+sys.path.insert(0, str(REPO / "scripts"))
+import version_surfaces as vs  # noqa: E402
+
+BASE = "4.23.0"
+BOT = "github-actions[bot]"
+PLAN_META = "docs/superpowers/plans/demo/_meta.yaml"
+ARCHIVED_META = "docs/superpowers/implemented/plans/old/_meta.yaml"
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def _lock(version: str) -> str:
+    return (
+        "version = 1\n"
+        "\n"
+        "[[package]]\n"
+        'name = "demo"\n'
+        f'version = "{version}"\n'
+        'source = { editable = "packages/demo" }\n'
+        "\n"
+        "[[package]]\n"
+        'name = "requests"\n'
+        'version = "2.31.0"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        "\n"
+        "[[package]]\n"
+        'name = "super-fr-workspace"\n'
+        f'version = "{version}"\n'
+        'source = { editable = "." }\n'
+    )
+
+
+def _seed(repo: Path, version: str = BASE) -> None:
+    files = {
+        "pyproject.toml": f'[project]\nname = "super-fr-workspace"\nversion = "{version}"\n',
+        "packages/demo/pyproject.toml": f'[project]\nname = "demo"\nversion = "{version}"\n',
+        "packages/demo/src/demo/__init__.py": 'FLOOR = ">=4.20.0,<5.0.0"\n',
+        "packages/fr-opencode-plugin/package.json": json.dumps(
+            {"name": "fr-opencode-plugin", "version": version}, indent=2
+        )
+        + "\n",
+        "plugins/super-fr/.claude-plugin/plugin.json": json.dumps(
+            {"name": "super-fr", "version": version}, indent=4
+        )
+        + "\n",
+        ".claude-plugin/marketplace.json": json.dumps(
+            {"plugins": [{"name": "super-fr", "version": version}]}, indent=4
+        )
+        + "\n",
+        "uv.lock": _lock(version),
+        "README.md": "# demo\n",
+        ".changes/README.md": "# fragments\n",
+        PLAN_META: "slug: demo\nfr_version: '>=4.20.0,<5.0.0'\nschema_version: 2\n",
+        ARCHIVED_META: "slug: old\nfr_version: '>=3.0.0,<4.0.0'\n",
+    }
+    for rel, text in files.items():
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+
+class World:
+    """A bare origin, the release clone, and a second clone for 'other people'."""
+
+    def __init__(self, tmp: Path) -> None:
+        self.origin = tmp / "origin.git"
+        seed = tmp / "seed"
+        seed.mkdir()
+        _git(seed, "init", "-q", "-b", "main")
+        _seed(seed)
+        _git(seed, "add", "-A")
+        _git(seed, "commit", "-q", "-m", "base")
+        _git(seed, "tag", "-a", f"v{BASE}", "-m", f"v{BASE}")
+        _git(tmp, "clone", "-q", "--bare", str(seed), str(self.origin))
+        self.clone = tmp / "clone"
+        _git(tmp, "clone", "-q", str(self.origin), str(self.clone))
+        self.other = tmp / "other"
+        _git(tmp, "clone", "-q", str(self.origin), str(self.other))
+        self.gh_calls: list[list[str]] = []
+        self.bump_calls: list[str] = []
+        self.lock_ok = True
+        self.test_calls: list[tuple[str, str]] = []  # (version tested, origin's version then)
+        self.test_failure: str | None = None
+        self.before_push: Callable[[int], None] = lambda n: None
+        self.migrate_calls: list[str] = []  # the version on disk when migrate ran
+        self.migrate_failure: str | None = None
+
+    # -- other people's pushes -------------------------------------------
+    def land(self, rel: str, text: str, message: str = "a merged PR") -> None:
+        """Commit `rel` in the other clone and push it to origin (a merged PR)."""
+        _git(self.other, "pull", "-q", "--ff-only", "origin", "main")
+        path = self.other / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        _git(self.other, "add", "-A")
+        _git(self.other, "commit", "-q", "-m", message)
+        _git(self.other, "push", "-q", "origin", "HEAD:main")
+
+    def fragment(self, name: str, bump: str, summary: str) -> None:
+        self.land(f".changes/{name}.yaml", f"bump: {bump}\nsummary: {summary}\n")
+
+    # -- origin state ----------------------------------------------------
+    def origin_show(self, path: str, ref: str = "main") -> str | None:
+        r = subprocess.run(
+            ["git", "show", f"{ref}:{path}"], cwd=self.origin, capture_output=True, text=True
+        )
+        return r.stdout if r.returncode == 0 else None
+
+    def origin_version(self) -> str:
+        text = self.origin_show("pyproject.toml")
+        assert text is not None
+        return text.split('version = "', 1)[1].split('"', 1)[0]
+
+    def origin_tags(self) -> list[str]:
+        return _git(self.origin, "tag", "--list").split()
+
+    def origin_log(self, fmt: str = "%s") -> list[str]:
+        return _git(self.origin, "log", f"--format={fmt}", "main").splitlines()
+
+    # -- injected commands ------------------------------------------------
+    def commands(self):  # type: ignore[no-untyped-def]
+        push_count = [0]
+
+        def bump(repo: Path, new: str) -> None:
+            self.bump_calls.append(new)
+            vs.write_version(repo, new)
+            push_count[0] += 1
+            self.before_push(push_count[0])
+
+        def lock_check(repo: Path) -> str | None:
+            return None if self.lock_ok else "uv.lock needs to be updated"
+
+        def gh(args: list[str]) -> subprocess.CompletedProcess[str]:
+            self.gh_calls.append(list(args))
+            return subprocess.CompletedProcess(["gh", *args], 0, "", "")
+
+        def migrate(repo: Path) -> str | None:
+            # What `fr migrate artifacts --yes` does at the bumped number: widen
+            # every LIVE plan's ceiling to the installed major's (never archives).
+            installed = next(iter({s.value for s in vs.version_surfaces(repo)}))
+            self.migrate_calls.append(installed)
+            ceiling = f"<{int(installed.split('.')[0]) + 1}.0.0"
+            for meta in (repo / "docs/superpowers/plans").glob("*/_meta.yaml"):
+                text = meta.read_text()
+                meta.write_text(re.sub(r"<\d+\.0\.0", ceiling, text))
+            return self.migrate_failure
+
+        def test(repo: Path, new: str) -> str | None:
+            self.test_calls.append((new, self.origin_version()))
+            assert {s.value for s in vs.version_surfaces(repo)} == {new}
+            return self.test_failure
+
+        return release.Commands(bump=bump, lock_check=lock_check, gh=gh, test=test, migrate=migrate)
+
+    def run(self, *argv: str) -> int:
+        return release.main(list(argv), repo=self.clone, commands=self.commands())
+
+
+@pytest.fixture
+def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
+    for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    # Commits in the clone use the bot identity release.py sets; the other clone
+    # and the tests use `-c user.*`. No global identity is assumed.
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    return World(tmp_path)
+
+
+def _release_calls(world: World) -> list[list[str]]:
+    return [c for c in world.gh_calls if c[:2] == ["release", "create"]]
+
+
+def _issue_calls(world: World) -> list[list[str]]:
+    return [c for c in world.gh_calls if c[:2] == ["issue", "create"]]
+
+
+def _arg(call: list[str], flag: str) -> str:
+    return call[call.index(flag) + 1]
+
+
+# -- aggregation and the release commit ------------------------------------
+
+
+def test_fragments_aggregate_to_the_highest_bump_and_are_removed_in_the_release_commit(
+    world: World,
+) -> None:
+    world.fragment("fix-a", "patch", "fix the thing")
+    world.fragment("feat-b", "minor", "add the feature")
+    world.fragment("fix-c", "patch", "fix another thing")
+
+    assert world.run() == 0
+
+    assert world.origin_version() == "4.24.0"
+    assert world.origin_log()[0] == "release: v4.24.0"
+    author = world.origin_log("%an")[0]
+    assert author == BOT
+    # Fragments are gone in the SAME commit that moved the version.
+    changed = _git(world.origin, "show", "--name-status", "--format=", "main").splitlines()
+    assert "D\t.changes/fix-a.yaml" in changed
+    assert "D\t.changes/feat-b.yaml" in changed
+    assert "D\t.changes/fix-c.yaml" in changed
+    assert "M\tpyproject.toml" in changed
+    assert world.origin_show(".changes/README.md") is not None
+    body = world.origin_log("%b")
+    text = "\n".join(body)
+    assert text.index("add the feature") < text.index("fix the thing")
+    assert "fix another thing" in text
+    # Grouped by bump: the minor heading comes before the patch heading.
+    assert text.index("Minor") < text.index("Patch")
+    assert "v4.24.0" in world.origin_tags()
+    (call,) = _release_calls(world)
+    assert call[2] == "v4.24.0"
+    assert "--generate-notes" in call
+    notes = _arg(call, "--notes")
+    assert "add the feature" in notes and "fix the thing" in notes
+
+
+def test_every_surface_moves_and_the_bump_gets_the_explicit_number(world: World) -> None:
+    world.fragment("feat-x", "major", "a breaking change")
+    assert world.run() == 0
+    assert world.bump_calls == ["5.0.0"]
+    _git(world.clone, "fetch", "-q", "origin")
+    _git(world.clone, "reset", "-q", "--hard", "origin/main")
+    assert {s.value for s in vs.version_surfaces(world.clone)} == {"5.0.0"}
+
+
+def test_no_fragments_and_a_tagged_version_is_a_no_op(world: World) -> None:
+    before = world.origin_log("%H")
+    assert world.run() == 0
+    assert world.origin_log("%H") == before
+    assert world.gh_calls == []
+    assert world.bump_calls == []
+    assert world.origin_tags() == [f"v{BASE}"]
+
+
+def test_no_fragments_and_an_untagged_version_only_tags(world: World) -> None:
+    _git(world.origin, "tag", "-d", f"v{BASE}")
+    before = world.origin_log("%H")
+    assert world.run() == 0
+    assert world.origin_log("%H") == before
+    assert world.bump_calls == []
+    assert world.origin_tags() == [f"v{BASE}"]
+    tag_type = _git(world.origin, "cat-file", "-t", f"v{BASE}").strip()
+    assert tag_type == "tag"  # annotated, as auto-tag.yml made them
+    (call,) = _release_calls(world)
+    assert call[2] == f"v{BASE}"
+    # Not a release commit, so there are no notes to read: --generate-notes alone.
+    assert "--notes" not in call and "--generate-notes" in call
+
+
+def test_two_runs_back_to_back_are_safe(world: World) -> None:
+    world.fragment("feat-b", "minor", "add the feature")
+    assert world.run() == 0
+    head = world.origin_log("%H")
+    assert world.run() == 0
+    assert world.origin_log("%H") == head
+    assert len(_release_calls(world)) == 1
+
+
+# -- the race ----------------------------------------------------------------
+
+
+def test_a_push_lost_to_a_new_commit_recomputes_and_includes_its_fragment(
+    world: World,
+) -> None:
+    world.fragment("fix-a", "patch", "fix the thing")
+
+    def race(n: int) -> None:
+        if n == 1:
+            world.fragment("feat-late", "minor", "landed while releasing")
+
+    world.before_push = race
+    assert world.run() == 0
+    assert world.bump_calls == ["4.23.1", "4.24.0"]
+    assert world.origin_version() == "4.24.0"
+    assert world.origin_show(".changes/feat-late.yaml") is None
+    assert world.origin_show(".changes/fix-a.yaml") is None
+    body = "\n".join(world.origin_log("%b"))
+    assert "landed while releasing" in body and "fix the thing" in body
+    # Recomputed from scratch, never rebased: one release commit on origin.
+    assert world.origin_log().count("release: v4.24.0") == 1
+    assert not any(s.startswith("release: v4.23.1") for s in world.origin_log())
+
+
+def test_three_lost_races_exit_non_zero(world: World, capsys: pytest.CaptureFixture[str]) -> None:
+    world.fragment("fix-a", "patch", "fix the thing")
+    world.before_push = lambda n: world.land(f"docs/n{n}.md", f"{n}\n")
+    code = world.run()
+    assert code != 0
+    assert len(world.bump_calls) == 3
+    assert not any(s.startswith("release:") for s in world.origin_log())
+    assert world.gh_calls == []
+    assert "3" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        # Classic branch protection.
+        "error: GH006: Protected branch update failed for refs/heads/main.",
+        # A ruleset — what THIS repo's `protect main` would send once it gains a
+        # required-PR rule (review rp3-f1): no GH006, no "protected branch".
+        "error: GH013: Repository rule violations found for refs/heads/main.\\n"
+        "- Changes must be made through a pull request.",
+        # Any other server-side decline: git reports it as `[remote rejected]`,
+        # never as a race's plain `[rejected]`.
+        "error: refusing the update",
+    ],
+    ids=["gh006-classic", "gh013-ruleset", "generic-remote-rejected"],
+)
+def test_a_protection_refusal_fails_at_once_naming_the_bypass_actor(
+    world: World, capsys: pytest.CaptureFixture[str], refusal: str
+) -> None:
+    world.fragment("fix-a", "patch", "fix the thing")
+    # A pre-receive hook relays the line as `remote: error: ...`, as GitHub's reply reads.
+    hook = world.origin / "hooks" / "pre-receive"
+    hook.write_text(f"#!/bin/sh\nprintf '{refusal}\\n' >&2\nexit 1\n")
+    hook.chmod(0o755)
+
+    code = world.run()
+    assert code != 0
+    assert len(world.bump_calls) == 1  # never retried as a lost race
+    err = capsys.readouterr().err
+    assert "bypass actor" in err
+    assert "derio-fr-automation" in err
+    assert "FR_AUTOMATION_APP_ID" in err
+    assert "protection" in err
+    assert "lost the push race" not in err
+
+
+# -- refusals ----------------------------------------------------------------
+
+
+def test_an_override_not_above_the_current_version_is_refused(
+    world: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for version in (BASE, "4.22.9"):
+        assert world.run("--version", version) != 0
+        assert "above" in capsys.readouterr().err
+    assert world.bump_calls == []
+
+
+def test_an_override_wins_over_the_fragments(world: World) -> None:
+    world.fragment("fix-a", "patch", "fix the thing")
+    assert world.run("--version", "5.0.0") == 0
+    assert world.origin_version() == "5.0.0"
+    assert world.origin_show(".changes/fix-a.yaml") is None
+
+
+def test_an_override_with_no_fragments_releases_with_generated_notes_alone(
+    world: World,
+) -> None:
+    assert world.run("--version", "4.23.5") == 0
+    assert world.origin_version() == "4.23.5"
+    (call,) = _release_calls(world)
+    assert "--notes" not in call and "--generate-notes" in call
+
+
+def test_a_pre_existing_tag_at_the_computed_version_is_bumped_past(world: World) -> None:
+    _git(world.other, "tag", "-a", "v4.24.0", "-m", "manual")
+    _git(world.other, "push", "-q", "origin", "v4.24.0")
+    manual = _git(world.origin, "rev-parse", "v4.24.0").strip()
+    world.fragment("feat-b", "minor", "add the feature")
+    assert world.run() == 0
+    assert world.origin_version() == "4.25.0"
+    assert _git(world.origin, "rev-parse", "v4.24.0").strip() == manual  # never re-tagged
+    assert "v4.25.0" in world.origin_tags()
+
+
+def test_an_invalid_fragment_refuses_the_release(
+    world: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world.fragment("fix-a", "patch", "fix the thing")
+    world.land(".changes/bad.yaml", "bump: huge\nsummary: nope\n")
+    assert world.run() != 0
+    err = capsys.readouterr().err
+    assert "bad.yaml" in err and "bump" in err
+    assert world.bump_calls == []
+    assert world.origin_version() == BASE
+
+
+def test_a_failing_lock_check_refuses(world: World, capsys: pytest.CaptureFixture[str]) -> None:
+    world.fragment("fix-a", "patch", "fix the thing")
+    world.lock_ok = False
+    assert world.run() != 0
+    assert "uv.lock" in capsys.readouterr().err
+    assert world.bump_calls == []
+    assert world.origin_version() == BASE
+
+
+@pytest.mark.parametrize(
+    "stray",
+    [
+        ("README.md", "# demo\nsmuggled\n"),
+        ("pyproject.toml", None),  # a non-version line in a surface file
+    ],
+    ids=["other-file", "other-line-in-a-surface"],
+)
+def test_a_staged_line_outside_the_version_surfaces_refuses(
+    world: World, capsys: pytest.CaptureFixture[str], stray: tuple[str, str | None]
+) -> None:
+    world.fragment("fix-a", "patch", "fix the thing")
+    rel, text = stray
+
+    def smuggle(n: int) -> None:
+        path = world.clone / rel
+        if text is None:
+            path.write_text(path.read_text() + 'description = "smuggled"\n')
+        else:
+            path.write_text(text)
+
+    world.before_push = smuggle
+    assert world.run() != 0
+    err = capsys.readouterr().err
+    assert rel in err
+    assert world.origin_version() == BASE
+    assert not any(s.startswith("release:") for s in world.origin_log())
+
+
+def test_a_rerun_reads_its_notes_from_the_release_commit_body(world: World) -> None:
+    world.fragment("feat-b", "minor", "add the feature")
+    world.fragment("fix-a", "patch", "fix the thing")
+    assert world.run() == 0
+    # Simulate a run that pushed the release commit but died before tagging.
+    _git(world.origin, "tag", "-d", "v4.24.0")
+    world.gh_calls.clear()
+    world.fragment("docs", "patch", "x")  # noise: a later PR must not change the notes
+    _git(world.other, "rm", "-q", ".changes/docs.yaml")
+    _git(world.other, "commit", "-q", "-m", "drop")
+    _git(world.other, "push", "-q", "origin", "HEAD:main")
+
+    assert world.run() == 0
+    (call,) = _release_calls(world)
+    assert call[2] == "v4.24.0"
+    notes = _arg(call, "--notes")
+    assert "add the feature" in notes and "fix the thing" in notes
+    assert "--generate-notes" in call
+
+
+# -- dry run -------------------------------------------------------------------
+
+
+def test_dry_run_prints_the_bump_and_writes_nothing(
+    world: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (world.clone / ".changes").mkdir(exist_ok=True)
+    (world.clone / ".changes" / "feat-b.yaml").write_text("bump: minor\nsummary: add it\n")
+    status_before = _git(world.clone, "status", "--porcelain")
+    head = world.origin_log("%H")
+    assert world.run("--dry-run") == 0
+    out = capsys.readouterr().out
+    assert "4.24.0" in out and "minor" in out
+    assert _git(world.clone, "status", "--porcelain") == status_before
+    assert world.origin_log("%H") == head
+    assert world.bump_calls == [] and world.gh_calls == []
+
+
+# -- the release-time floor check (§3.E) ---------------------------------------
+
+
+def test_a_floor_naming_the_wrong_release_still_tags_then_fails_and_files_an_issue(
+    world: World,
+) -> None:
+    # A PR guessed 4.24.0, but a major landed with it, so this releases as 5.0.0.
+    world.land(
+        "packages/demo/src/demo/new.py", 'SCOPE_FR_VERSION = ">=4.24.0,<5.0.0"\n', "floor PR"
+    )
+    world.fragment("feat-b", "minor", "the floor's feature")
+    world.fragment("big", "major", "a breaking change")
+
+    code = world.run()
+    assert code == release.EXIT_FLOOR
+    assert code not in (0, 1)
+    assert "v5.0.0" in world.origin_tags()  # the number itself is right, so it tags
+    assert len(_release_calls(world)) == 1
+    (issue,) = _issue_calls(world)
+    title, body = _arg(issue, "--title"), _arg(issue, "--body")
+    assert "5.0.0" in title
+    assert "packages/demo/src/demo/new.py" in body
+    assert ">=4.24.0" in body and ">=5.0.0" in body
+
+
+def test_a_floor_naming_the_released_version_passes(world: World) -> None:
+    world.land(
+        "packages/demo/src/demo/new.py", 'SCOPE_FR_VERSION = ">=4.24.0,<5.0.0"\n', "floor PR"
+    )
+    world.fragment("feat-b", "minor", "the floor's feature")
+    assert world.run() == 0
+    assert _issue_calls(world) == []
+
+
+def test_a_historical_floor_never_trips_the_release_check(world: World) -> None:
+    world.land(
+        "packages/demo/src/demo/__init__.py", 'FLOOR = ">=4.20.0,<6.0.0"  # moved\n', "reformat"
+    )
+    world.fragment("fix-a", "patch", "fix the thing")
+    assert world.run() == 0
+    assert _issue_calls(world) == []
+
+
+# -- the staged tree is tested at the new version before it is pushed (#854) --
+
+
+def test_the_staged_tree_is_tested_at_the_new_version_before_the_push(world: World) -> None:
+    world.fragment("feat-x", "major", "a breaking change")
+
+    assert world.run() == 0
+
+    # Tested once, at 5.0.0, while origin still said 4.23.0: before the push.
+    assert world.test_calls == [("5.0.0", BASE)]
+    assert world.origin_version() == "5.0.0"
+
+
+def test_a_red_staged_tree_pushes_nothing_tags_nothing_publishes_nothing(
+    world: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world.fragment("feat-x", "major", "a breaking change")
+    world.test_failure = "415 failed, 3101 passed"
+    before = world.origin_log("%H")
+
+    assert world.run() == release.EXIT_REFUSED
+
+    err = capsys.readouterr().err
+    assert "5.0.0" in err and "415 failed" in err
+    assert world.origin_log("%H") == before
+    assert world.origin_tags() == [f"v{BASE}"]
+    assert _release_calls(world) == []
+
+
+def test_no_release_commit_means_no_test_run(world: World) -> None:
+    assert world.run() == 0
+    assert world.test_calls == []
+
+
+def test_a_lost_race_retests_the_recomputed_tree(world: World) -> None:
+    world.fragment("fix-a", "patch", "fix the thing")
+
+    def race(n: int) -> None:
+        if n == 1:
+            world.fragment("feat-b", "minor", "add the feature")
+
+    world.before_push = race
+    assert world.run() == 0
+    assert [v for v, _ in world.test_calls] == ["4.23.1", "4.24.0"]
+
+
+# -- the default test command ---------------------------------------------------
+
+
+class _FakeRun:
+    """Stands in for subprocess.run: `fr` reports `installed`, pytest exits `rc`."""
+
+    def __init__(self, installed: str, rc: int = 0, tail: str = "3516 passed") -> None:
+        self.installed, self.rc, self.tail = installed, rc, tail
+        self.calls: list[list[str]] = []
+        self.envs: list[object] = []
+
+    def __call__(self, cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        self.calls.append(list(cmd))
+        self.envs.append(kw.get("env"))
+        if "pytest" in cmd:
+            return subprocess.CompletedProcess(cmd, self.rc, f"...\n{self.tail}\n", "")
+        return subprocess.CompletedProcess(cmd, 0, f"{self.installed}\n", "")
+
+
+def test_the_default_test_command_runs_the_suite_against_the_locked_env(tmp_path: Path) -> None:
+    run = _FakeRun("5.0.0")
+
+    assert release._run_staged_tests(tmp_path, "5.0.0", run=run) is None
+
+    pytest_call = next(c for c in run.calls if "pytest" in c)
+    assert pytest_call[:3] == ["uv", "run", "--locked"]
+    # The version probe runs first: never a green suite at the wrong number.
+    assert "pytest" not in run.calls[0]
+
+
+def test_the_default_test_command_refuses_an_env_still_at_the_old_version(
+    tmp_path: Path,
+) -> None:
+    run = _FakeRun("4.40.1")
+
+    failure = release._run_staged_tests(tmp_path, "5.0.0", run=run)
+
+    assert failure is not None and "4.40.1" in failure and "5.0.0" in failure
+    assert not any("pytest" in c for c in run.calls)
+
+
+def test_the_default_test_command_reports_the_pytest_tail_when_red(tmp_path: Path) -> None:
+    run = _FakeRun("5.0.0", rc=1, tail="415 failed, 3101 passed")
+
+    failure = release._run_staged_tests(tmp_path, "5.0.0", run=run)
+
+    assert failure is not None and "415 failed" in failure
+
+
+# -- a major migrates this repo's own live plans in the release commit (#861) ---
+
+
+def test_a_major_release_widens_the_live_plans_ceiling_in_the_release_commit(
+    world: World,
+) -> None:
+    world.fragment("feat-x", "major", "a breaking change")
+
+    assert world.run() == 0
+
+    # Migrated AT the new number, so the repair widens to the new major's ceiling.
+    assert world.migrate_calls == ["5.0.0"]
+    assert "'>=4.20.0,<6.0.0'" in (world.origin_show(PLAN_META) or "")
+    # Archives record what shipped: never rewritten.
+    assert "<4.0.0" in (world.origin_show(ARCHIVED_META) or "")
+    assert world.origin_log()[0] == "release: v5.0.0"
+
+
+def test_a_minor_release_migrates_nothing_and_still_releases(world: World) -> None:
+    world.fragment("feat-b", "minor", "add the feature")
+
+    assert world.run() == 0
+
+    assert world.migrate_calls == ["4.24.0"]
+    assert "'>=4.20.0,<5.0.0'" in (world.origin_show(PLAN_META) or "")
+
+
+def test_a_failed_migration_refuses_the_release(
+    world: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world.fragment("feat-x", "major", "a breaking change")
+    world.migrate_failure = "FAILED: docs/superpowers/plans/demo/_meta.yaml"
+    before = world.origin_log("%H")
+
+    assert world.run() == release.EXIT_REFUSED
+
+    assert "demo/_meta.yaml" in capsys.readouterr().err
+    assert world.origin_log("%H") == before
+    assert world.test_calls == []
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        ("fr_version: '>=4.20.0,<5.0.0'", "fr_version: '>=4.0.0,<6.0.0'"),  # the floor moved
+        ("fr_version: '>=4.20.0,<5.0.0'", "fr_version: '>=4.20.0,<7.0.0'"),  # not the new major
+        ("slug: demo", "slug: smuggled"),  # another line of a plan
+    ],
+    ids=["floor", "wrong-ceiling", "other-line"],
+)
+def test_a_plan_edit_other_than_the_ceiling_widening_refuses(
+    world: World, capsys: pytest.CaptureFixture[str], edit: tuple[str, str]
+) -> None:
+    world.fragment("feat-x", "major", "a breaking change")
+
+    def smuggle(n: int) -> None:
+        path = world.clone / PLAN_META
+        path.write_text(path.read_text().replace(*edit))
+
+    world.before_push = smuggle  # runs inside bump, before migrate and the check
+    original = world.commands()
+
+    def migrate_nothing(repo: Path) -> str | None:  # leave the smuggled edit as-is
+        return None
+
+    cmds = release.Commands(
+        bump=original.bump,
+        lock_check=original.lock_check,
+        gh=original.gh,
+        test=original.test,
+        migrate=migrate_nothing,
+    )
+    assert release.main([], repo=world.clone, commands=cmds) != 0
+
+    assert PLAN_META in capsys.readouterr().err
+    assert world.origin_version() == BASE
+
+
+def test_widening_an_archived_plan_refuses(
+    world: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world.fragment("feat-x", "major", "a breaking change")
+
+    def smuggle(n: int) -> None:
+        path = world.clone / ARCHIVED_META
+        path.write_text(path.read_text().replace("<4.0.0", "<6.0.0"))
+
+    world.before_push = smuggle
+    assert world.run() != 0
+
+    assert ARCHIVED_META in capsys.readouterr().err
+    assert world.origin_version() == BASE
+
+
+def test_the_default_migrate_command_applies_fr_migrate_in_the_locked_env(
+    tmp_path: Path,
+) -> None:
+    run = _FakeRun("5.0.0")
+
+    assert release._run_migrate(tmp_path, run=run) is None
+
+    assert run.calls == [["uv", "run", "--locked", "fr", "migrate", "artifacts", "--yes"]]
+
+
+def test_the_default_migrate_command_reports_a_failure(tmp_path: Path) -> None:
+    def run(cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 2, "  FAILED: plans/x/_meta.yaml\n", "boom")
+
+    failure = release._run_migrate(tmp_path, run=run)
+
+    assert failure is not None and "plans/x/_meta.yaml" in failure and "boom" in failure
+
+
+# The allowlist checked against what the REAL repair writes, not a fake's regex.
+@pytest.mark.parametrize(
+    "line",
+    [
+        "fr_version: '>=4.20.0,<5.0.0'",
+        'fr_version: ">=4.20.0,<5.0.0"',
+        "fr_version: '>=4.20.0, <5.0.0'",
+        "fr_version: '>= 4.20, < 5.0.0'",
+        "fr_version: '>=4.20.0,<=4.99.0'",
+        "fr_version: '>=4.20.0,<5.0.0,!=4.21.0'",
+    ],
+)
+def test_the_real_ceiling_repair_output_is_admitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, line: str
+) -> None:
+    from fr.artifacts import fr_version
+    from packaging.version import Version
+
+    monkeypatch.setattr(fr_version, "installed_fr_version", lambda: Version("5.0.0"))
+    meta = tmp_path / "_meta.yaml"
+    meta.write_text(f"slug: demo\n{line}\n")
+
+    fr_version.widen(meta)
+
+    after = meta.read_text().splitlines()[1]
+    assert after != line
+    assert release._plan_ceiling_widened([line], [after], "5.0.0")
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ("fr_version: '>=4.20.0,<9.0.0'", "fr_version: '>=4.20.0,<6.0.0'"),  # a narrowing
+        ("fr_version: '>=4.20.0,<6.0.0'", "fr_version: '>=4.20.0,<6.0.0 '"),  # trail moved
+        ("fr_version: '>=4.20.0'", "fr_version: '>=4.20.0,<6.0.0'"),  # a ceiling added
+        ("fr_version: '>=4.20.0,<5.0.0'", 'fr_version: ">=4.20.0,<6.0.0"'),  # quoting moved
+        ("slug: demo", "slug: other"),  # not an fr_version line
+    ],
+    ids=["narrowing", "trail", "added-ceiling", "quoting", "other-key"],
+)
+def test_anything_but_a_ceiling_widening_is_refused(before: str, after: str) -> None:
+    assert not release._plan_ceiling_widened([before], [after], "5.0.0")
+
+
+def test_two_changed_plan_lines_are_refused() -> None:
+    lines = ["fr_version: '>=4.20.0,<5.0.0'", "fr_version: '>=4.20.0,<5.0.0'"]
+    widened = [s.replace("<5.0.0", "<6.0.0") for s in lines]
+    assert not release._plan_ceiling_widened(lines, widened, "5.0.0")
+
+
+def test_adding_or_deleting_a_live_plan_refuses(
+    world: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world.fragment("feat-x", "major", "a breaking change")
+
+    def smuggle(n: int) -> None:
+        (world.clone / PLAN_META).unlink()
+        extra = world.clone / "docs/superpowers/plans/new/_meta.yaml"
+        extra.parent.mkdir(parents=True)
+        extra.write_text("fr_version: '>=5.0.0,<6.0.0'\n")
+
+    world.before_push = smuggle
+    assert world.run() != 0
+
+    err = capsys.readouterr().err
+    assert f"{PLAN_META} (D)" in err and "plans/new/_meta.yaml (A)" in err
+    assert world.origin_version() == BASE
+
+
+# -- a PR that merged past an artifact-version bump: the release migrates its stamps ---
+#
+# The #1058 release: #1041 moved the `run` and `usage` stamps and migrated main's own
+# artifacts; #1058, tested against the main before it, merged afterwards carrying
+# its run cursor and usage file at the old stamps. The release's own `fr migrate
+# artifacts --yes` then rewrote both stamp lines and verify_staged refused them,
+# so nothing released. A stamp-only rewrite of a LIVE artifact is as mechanical
+# as a widened plan ceiling, and the staged tree is still tested before the push.
+
+RUN_CURSOR = "docs/superpowers/runs/2026-10-06-feat-x.yaml"
+USAGE_FILE = "docs/superpowers/usage/2026-10-06-feat-x.yaml"
+DEBUG_JOURNAL = "docs/superpowers/journals/debug/2026-10-06-x.md"
+ARCHIVED_RUN = "docs/superpowers/implemented/runs/2026-09-01-old.yaml"
+
+
+def _migrating(world: World, rewrite: Callable[[Path], None]) -> release.Commands:
+    original = world.commands()
+
+    def migrate(repo: Path) -> str | None:
+        failure = original.migrate(repo)
+        rewrite(repo)
+        return failure
+
+    return release.Commands(
+        bump=original.bump,
+        lock_check=original.lock_check,
+        gh=original.gh,
+        test=original.test,
+        migrate=migrate,
+    )
+
+
+def _bump_stamps(repo: Path) -> None:
+    for rel, old, new in (
+        (RUN_CURSOR, "schema_version: 8\n", "schema_version: 9\n"),
+        (USAGE_FILE, "schema_version: 1\n", "schema_version: 2\n"),
+        (DEBUG_JOURNAL, "<!-- fr:journal-schema=2 -->", "<!-- fr:journal-schema=3 -->"),
+    ):
+        path = repo / rel
+        path.write_text(path.read_text().replace(old, new, 1))
+
+
+def _land_stale_artifacts(world: World) -> None:
+    world.land(RUN_CURSOR, "schema_version: 8\nrun: 2026-10-06-feat-x\nbranch: feat/x\n")
+    world.land(USAGE_FILE, "schema_version: 1\nrun: 2026-10-06-feat-x\ncaptures: []\n")
+    world.land(DEBUG_JOURNAL, "<!-- fr:journal-schema=2 -->\n# x\n\nbody\n")
+
+
+def test_a_stamp_only_migration_of_live_artifacts_rides_the_release_commit(
+    world: World,
+) -> None:
+    _land_stale_artifacts(world)
+    world.fragment("feat-b", "minor", "add the feature")
+
+    cmds = _migrating(world, _bump_stamps)
+    assert release.main([], repo=world.clone, commands=cmds) == 0
+
+    assert world.origin_log()[0] == "release: v4.24.0"
+    assert (world.origin_show(RUN_CURSOR) or "").startswith("schema_version: 9\n")
+    assert (world.origin_show(USAGE_FILE) or "").startswith("schema_version: 2\n")
+    assert (world.origin_show(DEBUG_JOURNAL) or "").startswith("<!-- fr:journal-schema=3 -->")
+    assert world.test_calls  # the migrated tree was still tested before the push
+
+
+def test_inserting_a_missing_stamp_rides_the_release_commit(world: World) -> None:
+    world.land(USAGE_FILE, "run: 2026-10-06-feat-x\ncaptures: []\n")
+    world.fragment("feat-b", "minor", "add the feature")
+
+    def insert(repo: Path) -> None:
+        path = repo / USAGE_FILE
+        path.write_text("schema_version: 2\n" + path.read_text())
+
+    assert release.main([], repo=world.clone, commands=_migrating(world, insert)) == 0
+    assert (world.origin_show(USAGE_FILE) or "").startswith("schema_version: 2\n")
+
+
+@pytest.mark.parametrize(
+    ("rel", "old", "new"),
+    [
+        (RUN_CURSOR, "branch: feat/x\n", "branch: feat/y\n"),  # a body line
+        (RUN_CURSOR, "schema_version: 8\n", "schema_version: 7\n"),  # a stamp moving down
+        (RUN_CURSOR, "schema_version: 8\n", "schema_version: 9\nextra: 1\n"),  # stamp + body
+        (ARCHIVED_RUN, "schema_version: 4\n", "schema_version: 9\n"),  # an archive
+        ("README.md", "# demo\n", "schema_version: 2\n# demo\n"),  # not an artifact
+    ],
+    ids=["body-line", "stamp-down", "stamp-plus-body", "archived", "not-an-artifact"],
+)
+def test_a_migration_beyond_a_live_stamp_refuses(
+    world: World, capsys: pytest.CaptureFixture[str], rel: str, old: str, new: str
+) -> None:
+    _land_stale_artifacts(world)
+    world.land(ARCHIVED_RUN, "schema_version: 4\nrun: old\n")
+    world.fragment("feat-b", "minor", "add the feature")
+
+    def rewrite(repo: Path) -> None:
+        path = repo / rel
+        path.write_text(path.read_text().replace(old, new, 1))
+
+    assert release.main([], repo=world.clone, commands=_migrating(world, rewrite)) != 0
+
+    assert rel in capsys.readouterr().err
+    assert world.origin_version() == BASE
+
+
+MATRIX = "docs/acceptance/matrix.yaml"
+RECORD = "docs/superpowers/runs/2026-10-06-feat-x.records/deliver.yaml"
+
+
+@pytest.mark.parametrize(
+    ("rel", "before", "after"),
+    [
+        (MATRIX, "schema_version: 3\nrows: []\n", "schema_version: 4\nrows: []\n"),
+        (RECORD, "schema_version: 7\nstep: deliver\n", "schema_version: 8\nstep: deliver\n"),
+        (
+            USAGE_FILE,
+            "---\n# usage\nrun: x\n",
+            "---\n# usage\nschema_version: 2\nrun: x\n",
+        ),  # inserted after the leading document marker and comments, as the writer does
+    ],
+    ids=["matrix", "record", "insert-after-header"],
+)
+def test_more_live_stamp_moves_ride_the_release_commit(
+    world: World, rel: str, before: str, after: str
+) -> None:
+    world.land(rel, before)
+    world.fragment("feat-b", "minor", "add the feature")
+
+    def rewrite(repo: Path) -> None:
+        (repo / rel).write_text(after)
+
+    assert release.main([], repo=world.clone, commands=_migrating(world, rewrite)) == 0
+    assert world.origin_show(rel) == after
+
+
+@pytest.mark.parametrize(
+    ("rel", "before", "after"),
+    [
+        (RUN_CURSOR, "schema_version: 8\nrun: x\n", "<!-- fr:journal-schema=9 -->\nrun: x\n"),
+        (
+            DEBUG_JOURNAL,
+            "<!-- fr:journal-schema=2 -->\n# x\n",
+            "schema_version: 3\n# x\n",
+        ),  # a YAML stamp in a journal
+        (
+            USAGE_FILE,
+            "schema_version: 1\nrun: x\n",
+            "schema_version: 1\nrun: x\nschema_version: 2\n",
+        ),
+        (USAGE_FILE, "run: x\ncaptures: []\n", "run: x\nschema_version: 2\ncaptures: []\n"),
+        (RUN_CURSOR, "schema_version: 8\nrun: x\n", "run: x\nschema_version: 9\n"),
+        (
+            "docs/superpowers/journals/implemented/old.md",
+            "<!-- fr:journal-schema=2 -->\n# x\n",
+            "<!-- fr:journal-schema=3 -->\n# x\n",
+        ),
+    ],
+    ids=[
+        "journal-stamp-in-yaml",
+        "yaml-stamp-in-journal",
+        "duplicate-stamp",
+        "inserted-below-a-key",
+        "moved-below-a-key",
+        "implemented-journal",
+    ],
+)
+def test_a_stamp_change_that_is_not_the_writers_refuses(
+    world: World, capsys: pytest.CaptureFixture[str], rel: str, before: str, after: str
+) -> None:
+    world.land(rel, before)
+    world.fragment("feat-b", "minor", "add the feature")
+
+    def rewrite(repo: Path) -> None:
+        (repo / rel).write_text(after)
+
+    assert release.main([], repo=world.clone, commands=_migrating(world, rewrite)) != 0
+    assert rel in capsys.readouterr().err
+    assert world.origin_version() == BASE
+
+
+def test_a_crlf_artifacts_stamp_move_rides_the_release_commit(world: World) -> None:
+    world.land(USAGE_FILE, "schema_version: 1\r\nrun: x\r\n")
+    world.fragment("feat-b", "minor", "add the feature")
+
+    def rewrite(repo: Path) -> None:
+        (repo / USAGE_FILE).write_bytes(b"schema_version: 2\r\nrun: x\r\n")
+
+    assert release.main([], repo=world.clone, commands=_migrating(world, rewrite)) == 0
+
+
+def test_a_change_hidden_behind_a_unicode_line_separator_refuses(
+    world: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # splitlines() would cut the added line at U+2028 and never check its tail.
+    world.land(RUN_CURSOR, "schema_version: 8\nrun: x\n")
+    world.fragment("feat-b", "minor", "add the feature")
+
+    def rewrite(repo: Path) -> None:
+        (repo / RUN_CURSOR).write_text("schema_version: 9 branch: smuggled\nrun: x\n")
+
+    assert release.main([], repo=world.clone, commands=_migrating(world, rewrite)) != 0
+    assert RUN_CURSOR in capsys.readouterr().err
+
+
+# -- no credential is readable by the staged tests (spec 2026-10-11 §F) ----------
+
+
+def test_the_staged_test_subprocess_env_carries_no_forge_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for var in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN"):
+        monkeypatch.setenv(var, "secret")
+    monkeypatch.setenv("KEEP_ME", "1")
+    run = _FakeRun("5.0.0")
+
+    assert release._run_staged_tests(tmp_path, "5.0.0", run=run) is None
+
+    assert len(run.envs) == 2  # the probe and the suite
+    for env in run.envs:
+        assert isinstance(env, dict)
+        assert not {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN"} & set(env)
+        assert env["KEEP_ME"] == "1"
+
+
+def test_pushes_authenticate_only_their_own_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[list[str]] = []
+
+    def fake(cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+        seen.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(release.subprocess, "run", fake)
+    release.push(tmp_path)
+    release._git(tmp_path, "status")
+
+    auth = ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"]
+    assert seen[0][1:5] == auth and "push" in seen[0]
+    assert "credential.helper=!gh auth git-credential" not in seen[1]

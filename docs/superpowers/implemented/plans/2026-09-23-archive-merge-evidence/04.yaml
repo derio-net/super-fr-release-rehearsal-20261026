@@ -1,0 +1,52 @@
+schema_version: 2
+phase:
+  number: 4
+  title: '[manual] Live verification - not merged on this branch, merged on main'
+  tag: manual
+  depends_on:
+  - 2
+  - 3
+  tracking_issue: null
+  acceptance:
+  - status-sweep-merge-evidence
+  - archive-refuses-unmerged-plan
+tasks:
+- number: 1
+  title: Verify the label before and after merge
+  steps:
+  - id: P4.T1.S1
+    text: |-
+      OPERATOR, on this run's branch after implement completes and before merge. Run uv run fr status from the worktree and confirm 2026-09-23-archive-merge-evidence is NOT listed as merged and no fr archive command is printed for it (it sits under in progress while this phase is open). Then run uv run fr archive docs/superpowers/plans/2026-09-23-archive-merge-evidence and confirm exit 2 naming the missing merge
+  - id: P4.T1.S2
+    text: |-
+      OPERATOR, after the PR merges and fr isolation verify-merge passes, on main. Run fr status and confirm the plan is listed as merged, under merged with manual phases still open (phase 4). In the close-out housekeeping branch tick this phase, re-run fr status and confirm the plan moves to merged but not archived with its own fr archive docs/superpowers/plans/2026-09-23-archive-merge-evidence line, then run that command and confirm it archives
+  - id: P4.T1.S3
+    text: |-
+      OPERATOR. Record the outcome in the housekeeping PR: if both checks pass, note live verification on both rows with fr acceptance set-status; if either fails, file an issue and set that row failing
+state:
+  steps:
+    P4.T1.S1:
+      state: x
+      ticked_at: '2026-09-24T15:00:41+00:00'
+      note: 'Verified pre-merge by the orchestrator on fix/526-status-archivable-merged
+        (plan journal live-premerge): in progress with phase 4 open; with phase 4
+        temporarily ticked, ''complete locally, not yet on origin/main (waiting for
+        merge)'' and JSON archivable=[]; fr archive exit 2 ''merge the PR first''.
+        Ticked in close-out; the operator merged #592 without ticking it.'
+    P4.T1.S2:
+      state: x
+      ticked_at: '2026-09-24T15:00:42+00:00'
+      note: 'On main @ a5b83567 after #592 merged (verify-merge OK): fr status listed
+        the plan under ''merged, manual phases still open (phase 4)''. The archivable
+        half is verified below, after this phase completes.'
+    P4.T1.S3:
+      state: x
+      ticked_at: '2026-09-24T15:00:43+00:00'
+      note: Outcome recorded in the close-out PR; both acceptance rows noted live-verified
+        via fr acceptance set-status.
+  completion:
+    at: '2026-09-24T15:00:54+00:00'
+    note: 'Live walk done: pre-merge not merged / no archive line / archive refuses;
+      post-merge merged with phase 4 open, then archivable with its own fr archive
+      line.'
+    observed_prs: []

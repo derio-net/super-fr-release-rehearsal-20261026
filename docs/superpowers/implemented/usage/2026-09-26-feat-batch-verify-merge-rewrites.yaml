@@ -1,0 +1,114 @@
+schema_version: 1
+run: 2026-09-26-feat-batch-verify-merge-rewrites
+captures:
+- host: h-1ffcdd26
+  harness: claude-code
+  mode: host-worktree
+  captured_at: '2026-10-04T05:15:23+00:00'
+  at:
+  - resolve:brainstorm
+  - deliver
+  - closeout
+  - backfill
+  sessions:
+  - session: 7c5ad7bb-e470-4cd0-b76d-c2448b14e467
+    role: main
+    models:
+      claude-sonnet-5:
+        input: 776
+        cache_write: 1303694
+        cache_read: 50684890
+        output: 72511
+        usd: 19.552179000000017
+        usd_source: exact
+      claude-opus-5-5:
+        input: 340
+        cache_write: 1182551
+        cache_read: 36808330
+        output: 71254
+        usd: 19.32605319999998
+        usd_source: exact
+      claude-haiku-4-5-20251001:
+        input: 0
+        cache_write: 0
+        cache_read: 0
+        output: 0
+        usd: 0.001634
+        usd_source: exact
+    activity:
+      implementation:
+        usd: 13.683363704670802
+        turns: 247
+      other:
+        usd: 17.06375691955106
+        turns: 184
+      paperwork:
+        usd: 8.132745575778143
+        turns: 130
+    steps:
+      (outside run):
+        usd: 2.7860165906032495
+        turns: 21
+      brainstorm:
+        usd: 0.574756723156022
+        turns: 12
+      spec-review:
+        usd: 0.5403305521296314
+        turns: 12
+      plan:
+        usd: 0.2287889280544922
+        turns: 4
+      implement:
+        usd: 2.532992154099192
+        turns: 57
+      journal-check:
+        usd: 0.04681809797784585
+        turns: 1
+      deliver:
+        usd: 32.17016315397958
+        turns: 432
+    briefs:
+      a6c16f87ab38181f3: 1072
+      phase/1/implement-phase: 1901
+      a6a03ceb06e10253d: 1256
+      a3a000b19944355d0: 3404
+      aae94ddac742e9ad4: 1671
+      a3be0e06072843aad: 2115
+      a569b83fdad8e5ae5: 4691
+      aa314fc56063d9e54: 2017
+      accc6bb7ff1d8d049: 1265
+      aa1f12c594c75f3bf: 1807
+      a5afa72445b4ed929: 1454
+      a3f72dc1a18485463: 5999
+      a9c7c97d8ebf515d7: 2073
+  - session: dfebcfa4-3fa8-4ad8-b662-22166c9cde21
+    role: main
+    models:
+      claude-opus-5-5:
+        input: 76
+        cache_write: 108895
+        cache_read: 3799012
+        output: 17716
+        usd: 1.9477334000000004
+        usd_source: exact
+      claude-haiku-4-5-20251001:
+        input: 0
+        cache_write: 0
+        cache_read: 0
+        output: 0
+        usd: 0.0011610000000000001
+        usd_source: exact
+    activity:
+      implementation:
+        usd: 0.11186082731090041
+        turns: 3
+      other:
+        usd: 0.6581345674603177
+        turns: 14
+      paperwork:
+        usd: 1.1788990052287827
+        turns: 20
+    steps:
+      (outside run):
+        usd: 1.9488944000000008
+        turns: 37

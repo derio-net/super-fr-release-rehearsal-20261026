@@ -1,0 +1,68 @@
+schema_version: 1
+run: 2026-09-26-fix-659-isolation-gc-fetch
+captures:
+- host: h-afad7d01
+  harness: opencode
+  mode: devcontainer
+  captured_at: '2026-09-26T11:23:36+00:00'
+  at:
+  - resolve:spec-review
+  - deliver
+  - closeout
+  sessions:
+  - session: ses_f22e821b3ffeRpfBm6FVTW2wpx
+    role: main
+    models:
+      gpt-6-luna:
+        input: 274530
+        cache_write: 0
+        cache_read: 17794862
+        output: 57031
+        usd: 0.2407658950000003
+        usd_source: estimated
+      claude-haiku-4.5:
+        input: 291
+        cache_write: 89834
+        cache_read: 3744241
+        output: 10974
+        usd: 0.5418776000000006
+        usd_source: estimated
+    activity:
+      implementation:
+        usd: 0.303040068134028
+        turns: 75
+      other:
+        usd: 0.23583854196259196
+        turns: 90
+      paperwork:
+        usd: 0.24376488490338002
+        turns: 106
+    steps:
+      (outside run):
+        usd: 0.03261585357400339
+        turns: 20
+      brainstorm:
+        usd: 0.011219332732123465
+        turns: 15
+      spec-review:
+        usd: 0.021105656991179413
+        turns: 23
+      plan:
+        usd: 0.021832914399402253
+        turns: 23
+      plan-review:
+        usd: 0.0016936368299451548
+        turns: 2
+      implement:
+        usd: 0.5729179058823541
+        turns: 80
+      journal-check:
+        usd: 0.0009614594698261085
+        turns: 1
+      deliver:
+        usd: 0.12029673512116609
+        turns: 82
+    briefs:
+      ses_f22e295adffe6EvKDfQc0OLF4z: 628
+      ses_f22d54e6effeRP7mrrWe7Xm6qO: 930
+      ses_f22cf8e9affeOpmMoMwBAkBn27: 724

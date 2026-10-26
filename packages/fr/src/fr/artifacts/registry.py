@@ -1,0 +1,637 @@
+"""The artifact registry — the ONE place that enumerates artifact kinds.
+
+Spec: `docs/superpowers/specs/2026-08-30-artifact-migration-framework-design.md`
+§3.A. A node's installed `fr` changes whenever the plugin updates, mid-flight;
+the artifacts on disk do not change with it. So every generated artifact
+declares the version it was written for, and the migration runner (Phase 2),
+the trigger (Phase 3) and the validator (Phase 7) all read that declaration
+through this module.
+
+Three properties this module exists to guarantee:
+
+1. **An absent stamp means version 1.** Not an error, not "unknown". Every
+   artifact in the wild today predates this framework, so absence *is* the
+   pre-framework era — and is itself information. No flag day.
+2. **Archived artifacts are excluded.** No locator reaches
+   `docs/superpowers/implemented/**`: those record what shipped, and rewriting
+   them would falsify history (spec §2 non-goals). The live locators are
+   rooted at the live directories, so the archive is unreachable by
+   construction; `iter_artifact_paths` re-checks anyway, because a future
+   locator edit is exactly the mistake that would go unnoticed.
+3. **Writing a stamp disturbs nothing else.** These run against files an
+   operator has open. Every writer edits the carrier line *textually* and
+   leaves every other byte — comments, key order, blank lines — alone. A
+   round-trip through `yaml.safe_dump` would silently normalise all three, so
+   no writer here re-serialises a parsed document.
+
+Adding a kind means adding one entry to `ARTIFACT_KINDS` — including its
+structure validator (spec §3.F), so a kind cannot be registered without one.
+Nothing outside this module may enumerate kinds
+(`tests/unit/test_tripwire_artifact_kinds.py`).
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from fr.artifacts.atomic import write_text_atomic
+from fr.artifacts.structure import (
+    validate_agents,
+    validate_journal,
+    validate_matrix,
+    validate_plan,
+    validate_profiles,
+    validate_record,
+    validate_run,
+    validate_spec,
+    validate_usage,
+)
+
+PRE_FRAMEWORK_VERSION = 1
+"""What an artifact with no stamp reads as (spec §3.A)."""
+
+ARCHIVE_SEGMENT = "implemented"
+"""Path segment marking the frozen archive; no locator may reach it."""
+
+
+class ArtifactError(Exception):
+    """Base for every artifact-registry failure."""
+
+
+class UnknownArtifactKindError(ArtifactError):
+    """Raised for a kind name the registry does not carry."""
+
+
+class ArtifactStampError(ArtifactError):
+    """Raised when an artifact's stamp is present but unreadable."""
+
+
+@dataclass(frozen=True)
+class ArtifactKind:
+    """One artifact kind: what it is, where it lives, how it is stamped."""
+
+    name: str
+    current_version: int
+    """The version this `fr` writes. An artifact below it is stale."""
+    locator: str
+    """Glob relative to the repo root. Never reaches the archive."""
+    stamp: str
+    """Human description of the carrier, for messages and `--dry-run` output."""
+    read_stamp: Callable[[Path], int | None]
+    """The version the artifact DECLARES, or `None` when it declares none.
+
+    `None` is not an error and not "unknown" — it is the pre-framework era
+    (property 1), and `read_version` below turns it into
+    `PRE_FRAMEWORK_VERSION`. The two are kept distinct because the migration
+    runner needs the distinction: a chain gap over a version an artifact
+    *declared* is a bug in the registry, while a gap over a version nobody ever
+    wrote is a data problem with one file (runner invariant 3)."""
+    write_version: Callable[[Path, int], None]
+    validate: Callable[[Path], list[str]]
+    """Structural validation for this kind (spec §3.F), from
+    `fr.artifacts.structure`: returns one human-readable message per problem
+    and an empty list when the artifact is valid. Every kind carries one —
+    "every version ships a structure validator" is only true if a new kind
+    cannot be registered without one."""
+    owns: Callable[[Path], bool] | None = None
+    """Which of the locator's matches are this kind's, when a glob cannot say it
+    exactly; `None` owns every match. The `agents` kind is the two files fr ships, not
+    every `fr-*.md` a repo keeps beside them (p7-r5)."""
+
+    def read_version(self, path: Path) -> int:
+        """The version `path` is on — `PRE_FRAMEWORK_VERSION` when unstamped."""
+        declared = self.read_stamp(path)
+        return PRE_FRAMEWORK_VERSION if declared is None else declared
+
+
+# --- YAML-carried stamps (plan / run / matrix) ---------------------------
+#
+# Read through `yaml.safe_load` (correct for any scalar style); write by line
+# surgery (byte-stable). The two halves deliberately do not share a code path:
+# reading wants a parser, writing must not use one.
+
+_TOP_LEVEL_KEY = "schema_version"
+
+_BOM = "\ufeff"
+
+
+def read_verbatim(path: Path) -> tuple[str, str]:
+    """`(bom, body)` — the file's bytes as text, with NOTHING normalised.
+
+    `Path.read_text()` is wrong for every writer in this module (review
+    r5-e10). It opens in universal-newline mode, so a CRLF artifact comes back
+    with `\n` and the writer then rewrites the WHOLE file with LF endings — a
+    diff the operator never made, in a commit that says "migrate". It also
+    leaves a UTF-8 BOM as an invisible first character, which made
+    `^schema_version:` fail to match line 1, so the stamp was inserted a second
+    time above the BOM.
+
+    Splitting the BOM off explicitly lets every reader parse clean text and
+    every writer put the mark back exactly where it was.
+    """
+    text = path.read_bytes().decode("utf-8")
+    if text.startswith(_BOM):
+        return _BOM, text[len(_BOM) :]
+    return "", text
+
+
+def split_lines(text: str) -> list[str]:
+    """`text`'s lines, each keeping its own ending — split on `\\n` ONLY.
+
+    Never `str.splitlines`: it also breaks on `\\x0c`, `\\x1c`, U+2028 and
+    friends, which YAML reads as ordinary characters inside a comment, so the
+    tail of such a comment would be matched as a key of its own (super-fr#806).
+    """
+    return [ln for ln in re.split(r"(?<=\n)", text) if ln]
+
+
+def _dominant_newline(text: str) -> str:
+    """The line ending to give a line this module ADDS. CRLF only when the
+    file is already CRLF, so a mixed file is not made more mixed."""
+    return "\r\n" if "\r\n" in text else "\n"
+
+
+def _yaml_read_key(path: Path, key: str) -> int | None:
+    _, text = read_verbatim(path)
+    try:
+        data: Any = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise ArtifactStampError(f"{path}: not valid YAML, cannot read `{key}`: {e}") from e
+    if data is not None and not isinstance(data, dict):
+        # Not "unstamped": no migration turns a list into this kind, and
+        # reading it as version 1 sent the gate off to migrate a file it
+        # could never migrate (#812 — a scratch phase list under .records/).
+        raise ArtifactStampError(f"{path}: top level must be a mapping, got {type(data).__name__}")
+    if data is None or key not in data:
+        return None
+    return _coerce_version(data[key], path, key)
+
+
+def _coerce_version(value: object, path: Path, carrier: str) -> int:
+    # `isinstance(True, int)` is True in Python; a YAML `yes` must not read as 1.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ArtifactStampError(f"{path}: `{carrier}` must be an integer, got {value!r}")
+    if value < 1:
+        raise ArtifactStampError(f"{path}: `{carrier}` must be >= 1, got {value!r}")
+    return value
+
+
+def _insertion_index(lines: list[str]) -> int:
+    """Where a new top-level key goes: after a `---` document start and after
+    any leading comment/blank block, so a file's header comment stays on top."""
+    i = 0
+    if i < len(lines) and lines[i].rstrip() == "---":
+        i += 1
+    while i < len(lines) and (not lines[i].strip() or lines[i].lstrip().startswith("#")):
+        i += 1
+    return i
+
+
+def _yaml_write_key(path: Path, key: str, version: int) -> None:
+    bom, text = read_verbatim(path)
+    lines = split_lines(text)
+    pattern = re.compile(rf"^{re.escape(key)}\s*:")
+    for i, line in enumerate(lines):
+        if pattern.match(line):
+            # Preserve the original line ending EXACTLY — `\r\n` stays `\r\n`,
+            # and a final line with none stays without one.
+            newline = line[len(line.rstrip("\r\n")) :]
+            lines[i] = f"{key}: {version}{newline}"
+            write_text_atomic(path, bom + "".join(lines))
+            return
+    at = _insertion_index(lines)
+    lines.insert(at, f"{key}: {version}{_dominant_newline(text)}")
+    write_text_atomic(path, bom + "".join(lines))
+
+
+def _read_yaml_stamp(path: Path) -> int | None:
+    return _yaml_read_key(path, _TOP_LEVEL_KEY)
+
+
+def _write_yaml_stamp(path: Path, version: int) -> None:
+    _yaml_write_key(path, _TOP_LEVEL_KEY, version)
+
+
+# --- journal: an HTML comment on the first line --------------------------
+#
+# NOT the spec table's literal `<!-- fr:journal schema=N -->`: that string
+# starts with `fr.journal.model._DELIM_PREFIX` (`"<!-- fr:journal "`), so
+# `parse_journal` would read it as an ENTRY delimiter and raise
+# `JournalParseError: missing required field: 'kind'` on every stamped journal.
+# One character moves it out of the way (space -> hyphen) while keeping the
+# spec's shape: a header comment, invisible in rendered Markdown, on line 1.
+
+# `[ \t]*`, never `\s*`: under `re.MULTILINE` a `\s` matches `\n` too, so a
+# trailing `\s*$` runs past the stamp's own line and the re-stamping writer
+# below then deletes every blank line that followed it — silently, and against
+# this module's property 3 ("writing a stamp disturbs nothing else").
+#
+# Anchored to the FIRST NON-BLANK LINE (review r5-c5). `re.MULTILINE` matched
+# the stamp anywhere in the file, including inside a fenced code block — and a
+# journal entry that QUOTES a stamp (this framework's own journal does exactly
+# that) was then read as declaring that version, and the writer rewrote the
+# quoted line instead of the real header. The stamp is a header comment on line
+# 1 by definition; anything further down is prose about a stamp, not a stamp.
+# No `^`: this pattern is applied with `Pattern.match(text, start, end)`, which
+# already anchors at `start`. `^` would additionally require `start == 0` (it
+# is not a MULTILINE pattern), so a journal with a blank line before its stamp
+# read as unstamped.
+_JOURNAL_STAMP_RE = re.compile(r"<!--[ \t]*fr:journal-schema=(\d+)[ \t]*-->[ \t]*$")
+
+
+def _first_non_blank(text: str) -> tuple[int, int] | None:
+    """`(start, end)` of the first non-blank line, or `None` for a blank file."""
+    offset = 0
+    for line in split_lines(text):
+        stripped = line.rstrip("\r\n")
+        if stripped.strip():
+            return offset, offset + len(stripped)
+        offset += len(line)
+    return None
+
+
+def _journal_stamp_match(text: str) -> re.Match[str] | None:
+    span = _first_non_blank(text)
+    if span is None:
+        return None
+    start, end = span
+    return _JOURNAL_STAMP_RE.match(text, start, end)
+
+
+def _journal_stamp_line(version: int) -> str:
+    return f"<!-- fr:journal-schema={version} -->"
+
+
+def _read_journal_stamp(path: Path) -> int | None:
+    _, text = read_verbatim(path)
+    m = _journal_stamp_match(text)
+    if m is None:
+        return None
+    return _coerce_version(int(m.group(1)), path, "fr:journal-schema")
+
+
+def _write_journal_stamp(path: Path, version: int) -> None:
+    # `read_verbatim`, not `read_text` (review r5-e10). The reader already used
+    # it, so a BOM'd journal READ its stamp fine while this writer saw the BOM
+    # as the first character, failed to match the stamp behind it, and prepended
+    # a SECOND one — leaving a file with two stamps declaring two versions. And
+    # `read_text` normalises CRLF, so writing one line rewrote every line ending
+    # in the file.
+    bom, text = read_verbatim(path)
+    m = _journal_stamp_match(text)
+    if m is not None:
+        write_text_atomic(
+            path, bom + text[: m.start()] + _journal_stamp_line(version) + text[m.end() :]
+        )
+        return
+    write_text_atomic(path, bom + _journal_stamp_line(version) + _dominant_newline(text) + text)
+
+
+# --- spec: YAML front matter ---------------------------------------------
+#
+# Specs are hand-written Markdown that starts at `# Title`. Front matter is
+# added only when stamping, and only at the very top: a `---` further down is
+# a horizontal rule, not a delimiter.
+
+_SPEC_KEY = "fr_schema"
+# `\r?\n`, not `\n` (review r5-e10). A CRLF spec's front matter did not match
+# at all, so `_read_spec_stamp` reported "unstamped" for a file that plainly
+# carried `fr_schema:` — and `_write_spec_stamp` then prepended a SECOND front
+# matter block above the first. The artifact stayed "stale" forever, gaining
+# one more block per migration.
+_FRONT_MATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.DOTALL)
+
+
+def _read_front_matter_key(path: Path, key: str) -> int | None:
+    """The integer `key` in `path`'s leading front matter, `None` when absent."""
+    _, text = read_verbatim(path)
+    m = _FRONT_MATTER_RE.match(text)
+    if m is None:
+        return None
+    try:
+        data: Any = yaml.safe_load(m.group(1))
+    except yaml.YAMLError as e:
+        raise ArtifactStampError(f"{path}: front matter is not valid YAML: {e}") from e
+    if not isinstance(data, dict) or key not in data:
+        return None
+    return _coerce_version(data[key], path, key)
+
+
+def set_front_matter_key(text: str, key: str, version: int, *, append: bool = False) -> str:
+    """`text` with `key: version` in its leading front matter, nothing else moved.
+
+    An existing `key` line is rewritten in place; a missing one is added at the
+    top of the block, or at its end with `append` (the `agents` kind keeps
+    `name` first, as Claude Code's agent files do). Text with no front matter
+    gains a block holding only the key. Pure, so `fr.agents.render_agent` and
+    the stamp writers share it."""
+    m = _FRONT_MATTER_RE.match(text)
+    nl = _dominant_newline(text)
+    if m is None:
+        return f"---{nl}{key}: {version}{nl}---{nl}" + text
+    block = m.group(1)
+    # `[^\r\n]*` rather than `.*$`: `.` matches `\r`, so on a CRLF spec the
+    # substitution swallowed the carriage return and left ONE line of the block
+    # with a bare LF (review r5-e10).
+    pattern = re.compile(rf"^{re.escape(key)}\s*:[^\r\n]*", re.MULTILINE)
+    if pattern.search(block):
+        new_block = pattern.sub(f"{key}: {version}", block, count=1)
+    elif append:
+        new_block = f"{block}{nl}{key}: {version}"
+    else:
+        new_block = f"{key}: {version}{nl}{block}"
+    return text[: m.start(1)] + new_block + text[m.end(1) :]
+
+
+def _write_front_matter_key(path: Path, key: str, version: int, *, append: bool = False) -> None:
+    bom, text = read_verbatim(path)
+    write_text_atomic(path, bom + set_front_matter_key(text, key, version, append=append))
+
+
+def _read_spec_stamp(path: Path) -> int | None:
+    return _read_front_matter_key(path, _SPEC_KEY)
+
+
+def _write_spec_stamp(path: Path, version: int) -> None:
+    _write_front_matter_key(path, _SPEC_KEY, version)
+
+
+# --- agents: the repo's copy of fr's two dispatched agents ----------------
+#
+# `.claude/agents/fr-spec-reviewer.md` and `fr-phase-executor.md` (spec
+# `2026-10-07-cloud-triage-design` §H, R19): the canonical plugin agents with
+# one added front-matter key. Rendered by `fr.agents`; the migration and the
+# repair live in `fr.artifacts.agents_kind`.
+
+AGENTS_STAMP_KEY = "fr_artifact_version"
+
+
+def _is_shipped_agent(path: Path) -> bool:
+    """One of the agents fr ships: a repo's own `fr-helper.md` is not the kind's (p7-r5)."""
+    from fr.agents import AGENT_NAMES
+
+    return path.stem in AGENT_NAMES
+
+
+def _read_agents_stamp(path: Path) -> int | None:
+    return _read_front_matter_key(path, AGENTS_STAMP_KEY)
+
+
+def _write_agents_stamp(path: Path, version: int) -> None:
+    _write_front_matter_key(path, AGENTS_STAMP_KEY, version, append=True)
+
+
+# --- the registry --------------------------------------------------------
+
+ARTIFACT_KINDS: Mapping[str, ArtifactKind] = {
+    kind.name: kind
+    for kind in (
+        ArtifactKind(
+            name="plan",
+            # The plan-folder schema version, which ALREADY means "the version
+            # this artifact was written for" and already owns a migration chain
+            # (`fr migrate v1-to-v2`). The framework reads that field rather
+            # than adding a second one: `PlanMeta` is `extra="forbid"`, so a
+            # new key would make every stamped plan unparseable.
+            current_version=2,
+            locator="docs/superpowers/plans/*/_meta.yaml",
+            stamp="`schema_version` in `_meta.yaml`",
+            read_stamp=_read_yaml_stamp,
+            write_version=_write_yaml_stamp,
+            validate=validate_plan,
+        ),
+        ArtifactKind(
+            name="journal",
+            # 2: the `owed` entry kind (spec `2026-10-11-debt-engine-design` §E,
+            # R20), migration `fr.artifacts.journal_owed` — stamp-only.
+            current_version=2,
+            locator="docs/superpowers/journals/**/*.md",
+            stamp="`<!-- fr:journal-schema=N -->` header comment",
+            read_stamp=_read_journal_stamp,
+            write_version=_write_journal_stamp,
+            validate=validate_journal,
+        ),
+        ArtifactKind(
+            name="run",
+            # 2: `StepRecord.answered_by` — gate provenance (spec
+            # `2026-09-18-harness-parity-matrix-design` §3.D.2), migration
+            # `fr.artifacts.run_provenance`.
+            # 3: the accounting snapshot's four measured token fields — V2 telemetry
+            # (spec `2026-09-20-bounded-executor-handoff-design` §5.C),
+            # migration `fr.artifacts.run_telemetry`.
+            # 4: `StepRecord.dispatch` — the dispatch-holder record (spec
+            # `2026-09-20-dispatch-holder-identity-design` §4.A/§4.D),
+            # migration `fr.artifacts.run_dispatch_holder`. It is 3 -> 4
+            # rather than 2 -> 3 because gh#506's telemetry migration took
+            # 3 first: two branches bumped the same kind in parallel, and a
+            # kind has exactly one linear history, so the later one stacks.
+            # All three are shape changes for the same reason: `RunState` is
+            # `extra="forbid"`, so a cursor carrying the new keys RAISES for an
+            # fr that predates them rather than ignoring them, whatever
+            # "optional and defaulted" suggests. `RunState.schema_version`
+            # exists so the stamp a migration writes stays readable.
+            # 5: `StepRecord.units` — one record per unit (spec
+            # `2026-09-20-unit-record-unification-design` §4.A/§4.F), migration
+            # `fr.artifacts.run_unit_record`. The first run migration that
+            # REWRITES A BODY, and the first change that REMOVES fields
+            # (`items`, `dispatch`, top-level `accounting`) — which is why the
+            # v1-v4 shape is frozen in `fr.run.legacy` and every hop of the
+            # chain reads with that, never with the live model.
+            # 6: `StepRecord.main_session` — main-session usage per step (spec
+            # `2026-09-24-fr-goal-scope-proportion-cost-design` §D), migration
+            # `fr.artifacts.run_main_session`. Additive, so stamp-only.
+            # 7: `Attempt.estimate`, `Attempt.measured` and
+            # `StepRecord.main_session` REMOVED — usage moved to its own kind
+            # (spec `2026-09-25-lean-cost-aware-process-design` §5.B.4),
+            # migration `fr.artifacts.run_usage_split`; the v5/v6 shape is
+            # frozen as `fr.run.legacy.RunStateV6`.
+            # 8: `RunState.driver` — who drives the run (gh#761), migration
+            # `fr.artifacts.run_driver`. Additive, so stamp-only.
+            # 9: `Attempt.tier` and `Attempt.bound` — the tier a subagent was
+            # dispatched at and the model it resolved to (spec
+            # `2026-10-06-cost-evidence-design` §D), migration
+            # `fr.artifacts.run_bound_model`. Additive, so stamp-only.
+            # 10: `RunState.fr_version` — the fr a run started under (spec
+            # `2026-10-07-cloud-triage-design` §G, R16), migration
+            # `fr.artifacts.run_fr_version`. Additive, so stamp-only.
+            current_version=10,
+            locator="docs/superpowers/runs/*.yaml",
+            stamp="`schema_version` in the run yaml",
+            read_stamp=_read_yaml_stamp,
+            write_version=_write_yaml_stamp,
+            validate=validate_run,
+        ),
+        ArtifactKind(
+            name="matrix",
+            # 1 -> 2 for `Row.verify` (spec
+            # `2026-09-28-requirements-traceability-design` §H), migration
+            # `fr.artifacts.matrix_verify`; `Matrix.schema_version` added with it.
+            # 2 -> 3 for `Row.visual` (spec `2026-09-28-ui-visual-evidence-design`
+            # §G), migration `fr.artifacts.matrix_visual`.
+            # 3 -> 4: `Row.verify` names a strategy (`post-merge` becomes
+            # `live`) and rows gain `scenario`/`issues`/`harnesses`/`walks`
+            # (spec `2026-10-06-verification-strategies-design` §B), migration
+            # `fr.artifacts.matrix_strategies`, every hop reading through the
+            # frozen `fr.acceptance.legacy.MatrixV3`.
+            # 4 -> 5: the status `skipped` splits into `unwired`/`walk-owed`/
+            # `walked`/`manual` (spec `2026-10-11-debt-engine-design` §D),
+            # migration `fr.artifacts.matrix_status_split`, every hop reading
+            # through the frozen `fr.acceptance.legacy.MatrixV4`.
+            current_version=5,
+            locator="docs/acceptance/matrix.yaml",
+            stamp="`schema_version` in `matrix.yaml`",
+            read_stamp=_read_yaml_stamp,
+            write_version=_write_yaml_stamp,
+            validate=validate_matrix,
+        ),
+        ArtifactKind(
+            name="spec",
+            current_version=1,
+            locator="docs/superpowers/specs/*.md",
+            stamp="`fr_schema:` in the front matter",
+            read_stamp=_read_spec_stamp,
+            write_version=_write_spec_stamp,
+            validate=validate_spec,
+        ),
+        ArtifactKind(
+            name="usage",
+            # What a run cost, persisted beside its cursor (spec
+            # `2026-09-25-lean-cost-aware-process-design` §5.B). Born at 1;
+            # 1 -> 2 for `steps_by_role` and `units` (spec
+            # `2026-10-06-cost-evidence-design` §C), stamp only.
+            current_version=2,
+            locator="docs/superpowers/usage/*.yaml",
+            stamp="`schema_version` in the usage yaml",
+            read_stamp=_read_yaml_stamp,
+            write_version=_write_yaml_stamp,
+            validate=validate_usage,
+        ),
+        ArtifactKind(
+            name="record",
+            # One step's bookkeeping, as data (spec
+            # `2026-09-25-lean-cost-aware-process-design` §5.C.1). Transient:
+            # tracked while its step runs, deleted by the `fr run resolve
+            # --record` that applies it. Born at 1; 1 -> 2 for `questions`
+            # (spec `2026-09-26-dynamic-brainstorm-question-rounds-design`
+            # §3.B), migration `fr.artifacts.record_questions`; 2 -> 3 for
+            # `input`/`verify`/`unconfirmed` (spec
+            # `2026-09-28-requirements-traceability-design` §H), migration
+            # `fr.artifacts.record_input_unconfirmed`; 3 -> 4 for
+            # `AcceptanceItem.visual`/`StepRecord.visual` (spec
+            # `2026-09-28-ui-visual-evidence-design` §G), migration
+            # `fr.artifacts.record_visual`; 4 -> 5 for `JournalItem.delegated`
+            # (spec `2026-09-29-spec-fidelity-invention-design` §E), migration
+            # `fr.artifacts.record_delegated`; 5 -> 6 for `StepRecord.shape`
+            # (spec `2026-09-29-fr-goal-light-path-design` §A, the brainstorm
+            # record's rebind onto `fr-goal-light`), migration
+            # `fr.artifacts.record_shape`; 6 -> 7 REMOVES `JournalItem.delegated`
+            # and the `unconfirmed` resolution (spec
+            # `2026-09-29-spec-is-the-contract-design` §C), migration
+            # `fr.artifacts.record_contract`, every hop reading through the
+            # frozen `fr.record.legacy.RecordV6`; 7 -> 8 for
+            # `AcceptanceItem.verify` naming a strategy and its `scenario`/
+            # `issues`/`harnesses`/`walk` (spec
+            # `2026-10-06-verification-strategies-design` §B), migration
+            # `fr.artifacts.record_strategies`, read through the frozen
+            # `fr.record.legacy.RecordV7`; 8 -> 9 because the acceptance status
+            # `skipped` split (spec `2026-10-11-debt-engine-design` §D, R27),
+            # migration `fr.artifacts.record_status_split`, read through the
+            # frozen `fr.record.legacy.RecordV8`.
+            current_version=9,
+            locator="docs/superpowers/runs/*.records/*.yaml",
+            stamp="`schema_version` in the record yaml",
+            read_stamp=_read_yaml_stamp,
+            write_version=_write_yaml_stamp,
+            validate=validate_record,
+        ),
+        ArtifactKind(
+            name="profiles",
+            # 1 -> 2: top-level `backend:`/`host:` become nested `forge:`, `ci:`
+            # and `tracking:` blocks (spec `2026-09-28-fr-profiles-services-design`
+            # §3.D), migration `fr.artifacts.profiles_services`. Fields MOVE, so
+            # version 1 is read only through the frozen
+            # `fr.services.legacy.ProfilesV1`. An unstamped file is version 1.
+            current_version=2,
+            locator=".devcontainer/fr-profiles.yaml",
+            stamp="`schema_version` in `fr-profiles.yaml`",
+            read_stamp=_read_yaml_stamp,
+            write_version=_write_yaml_stamp,
+            validate=validate_profiles,
+        ),
+        ArtifactKind(
+            name="agents",
+            # The repo's own copy of fr's two dispatched agents, so a Claude Code
+            # cloud session can dispatch them from its first turn (spec
+            # `2026-10-07-cloud-triage-design` §H, R19). Born at 1. A release that
+            # changes either canonical agent moves this AND registers
+            # `fr.artifacts.agents_kind.rerender_migration` for the hop
+            # (`tests/unit/test_tripwire_agents_data.py` pins the pair).
+            current_version=1,
+            locator=".claude/agents/fr-*.md",
+            stamp=f"`{AGENTS_STAMP_KEY}` in the agent's front matter",
+            read_stamp=_read_agents_stamp,
+            write_version=_write_agents_stamp,
+            validate=validate_agents,
+            owns=_is_shipped_agent,
+        ),
+    )
+}
+
+
+def artifact_kind(name: str) -> ArtifactKind:
+    """The registered kind called `name`. Raises `UnknownArtifactKindError`."""
+    try:
+        return ARTIFACT_KINDS[name]
+    except KeyError:
+        raise UnknownArtifactKindError(
+            f"unknown artifact kind {name!r} (known: {', '.join(sorted(ARTIFACT_KINDS))})"
+        ) from None
+
+
+def iter_paths_of(repo_root: Path, kind: ArtifactKind) -> Iterator[Path]:
+    """Every live artifact of `kind` under `repo_root`, sorted.
+
+    Archived artifacts are never yielded — the locators cannot reach
+    `implemented/`, and this re-checks so a future locator edit cannot quietly
+    start rewriting shipped history.
+
+    Takes the kind rather than its name so the migration runner can walk the
+    kinds it was handed without re-entering the global mapping (the runner's
+    registry is injectable in tests); `iter_artifact_paths` is the by-name
+    front door and the archive check lives here, once, for both.
+    """
+    for path in sorted(repo_root.glob(kind.locator)):
+        if ARCHIVE_SEGMENT in path.relative_to(repo_root).parts:
+            continue
+        if kind.owns is not None and not kind.owns(path):
+            continue
+        if path.is_file():
+            yield path
+
+
+def iter_artifact_paths(repo_root: Path, name: str) -> Iterator[Path]:
+    """Every live artifact of kind `name` under `repo_root`, sorted."""
+    yield from iter_paths_of(repo_root, artifact_kind(name))
+
+
+def iter_all_artifacts(repo_root: Path) -> Iterator[tuple[ArtifactKind, Path]]:
+    """`(kind, path)` for every live artifact of every registered kind."""
+    for name, kind in ARTIFACT_KINDS.items():
+        for path in iter_artifact_paths(repo_root, name):
+            yield kind, path
+
+
+def read_version(name: str, path: Path) -> int:
+    """The version `path` declares — `PRE_FRAMEWORK_VERSION` when unstamped."""
+    return artifact_kind(name).read_version(path)
+
+
+def write_version(name: str, path: Path, version: int) -> None:
+    """Stamp `path` with `version`, disturbing nothing else in the file."""
+    artifact_kind(name).write_version(path, version)

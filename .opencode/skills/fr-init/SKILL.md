@@ -1,0 +1,120 @@
+---
+name: fr-init
+description: >
+  Initialize a repo for isolated runs: scan it, interview the operator about working patterns,
+  tools, and credentials, then scaffold one or more devcontainer profiles via `fr init scaffold`.
+  Use when a repo has no devcontainer profile, when fr-isolation or fr-brainstorming hard-stops
+  asking for one, when the operator says "init this repo", "set up the devcontainer", or wants
+  separate read-only/admin environments.
+---
+
+# fr-init
+
+Captures "how you work in this repo" as committed devcontainer profiles plus
+host-only secrets placeholders. Interactive BY DESIGN — the interview is
+operator-owned context, so this skill is exempt from autonomy contracts:
+under a fr-goal run, a missing devcontainer is a blocker; pause, run this
+interview, resume isolated.
+
+**Announce at start:** "I'm using fr-init to set up this repo's profiles."
+
+## 1. Scan first
+
+Before asking anything, learn what the repo already says:
+
+- Languages and toolchains: manifests (pyproject/package.json/go.mod/...),
+  lockfiles, `.tool-versions`, CI workflows (what does CI install?).
+- Existing `.devcontainer/` (profiles present? then this is an edit, not a green-field init),
+  incl. `.devcontainer/fr-profiles.yaml`'s `forge:`/`ci:`/`tracking:`.
+- Which forge: `git remote get-url origin`'s hostname (`github.com` / `gitlab.com`
+  self-identify; any other host is self-hosted: the operator confirms the backend explicitly).
+- Credential surface: `.env*` patterns in .gitignore, CI secret names,
+  cloud/k8s configs — candidates for the profile's expected secrets.
+- Working patterns: Makefile/justfile/scripts (what do humans run here?).
+
+The interview confirms and fills gaps; it never asks what the scan answers.
+
+## 2. Interview (batched ≤4 per round)
+
+**Hard gate:** an unanswered round is a stop signal — restate the open questions, never default.
+**Harness — questions:** Claude Code batches them into one `AskUserQuestion` call; OpenCode uses its
+`question` tool. Hermes has none: put the numbered round in your reply and END THE TURN.
+
+Cover, with scan-informed recommended options:
+
+1. **Backend** — github (default), gitlab, or gitea? Skip asking if the
+   scan already resolved it unambiguously (github.com/gitlab.com remote, or
+   an explicit `backend:` key already in fr-profiles.yaml). Confirm the
+   hostname too (`--host`) if self-hosted — drives which CLI
+   (`gh`/`glab`/`tea`) gets installed and which CI template
+   `fr acceptance init` picks (written only beside existing CI).
+2. **Profiles wanted** — one `dev` default, or split (e.g. `readonly` for
+   review/exploration vs `admin` with deploy credentials)? Profiles differ
+   by CREDENTIALS first, tools second — same binaries, different env-files
+   is the normal shape.
+3. **Tools** — confirm the scan's toolchain against the known set (`fr init scaffold --help`)
+   and what CI installs that local work needs. JVM (maven implies java): confirm the Java major
+   from version files/pom.xml AND project notes (README, CONTRIBUTING, CI `setup-java` steps).
+4. **Credentials per profile** — which env KEYS each profile expects
+   (names only, never values). **Do NOT ask for a host-forge token by
+   default:** push, PR/MR creation, and every `fr`-driven `gh`/`glab`/`tea`
+   call run on the authenticated HOST (fr-isolation's credential boundary)
+   — the container needs none for the standard pipeline. Offer it only
+   for an explicit in-container-writes profile (e.g. `admin`).
+5. **Working patterns** — test/build/run commands worth recording in the
+   profile's purpose so future runs know the repo's verbs.
+
+## 3. Scaffold per profile
+
+```bash
+fr init scaffold --repo . --profile dev --purpose "day-to-day development" \
+    --tool uv --tool node --default
+fr init scaffold --repo . --profile admin --purpose "deploys, gh writes" \
+    --secret GH_TOKEN --secret KUBECONFIG_B64
+```
+
+Services: `forge`, `ci`, `tracking` (`fr services [--json]` shows type, host, source). Pass
+`--ci none|github-actions|gitlab-ci|gitea-actions|auto` and `--tracking none|github|gitlab|gitea|auto`
+(auto default; jenkins/jira refused, derio-net/super-fr#795). An inconclusive auto exits 2 naming `--ci`,
+`--tracking` or `--backend`/`--host`: ask the operator, then re-run explicitly. Non-GitHub forge: pass
+`--backend` on every profile call (`--host` optional for GitLab; `gh`/`tea` aren't host-threaded, gh-486).
+
+Each call writes:
+
+- `.devcontainer/<profile>/devcontainer.json` — committed by scaffold; base
+  image + the backend's CLI (github-cli feature for GitHub; a versioned,
+  checksummed `glab`/`tea` binary install for GitLab/Gitea — no official
+  devcontainer feature exists for either) + mapped tool features + vk
+  installed in postCreate + `--env-file` pointing at the host secrets path.
+- `.devcontainer/fr-profiles.yaml` — committed by scaffold; default profile, purpose, expected
+  secret keys, and the repo-level nested `forge:` / `ci:` / `tracking:` services (each `type`, optional
+  `host`; schema_version 2 — an older flat `backend`/`host` file is migrated by the CLI-entry gate).
+- `~/.config/fr/secrets/<repo>/<profile>.env` — host-only; commented
+  placeholders per secret key. Existing operator values are never
+  overwritten; re-runs only append missing placeholders.
+
+Tools take `<tool>[@<version>]`; an unknown tool is refused — pass an unmapped toolchain's
+devcontainer feature ref with `--feature <ref>`. For java/maven ALWAYS pass the confirmed major
+as `--tool java@<major>`: scaffold's own detection reads only version files and pom.xml.
+
+## 4. Hand back
+
+- Tell the operator which placeholders to fill (`~/.config/fr/secrets/<repo>/<profile>.env`)
+  before the first `fr isolation up` — an empty env-file is normal for a default profile (the
+  standard pipeline needs only the host's own CLI auth to be green: `gh auth status` for
+  GitHub, `glab auth status` for GitLab, `tea login` for Gitea).
+- `fr init scaffold` already **committed** the `.devcontainer/` files (scoped
+  commit on the current branch — `main` during bootstrap), so the profile is in
+  the committed tree that `fr isolation up` checks out. No separate commit step
+  — and the agent couldn't do one anyway (base-repo `git commit` is gate-denied).
+  Pass `--no-commit` only if you want to stage/commit them yourself (e.g. to open
+  a PR in a repo that blocks direct pushes to `main`).
+- If a run was paused on this init, resume it: `fr isolation up` now works.
+
+## Multi-profile principles
+
+- The DEFAULT profile is the one autonomous runs use; keep it
+  least-privileged enough to be safe unattended (admin credentials belong in a
+  non-default profile the operator selects explicitly).
+- Adding a profile later is one more `fr init scaffold` call — the layout
+  is per-profile subfolders from day one, no migration.

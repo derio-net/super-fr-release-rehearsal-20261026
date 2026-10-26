@@ -1,0 +1,1012 @@
+"""fr isolation — CLI over the isolation Target (worktree + devcontainer).
+
+Plain-shell surface by design (agent-agnostic): any agent or a human drives
+up/exec/status/down identically. IsolationError maps to exit 2.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from collections.abc import Callable
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Protocol, cast
+
+import typer
+
+from fr import cloud
+from fr.isolation import sessions as _sessions
+from fr.isolation.external import ExternalTarget
+from fr.isolation.hostworktree import HostWorktreeTarget
+from fr.isolation.local import (
+    GcAction,
+    LocalWorktreeDevcontainerTarget,
+    _detached_gc_spawn,
+    subprocess_runner,
+)
+from fr.isolation.preserve import NO_PRESERVE, TeardownReport
+from fr.isolation.routing import target_for_state
+from fr.isolation.types import (
+    IsolationError,
+    IsolationState,
+    Target,
+    clear_repo_sentinels,
+    clear_workspace_sentinels,
+    list_states,
+    load_state,
+    recorded_mode,
+)
+
+isolation_app = typer.Typer(
+    name="isolation",
+    help="Isolated workspaces: git worktree + devcontainer.",
+    no_args_is_help=True,
+)
+
+# Module-level runner seam so tests can monkeypatch every external call.
+_runner = subprocess_runner
+# Production entry point opts into the real detached gc spawn on up/down; the
+# library default is a no-op. Module seam so tests never fork a real sweep.
+_gc_spawner = _detached_gc_spawn
+
+DEFAULT_BRANCH = "vk-iso/work"
+
+
+def _target(repo: Path) -> Target:
+    """Select the isolation backend where NO workspace exists yet — `up`, `gc`'s
+    host-wide discovery sweep, and `verify-merge` on an already reaped branch.
+    Every command addressing an existing workspace uses `_target_for` instead
+    (gh#569): the workspace's recorded mode, never this env. Precedence (spec
+    §A Selection):
+
+    1. a valid `external` marker at `repo`'s toplevel → `ExternalTarget`,
+       regardless of any other configuration — a prepared container is a
+       recognize-and-adopt, not a second isolation attempt;
+    2. else `FR_ISOLATION_TARGET` (selects the mode at creation, never a
+       per-call flag — spec §B): unset/"devcontainer" → the local
+       worktree+devcontainer target (unchanged default — but unset in a Claude
+       Code cloud session, which has no docker, is "worktree", gh#1098); "worktree" →
+       HostWorktreeTarget (fr worktree, host env, no docker); anything else
+       fails closed so a broken docker can't be silently routed around."""
+    root = repo.resolve()
+    external = ExternalTarget.detect(root, runner=_runner)
+    if external is not None:
+        return external
+    mode = os.environ.get("FR_ISOLATION_TARGET")
+    if mode in (None, "") and cloud.detect():
+        mode = "worktree"
+    if mode in (None, "", "devcontainer"):
+        return LocalWorktreeDevcontainerTarget(root, runner=_runner, gc_spawner=_gc_spawner)
+    if mode == "worktree":
+        return HostWorktreeTarget(root, runner=_runner, gc_spawner=_gc_spawner)
+    raise IsolationError(f"unknown FR_ISOLATION_TARGET {mode!r} — valid: devcontainer | worktree")
+
+
+def _target_for(root: Path, state: IsolationState) -> Target:
+    """The backend that owns an EXISTING workspace, from its recorded mode
+    (gh#569) — the single seam every addressing command goes through. `root`
+    is the repo the command was pointed at; the routing itself keys off
+    `state.repo_root`. Raises IsolationError when no backend can be built (an
+    external workspace whose marker, evidence or checkout is gone): `down
+    --all` keeps such a row instead of aborting; single-workspace commands
+    use `_target_for_or_exit`."""
+    return target_for_state(state, runner=_runner, gc_spawner=_gc_spawner)
+
+
+def _target_for_or_exit(root: Path, state: IsolationState) -> Target:
+    """`_target_for` + uniform IsolationError → clean exit 2 (the
+    `_target_or_exit` counterpart)."""
+    try:
+        return _target_for(root, state)
+    except IsolationError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(2) from err
+
+
+def _worktree_ops(target: Target) -> LocalWorktreeDevcontainerTarget:
+    """Type-narrow to the worktree+container family for the two subcommands
+    whose operations (push-check, verify-merge) are NOT in the Target protocol.
+    A `cast`, not an isinstance check, on purpose: those commands are driven in
+    tests through duck-typed stubs monkeypatched over `_target`, so a nominal
+    guard would reject the doubles. The non-devcontainer modes are refused
+    up-front by the `_refuse_*` guards below before this cast runs."""
+    return cast("LocalWorktreeDevcontainerTarget", target)
+
+
+class _GcCapable(Protocol):
+    """Every target reconciles — the shapes differ, the surface does not (#423).
+    Separate from `_worktree_ops` precisely because `gc` is no longer a
+    worktree-family-only operation: `ExternalTarget` implements it too."""
+
+    def gc(self, dry_run: bool = False) -> list[GcAction]: ...
+
+
+def _gc_ops(target: Target) -> _GcCapable:
+    return cast("_GcCapable", target)
+
+
+def _fail(err: IsolationError) -> None:
+    typer.echo(f"error: {err}", err=True)
+    raise typer.Exit(2)
+
+
+def _verify_or_fail(call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    """Run a `verify_merge`/`verify_merge_reaped` call; a raised `IsolationError`
+    exits 2 via `_fail` (an `error:`-prefixed message, no traceback) instead of
+    propagating — the live and reaped paths share this shape (§3.A, gh#469)."""
+    try:
+        return call()
+    except IsolationError as err:
+        _fail(err)
+        raise AssertionError("unreachable")  # _fail always raises typer.Exit
+
+
+def _resolve_repo(repo: Path) -> Path:
+    """Resolve the --repo path, degrading a deleted cwd to a clean error (#399).
+
+    The default is ``Path(".")``; resolving it calls ``os.getcwd()``. When a
+    prior ``down`` removed the worktree the operator's shell was sitting in, cwd
+    no longer exists and ``resolve()`` raises ``FileNotFoundError`` — an
+    unhandled traceback. Convert it to a normal IsolationError (exit 2) that
+    tells the operator to cd elsewhere or pass ``--repo``.
+    """
+    try:
+        return repo.resolve()
+    except FileNotFoundError:
+        _fail(
+            IsolationError(
+                "current directory no longer exists (a prior teardown likely "
+                "removed it) — cd to an existing directory or pass --repo."
+            )
+        )
+        raise AssertionError("unreachable")  # _fail always raises typer.Exit
+
+
+def _target_or_exit(repo: Path) -> Target:
+    """`_target` + uniform IsolationError → clean exit 2. `_target` fails closed
+    on a bogus `FR_ISOLATION_TARGET`; every command that selects a target must
+    map that to the same "error: … (exit 2)" UX rather than a traceback (up
+    already wraps its whole body; this is the shared wrap for gc and a reaped
+    verify-merge — the other env-selected commands)."""
+    try:
+        return _target(repo)
+    except IsolationError as err:
+        typer.echo(f"error: {err}", err=True)
+        raise typer.Exit(2) from err
+
+
+def _resolve_single(root: Path, branch: str | None) -> IsolationState:
+    """Resolve the workspace a command targets: explicit `--branch`, else the
+    single active workspace, else a clean exit 2 (super-fr#299 part 3 — never a
+    phantom hardcoded default). Shared by exec / restart / down / attach."""
+    if branch is not None:
+        state = load_state(root, branch)
+    else:
+        states = list_states(root)
+        if len(states) > 1:
+            _fail(
+                IsolationError(
+                    "multiple isolation workspaces — specify --branch: "
+                    + ", ".join(s.branch for s in states)
+                )
+            )
+        state = states[0] if states else None
+    if state is None:
+        _fail(
+            IsolationError(
+                f"no isolation workspace for branch {branch!r} — run `fr isolation up` first."
+                if branch
+                else "no isolation workspace — run `fr isolation up` first."
+            )
+        )
+    return state  # type: ignore[return-value]
+
+
+def _resolve_by_worktree(worktree: Path) -> IsolationState:
+    """Resolve a workspace by its worktree path (`down --worktree`, spec
+    2026-09-04 §5.B.4). `list_states` keys on the git common dir, which resolves
+    from inside the worktree; a non-git or missing path degrades to no states
+    (never a traceback) → clean exit 2."""
+    wt = worktree.resolve()
+    try:
+        states = list_states(wt) if wt.is_dir() else []
+    except IsolationError:
+        states = []
+    matches = [s for s in states if s.worktree.resolve() == wt]
+    if not matches:
+        _fail(IsolationError(f"no isolation workspace at {wt}"))
+    return matches[0]
+
+
+def _refuse_external(target: Target, op: str) -> None:
+    """External mode adopts a preparer-managed containment — the worktree-ops
+    subcommands (push-check / verify-merge / gc) do not apply. Refuse cleanly
+    (exit 2) instead of AttributeError-ing through the `_worktree_ops` cast."""
+    if isinstance(target, ExternalTarget):
+        _fail(IsolationError(f"{op} not supported in external mode — externally managed."))
+
+
+def _refuse_no_docker_status_extras(target: Target) -> None:
+    """`status --stats` / `--push-check` need a docker-backed devcontainer
+    (docker stats; in-container ssh-agent probe). Neither host-worktree nor
+    external mode has one — refuse cleanly rather than FileNotFoundError on a
+    docker-less host or AttributeError through the cast."""
+    if isinstance(target, ExternalTarget):
+        _fail(
+            IsolationError(
+                "--stats / --push-check not supported in external mode — externally managed."
+            )
+        )
+    if isinstance(target, HostWorktreeTarget):
+        _fail(
+            IsolationError(
+                "--stats / --push-check require devcontainer mode (docker) — "
+                "not available in host-worktree mode."
+            )
+        )
+
+
+@isolation_app.command()
+def up(
+    repo: Path = typer.Option(Path("."), help="Repo root (default: cwd)."),
+    profile: str | None = typer.Option(
+        None, help="Devcontainer profile (default: repo's configured default)."
+    ),
+    branch: str = typer.Option(DEFAULT_BRANCH, help="Branch for the worktree."),
+    path: Path | None = typer.Option(
+        None,
+        help="Worktree path (default: ~/.cache/fr/worktrees/<main-checkout>/<branch>).",
+    ),
+    base: str | None = typer.Option(
+        None,
+        "--base",
+        help="Start-point for a NEW branch (e.g. origin/main, HEAD, <sha>). "
+        "Given → no fetch, no default-branch resolution. New branches otherwise "
+        "default to freshly-fetched origin/<default>.",
+    ),
+    no_fetch: bool = typer.Option(
+        False,
+        "--no-fetch",
+        help="Skip git fetch; base a new branch on the local origin/<default> "
+        "tracking ref (or HEAD if absent).",
+    ),
+    session: str | None = typer.Option(
+        None, "--session", help="Bind this agent session to the new workspace (one CLI call)."
+    ),
+    harness: str = typer.Option(
+        "unknown", "--harness", help="claude | hermes | opencode | unknown (with --session)."
+    ),
+    print_path: bool = typer.Option(
+        False,
+        "--print-path",
+        help="Print ONLY the worktree path on stdout (last line); everything else "
+        "to stderr. For WorktreeCreate hooks.",
+    ),
+) -> None:
+    """Create worktree + start the profile's devcontainer against it.
+
+    On an existing workspace this is a resume: a stopped container is started
+    again, and the state record's session bindings and creation time are kept.
+
+    With --print-path (spec 2026-09-04 §5.B.3) the LAST non-empty stdout line
+    is the worktree path — the contract a WorktreeCreate hook relies on — and
+    the human-facing lines move to stderr.
+    """
+    try:
+        state = _target(repo).up(
+            profile=profile, branch=branch, path=path, base=base, no_fetch=no_fetch
+        )
+        if session:
+            state = _sessions.attach(state.repo_root, state.branch, session, harness=harness)
+    except IsolationError as err:
+        _fail(err)
+        return
+    if not session:
+        # The ambient default (2026-09-21 debug journal, C4): bind the session
+        # fr already knows, so traceability and the Stop idle guard no longer
+        # hinge on the bind hook recognising how `fr` was launched. Unlike an
+        # explicit `--session`, a failure here never costs the workspace.
+        ambient, ambient_harness = _sessions.ambient_binding(None, harness, os.environ)
+        if ambient is not None:
+            try:
+                state = _sessions.attach(
+                    state.repo_root, state.branch, ambient, harness=ambient_harness
+                )
+            except IsolationError as err:
+                typer.echo(f"warning: could not bind session {ambient!r}: {err}", err=True)
+    typer.echo(
+        f"isolation up: worktree={state.worktree} profile={state.profile} branch={state.branch}",
+        err=print_path,
+    )
+    if os.environ.get("CLAUDECODE"):
+        typer.echo(
+            "tip: register the worktree as a Claude Code working directory so the "
+            "shell cwd persists there (no more `cd <worktree> && …` for host git/gh):\n"
+            f"    /add-dir {state.worktree}",
+            err=print_path,
+        )
+    if print_path:
+        typer.echo(str(state.worktree))
+
+
+@isolation_app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def exec(  # noqa: A001 - typer command name
+    ctx: typer.Context,
+    repo: Path = typer.Option(Path("."), help="Repo root (default: cwd)."),
+    branch: str | None = typer.Option(
+        None, help="Isolation branch (default: the single active workspace)."
+    ),
+) -> None:
+    """Run a command inside the isolation container (exit code passthrough).
+
+    A stopped container is resumed first (devcontainer up); a paused one is
+    unpaused. An absent or dead one is never recreated silently — the error
+    names `fr isolation rebuild`.
+    """
+    root = _resolve_repo(repo)
+    # super-fr#299 part 3: with --branch omitted, resolve to the single active
+    # workspace instead of a hardcoded vk-iso/work default — so `exec` after an
+    # `up --branch feat/x` targets the workspace the operator actually has,
+    # never a phantom default. Mirrors `status`/`down`'s no-branch handling.
+    state = _resolve_single(root, branch)
+    argv = list(ctx.args)
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    if not argv:
+        _fail(IsolationError("nothing to run — usage: fr isolation exec -- CMD ..."))
+        return
+    if recorded_mode(state) == "devcontainer":
+        # `fr run` / `fr usage` run on the harness host (spec 2026-09-25 §5.B.6)
+        from fr.isolation.where import inner_fr_command, refusal
+
+        inner = inner_fr_command(argv)
+        if inner is not None:
+            typer.echo(refusal(state.worktree, inner), err=True)
+            raise typer.Exit(2)
+    try:
+        # the workspace's recorded mode, never the env (gh#569)
+        rc = _target_for(root, state).exec(state, argv)
+    except IsolationError as err:
+        _fail(err)
+        return
+    raise typer.Exit(rc)
+
+
+@isolation_app.command()
+def restart(
+    repo: Path = typer.Option(Path("."), help="Repo root (default: cwd)."),
+    branch: str | None = typer.Option(
+        None, help="Isolation branch (default: the single active workspace)."
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Immediate SIGKILL (docker restart --time=0) when a graceful stop hangs.",
+    ),
+) -> None:
+    """Bounce a resource-wedged devcontainer, keeping the worktree intact.
+
+    Unlike `down` + `up`, `restart` cycles only the container process tree — the
+    worktree, node_modules, local DB stack, and in-container installs survive.
+    It also resumes a stopped container. It does NOT apply profile changes
+    (devcontainer.json edits) — use `fr isolation rebuild` for that.
+    """
+    root = _resolve_repo(repo)
+    # Mirror exec's no-branch resolution: the single active workspace, or error.
+    state = _resolve_single(root, branch)
+    try:
+        container = _target_for(root, state).restart(state, force=force)
+    except IsolationError as err:
+        _fail(err)
+        return
+    typer.echo(f"isolation restart: {state.branch} bounced ({container}).")
+
+
+@isolation_app.command()
+def rebuild(
+    repo: Path = typer.Option(Path("."), help="Repo root (default: cwd)."),
+    branch: str | None = typer.Option(
+        None, help="Isolation branch (default: the single active workspace)."
+    ),
+    no_cache: bool = typer.Option(
+        False, "--no-cache", help="Rebuild the image without the docker build cache."
+    ),
+) -> None:
+    """Recreate the devcontainer against the existing worktree.
+
+    Uses the BRANCH's own profile config (<worktree>/.devcontainer/<profile>/
+    devcontainer.json): a profile fix merged to main applies only once the
+    branch has it. The worktree, state, marker, session bindings and run cursor
+    are untouched; in-container installs are lost (use `restart` to keep them).
+    Host-worktree mode has no container (no-op); external mode refuses.
+    """
+    root = _resolve_repo(repo)
+    state = _resolve_single(root, branch)
+    try:
+        message = _target_for(root, state).rebuild(state, no_cache=no_cache)
+    except IsolationError as err:
+        _fail(err)
+        return
+    typer.echo(f"isolation rebuild: {message}")
+
+
+@isolation_app.command()
+def stop(
+    repo: Path = typer.Option(Path("."), help="Repo root (default: cwd)."),
+    branch: str | None = typer.Option(
+        None, help="Isolation branch (default: the single active workspace)."
+    ),
+) -> None:
+    """Stop a workspace's devcontainer to free its resources, keeping the rest.
+
+    The worktree, state, marker and session bindings are kept — only the
+    container halts. `fr isolation up`, `restart` or the next `exec` resumes it.
+    Already stopped is a no-op; host-worktree mode has no container (no-op);
+    external mode refuses.
+    """
+    root = _resolve_repo(repo)
+    state = _resolve_single(root, branch)
+    try:
+        message = _target_for(root, state).stop(state)
+    except IsolationError as err:
+        _fail(err)
+        return
+    typer.echo(f"isolation stop: {message}")
+
+
+@isolation_app.command()
+def status(
+    repo: Path = typer.Option(Path("."), help="Repo root (default: cwd)."),
+    branch: str | None = typer.Option(None, help="Limit to one isolation branch."),
+    format: str = typer.Option("text", "--format", help="text | json"),
+    stats: bool = typer.Option(
+        False,
+        "--stats",
+        help="Include container resource use (docker stats --no-stream) — opt-in "
+        "to keep the default status fast; helps spot a thrashing container (#341).",
+    ),
+    push_check: bool = typer.Option(
+        False,
+        "--push-check",
+        help="Read-only preflight for #377: worktree remotes, in-container SSH-agent "
+        "presence (informational — expected absent), and a backend-aware pointer at "
+        "the correct host-side push workflow. Never prints key material or "
+        "token/socket contents.",
+    ),
+    session: str | None = typer.Option(
+        None, "--session", help="Only the workspace this session is bound to."
+    ),
+) -> None:
+    """Show worktree, container, PR, and bound-session state for isolation workspaces."""
+    root = _resolve_repo(repo)
+    states = (
+        [s for s in [load_state(root, branch)] if s is not None] if branch else list_states(root)
+    )
+    if branch and not states:
+        _fail(IsolationError(f"no isolation workspace for branch {branch!r}."))
+        return
+    if session:
+        states = [s for s in states if any(b.session_id == session for b in s.sessions)]
+    # One target PER ROW, from each workspace's recorded mode (gh#569) — zero
+    # workspaces select none. The --stats/--push-check refusal runs per row
+    # BEFORE any row is rendered, so a set holding any host/external workspace
+    # is refused naming its mode rather than half-printed.
+    targets = [_target_for_or_exit(root, s) for s in states]
+    if stats or push_check:
+        for target in targets:
+            _refuse_no_docker_status_extras(target)
+    rows = [target.status(s) for target, s in zip(targets, states)]
+    for row, s in zip(rows, states):
+        row["sessions"] = [b.model_dump() for b in s.sessions]
+    if stats:
+        for row, target, s in zip(rows, targets, states):
+            row["stats"] = target.stats(s)
+    if push_check:
+        for row, target, s in zip(rows, targets, states):
+            row["push_check"] = _worktree_ops(target).push_check(s)
+    if format == "json":
+        typer.echo(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        typer.echo("no isolation workspaces.")
+        return
+    for r in rows:
+        pr = r["pr"]
+        pr_text = f"{pr['state']} {pr.get('url', '')}".strip() if pr else "none"
+        line = (
+            f"{r['branch']}: profile={r['profile']} container={r['container']} "
+            f"worktree={r['worktree']} pr={pr_text}"
+        )
+        if stats:
+            st = r.get("stats")
+            line += (
+                f" stats=cpu={st['cpu']} mem={st['mem']} ({st['mem_perc']})" if st else " stats=n/a"
+            )
+        line += f" sessions={','.join(b['session_id'] for b in r['sessions']) or 'none'}"
+        typer.echo(line)
+        if push_check:
+            pc = r.get("push_check")
+            if pc:
+                remotes_text = ", ".join(pc["remotes"]) if pc["remotes"] else "(none)"
+                typer.echo(f"  remotes: {remotes_text}")
+                ssh = pc["ssh_agent_in_container"]
+                ssh_text = "present" if ssh["present"] else "absent (expected — informational only)"
+                typer.echo(f"  ssh-agent-in-container: {ssh_text}")
+                typer.echo(f"  {pc['guidance']}")
+
+
+@isolation_app.command()
+def down(
+    repo: Path = typer.Option(Path("."), help="Repo root (default: cwd)."),
+    branch: str | None = typer.Option(
+        None, help="Isolation branch to tear down (default: the single active workspace)."
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Tear down even when a guard refuses (an open PR, or a reap "
+        "hazard — uncommitted changes, or content not on origin). Removes "
+        "the worktree and fr's record of it; the branch and any landed "
+        "commits stay in the repo, but uncommitted changes do not survive — "
+        "except fr's own records under docs/superpowers/, which are preserved "
+        "and restored by the next `up`.",
+    ),
+    no_preserve: bool = typer.Option(
+        False,
+        "--no-preserve",
+        help="With --force: discard fr's records under docs/superpowers/ instead "
+        "of preserving them (a full disk, an unreadable tree). Refused without --force.",
+    ),
+    all_: bool = typer.Option(
+        False,
+        "--all",
+        help="Tear down EVERY workspace for the repo and clear the pipeline "
+        "sentinel(s) — the escape from an orphaned-sentinel deadlock (#341).",
+    ),
+    session: str | None = typer.Option(
+        None,
+        "--session",
+        help="The calling session; excluded from the still-attached warning, "
+        "and (with --all) from the --yes confirmation.",
+    ),
+    worktree: Path | None = typer.Option(
+        None,
+        "--worktree",
+        help="Resolve the workspace by its worktree path (WorktreeRemove hooks).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="With --all: list what would be torn down or kept (and which "
+        "sessions are bound to each); change nothing.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="With --all: confirm tearing down workspaces bound to a session "
+        "other than --session (refused with exit 2 otherwise).",
+    ),
+) -> None:
+    """Stop the container, remove the worktree, drop the state.
+
+    With --worktree <path> (spec 2026-09-04 §5.B.4), resolve the workspace by
+    its worktree path instead of --repo/--branch — the caller (a WorktreeRemove
+    hook) only knows the path and may run from any cwd.
+
+    With --branch omitted, resolve to the single active workspace — so bare
+    `down` from inside a worktree tears down the workspace the operator actually
+    has, never a phantom hardcoded default (#399). Mirrors exec/restart/status.
+
+    With --all, ignore --branch: tear down all workspaces — keeping any that a
+    guard refuses (an open PR, or a reap hazard: uncommitted changes, or
+    content not yet on origin) unless --force — and clear this repo's
+    pipeline sentinel(s). It first prints its blast radius (per workspace:
+    tear down or keep-and-why, plus bound sessions); --dry-run stops there.
+    Tearing down a workspace bound to a session other than --session (any
+    bound session, without --session) needs --yes, else exit 2 (#533).
+
+    Bound sessions (spec 2026-09-04 §5.A): every session attached to the
+    workspace is unbound; those other than `--session` are named in a warning
+    (never a refusal — liveness is unknowable here).
+    """
+    if dry_run and not all_:
+        # A dry run that silently acted would be the worst possible failure.
+        _fail(IsolationError("--dry-run is only supported with --all."))
+    if no_preserve and not force:
+        _fail(
+            IsolationError(
+                "--no-preserve is only valid with --force — it discards fr's records "
+                "under docs/superpowers/ that a teardown otherwise preserves."
+            )
+        )
+    # The caller is the ambient session when --session is not given — the same
+    # rule `up` binds with (debug journal 2026-09-21 C4). Without it, a session
+    # that ran `up` then `down --all` was told its OWN workspace was another
+    # session's (the #533 guard, which treats every binding as foreign absent
+    # --session). A genuinely different session's binding is still foreign.
+    session, _ = _sessions.ambient_binding(session, "unknown", os.environ)
+    if worktree is not None:
+        state = _resolve_by_worktree(worktree)
+        root = state.repo_root
+    else:
+        root = _resolve_repo(repo)
+        if all_:
+            _down_all(
+                root,
+                force=force,
+                session=session,
+                dry_run=dry_run,
+                yes=yes,
+                preserve=not no_preserve,
+            )
+            return
+        state = _resolve_single(root, branch)
+    others = [b.session_id for b in state.sessions if b.session_id != session]
+    if others:
+        typer.echo(
+            f"warning: sessions still attached: {', '.join(others)} — they will be detached",
+            err=True,
+        )
+    try:
+        report = _target_for(root, state).down(state, force=force, preserve=not no_preserve)
+    except IsolationError as err:
+        _fail(err)
+        return
+    _echo_ended_runs(report)
+    # Only after a SUCCESSFUL teardown: a refused `down` (open PR, or a reap
+    # hazard — #467 phase 3) keeps the workspace, so it keeps its bindings too.
+    bound = [b.session_id for b in state.sessions] + ([session] if session else [])
+    _sessions.detach_all(state)
+    # #399: clear the pipeline sentinel(s) eagerly. The bash guard's own clear
+    # can't fire here — it exits early when `down` runs from the worktree cwd
+    # (the prescribed workflow), so the guard would keep reporting 'fr pipeline
+    # active'. Scoped to THIS workspace's pipelines — sentinels stamped with it,
+    # or of sessions bound to it — never "every sentinel once zero workspaces
+    # remain": that also retired a stranger's FRESH pipeline, one whose
+    # workspace did not exist yet, and disarmed its guard (#472).
+    clear_workspace_sentinels(root, state.worktree, bound)
+    typer.echo(f"isolation down: {state.branch} cleaned up.")
+
+
+def _down_refusal(target: Target, state: IsolationState, force: bool) -> str | None:
+    """Read-only prediction of whether `target.down` would refuse `state`.
+
+    `--force` bypasses every guard, so nothing is kept. A target without the
+    probe (test doubles) is predicted to proceed; the live `down` still has
+    the final word and a refusal there is reported as kept."""
+    if force:
+        return None
+    probe = getattr(target, "down_refusal", None)
+    return probe(state) if probe is not None else None
+
+
+def _echo_ended_runs(report: TeardownReport) -> None:
+    """What a teardown ended and where its records went, on stderr (spec
+    §3.D.3). Never claims "preserved" for a run whose file was not copied, and
+    never blames --no-preserve for a failure that was not one (p4-f3/f4)."""
+    for run_id, cursor in report.ended_runs:
+        if report.preserved_dir is not None and run_id not in report.unpreserved_runs:
+            tail = (
+                f"its record is preserved at {report.preserved_dir}; "
+                f"`fr isolation up --branch {report.branch}` restores it"
+            )
+        elif report.preserved_dir is not None:
+            tail = "its run file could NOT be copied, so its record was NOT preserved"
+        else:
+            tail = f"its record was NOT preserved ({report.reason or 'nothing to copy'})"
+        typer.echo(f"down: ended run {run_id} at step {cursor} here — {tail}", err=True)
+    if not report.ended_runs:
+        if report.preserved_dir is not None:
+            typer.echo(
+                f"down: preserved {report.preserved_files} file(s) at {report.preserved_dir}",
+                err=True,
+            )
+        elif report.reason and report.reason != NO_PRESERVE:
+            typer.echo(f"down: fr's records were NOT preserved — {report.reason}", err=True)
+    if report.skipped:
+        typer.echo(
+            "down: not preserved (not a regular file): " + ", ".join(report.skipped), err=True
+        )
+
+
+def _held_runs(target: Target, state: IsolationState) -> str:
+    """The active-run line(s) for the blast radius; '' for a target without
+    the probe (test doubles, external — which destroys nothing)."""
+    probe = getattr(target, "held_runs", None)
+    return probe(state) if probe is not None else ""
+
+
+def _sessions_text(state: IsolationState) -> str:
+    return ", ".join(b.session_id for b in state.sessions) or "none"
+
+
+def _down_all(
+    root: Path,
+    force: bool,
+    session: str | None = None,
+    dry_run: bool = False,
+    yes: bool = False,
+    preserve: bool = True,
+) -> None:
+    """Tear down every workspace + drop session sentinel(s) (#341 Task 2A).
+
+    Blast radius first (#533): every workspace is classified (tear down, or
+    keep and why) by the same guards `down` enforces, and printed with its
+    bound sessions BEFORE anything is touched. `--dry-run` stops there.
+    Tearing down a workspace bound to any session other than `--session` is
+    refused (exit 2, nothing changed) unless `--yes` — non-interactive by
+    design, since agents and CI are the callers.
+
+    A workspace `down` refuses is KEPT (never silently destroyed) unless
+    --force. An open PR is no longer the only reason `down` can refuse
+    (#467 phase 3, spec §3.7): the reap-hazard guard — a dirty worktree, or
+    content that never reached origin — refuses too, with its own message.
+    Each kept workspace's ACTUAL reason (the exception's own text) is
+    reported, not a hardcoded "open PR" clause that would misdescribe a
+    hazard refusal. Sentinels are cleared regardless — `down --all` is the
+    deliberate "end this pipeline" lever, with the guard self-heal as the
+    lazy backstop.
+    """
+    # Each workspace is probed AND torn down through its own recorded mode
+    # (gh#569): one repo can hold a devcontainer and a host-worktree workspace,
+    # and the env of whoever runs `--all` says nothing about either.
+    # A row whose backend cannot be built (review p2-f3: an external record
+    # whose checkout is gone) is KEPT with the routing error as its reason —
+    # even under --force, since there is nothing to tear it down through — and
+    # never aborts the sweep over the others.
+    plan: list[tuple[IsolationState, Target | None, str | None]] = []
+    for state in list_states(root):
+        try:
+            routed = _target_for(root, state)
+        except IsolationError as err:
+            plan.append((state, None, str(err)))
+            continue
+        plan.append((state, routed, _down_refusal(routed, state, force)))
+    header = "isolation down --all --dry-run" if dry_run else "isolation down --all"
+    typer.echo(f"{header} blast radius: {len(plan)} workspace(s)")
+    for state, owner, refusal in plan:
+        # #575: the run a workspace holds is named for EVERY workspace, even
+        # under --force (where no refusal carries it). A refusal already
+        # starts with a sentence naming it, so the keep line shows the actual reason.
+        held = _held_runs(owner, state) if owner is not None else ""
+        if refusal is None:
+            typer.echo(f"  tear down {state.branch} (sessions: {_sessions_text(state)})")
+        else:
+            # the refusal's run sentences are shown bare below, from `held`
+            ran = f"isolation: {state.branch} holds active run "
+            why = [ln for ln in refusal.splitlines() if not ln.startswith(ran)]
+            first = why[0] if why else ""
+            typer.echo(f"  keep {state.branch} — {first} (sessions: {_sessions_text(state)})")
+        for line in held.splitlines():
+            typer.echo(f"      {line}")
+    foreign = [
+        (state.branch, [b.session_id for b in state.sessions if b.session_id != session])
+        for state, _t, refusal in plan
+        if refusal is None
+    ]
+    foreign = [(branch, sids) for branch, sids in foreign if sids]
+    foreign_text = "; ".join(f"{branch} (sessions: {', '.join(s)})" for branch, s in foreign)
+    if dry_run:
+        if foreign:
+            typer.echo(f"would require --yes — bound to another session: {foreign_text}")
+        typer.echo("dry run: nothing changed.")
+        return
+    if foreign and not yes:
+        _fail(
+            IsolationError(
+                "down --all would tear down workspace(s) bound to another session: "
+                f"{foreign_text}. Nothing was changed. Re-run with --yes to confirm, "
+                "or `fr isolation down --branch <b>` for just your own."
+            )
+        )
+    torn: list[str] = []
+    kept: list[tuple[str, str]] = []
+    for state, target, refusal in plan:
+        if refusal is not None or target is None:
+            kept.append((state.branch, refusal or "no backend"))
+            continue
+        try:
+            report = target.down(state, force=force, preserve=preserve)
+            torn.append(state.branch)
+        except IsolationError as err:
+            kept.append((state.branch, str(err)))
+            continue
+        _echo_ended_runs(report)
+        _sessions.detach_all(state)  # kept workspaces keep their bindings
+    cleared = clear_repo_sentinels(root)
+    summary = f"isolation down --all: {len(torn)} torn down"
+    if kept:
+        summary += f", {len(kept)} kept (rerun with --force to override)"
+    summary += f", {cleared} sentinel(s) cleared."
+    typer.echo(summary)
+    # Each kept workspace's reason on its OWN lines, never inlined into the
+    # summary (phase-3 review f6). A hazard refusal is multi-line BY DESIGN —
+    # it names the offending paths and the way out — so "; "-joining reasons
+    # into the summary put a separator mid-sentence and buried the sentinel
+    # count at the tail of a paragraph. The message quality IS the product of
+    # this change; a garbled --all undoes it.
+    for branch, reason in kept:
+        typer.echo(f"  kept {branch}:")
+        for line in reason.splitlines():
+            typer.echo(f"    {line}")
+
+
+@isolation_app.command()
+def attach(
+    session: str = typer.Option(
+        ..., "--session", help="Agent session id (from the harness hook payload)."
+    ),
+    repo: Path = typer.Option(Path("."), help="Repo root (default: cwd)."),
+    branch: str | None = typer.Option(
+        None, help="Isolation branch (default: the single active workspace)."
+    ),
+    harness: str = typer.Option("unknown", help="claude | hermes | opencode | unknown"),
+) -> None:
+    """Bind a session to a workspace (traceability; idempotent).
+
+    A session holds at most one binding — attaching elsewhere moves it. State
+    (IsolationState.sessions) is the source of truth; the per-session index
+    under ~/.cache/fr/sessions/ is derived (spec 2026-09-04 §5.A, decision d1).
+    """
+    root = _resolve_repo(repo)
+    state = _resolve_single(root, branch)
+    try:
+        _sessions.attach(root, state.branch, session, harness=harness)
+    except IsolationError as err:
+        _fail(err)
+        return
+    typer.echo(f"attached {session} -> {state.branch}")
+
+
+@isolation_app.command()
+def detach(
+    session: str = typer.Option(..., "--session", help="Agent session id to unbind."),
+    repo: Path | None = typer.Option(
+        None, help="Limit to this repo (default: wherever the session is bound)."
+    ),
+    branch: str | None = typer.Option(None, help="Limit to this branch (with --repo)."),
+) -> None:
+    """Unbind a session (idempotent; exit 0 when nothing was bound)."""
+    try:
+        gone = _sessions.detach(session, repo_root=repo.resolve() if repo else None, branch=branch)
+    except IsolationError as err:
+        _fail(err)
+        return
+    typer.echo(
+        f"detached {session} <- {', '.join(gone)}" if gone else f"detached {session} (no binding)"
+    )
+
+
+@isolation_app.command(name="verify-merge")
+def verify_merge(
+    repo: Path = typer.Option(Path("."), help="Repo root (default: cwd)."),
+    branch: str | None = typer.Option(
+        None, help="Branch whose merge to verify (default: the single active workspace)."
+    ),
+    default_branch: str | None = typer.Option(
+        None,
+        "--default-branch",
+        help="Base branch the PR merged into (resolved from target if unset).",
+    ),
+) -> None:
+    """Verify a merged branch's changes actually reached the base branch.
+
+    Squash/rebase/merge-safe: checks content presence on `origin/<default>`,
+    not commit ancestry (the #320 close-out). Exit 1 if not verified — the fix
+    may have orphaned (a commit pushed after the PR merged). With an explicit
+    --branch whose workspace gc already reaped, the same check runs from the
+    repo root, against every ref of the branch that survives (`origin/<b>`
+    after a fresh fetch of it, and the local branch); an unresolvable ref exits 2.
+    """
+    root = _resolve_repo(repo)
+    if branch is None:
+        states = list_states(root)
+        if len(states) > 1:
+            _fail(
+                IsolationError(
+                    "multiple isolation workspaces — specify --branch: "
+                    + ", ".join(s.branch for s in states)
+                )
+            )
+            return
+        state = states[0] if states else None
+    else:
+        state = load_state(root, branch)
+    reaped = False
+    if state is None:
+        if branch is None:
+            _fail(IsolationError("no isolation workspace — run `fr isolation up` first."))
+            return
+        reaped = True
+    # A live workspace follows its recorded mode (gh#569); a reaped one has
+    # only the host to go on, so it keeps the env-based selection.
+    target = _target_or_exit(root) if state is None else _target_for_or_exit(root, state)
+    _refuse_external(target, "verify-merge")
+    # Resolve default_branch if not explicitly provided
+    if default_branch is None:
+        try:
+            default_branch = _worktree_ops(target)._resolve_default_branch()
+        except IsolationError as e:  # a refused forge lookup (exit 2: it disproves nothing)
+            _fail(e)
+            return
+    # Exit 2 (usage), never 1, on a raised IsolationError: 1 means "not
+    # verified — recover", and an unresolvable ref/base disproves nothing
+    # about the merge.
+    if state is None:
+        assert branch is not None
+        res = _verify_or_fail(
+            lambda: _worktree_ops(target).verify_merge_reaped(branch, default_branch=default_branch)
+        )
+    else:
+        res = _verify_or_fail(
+            lambda: _worktree_ops(target).verify_merge(state, default_branch=default_branch)
+        )
+    note = " (workspace already reaped; checked from the repo root)" if reaped else ""
+    if res["verified"]:
+        typer.echo(
+            f"verify-merge: {res['branch']} ✓ changes present on "
+            f"origin/{default_branch}, PR MERGED.{note}"
+        )
+        return
+    reasons = []
+    if not res["fetched"]:
+        reasons.append(f"could not fetch origin/{default_branch} (check may be stale)")
+    if not res.get("branch_fetched", True):
+        reasons.append(
+            f"could not confirm origin/{res['branch']} (branch fetch failed and the remote "
+            "may hold unpushed content; not confirmed deleted either)"
+        )
+    if not res["changes_present"]:
+        reasons.append(f"changes missing from origin/{default_branch}: {res['missing']}")
+    if res["pr_state"] != "MERGED":
+        reasons.append(f"PR state is {res['pr_state']} (expected MERGED)")
+    typer.echo(
+        f"verify-merge: {res['branch']} ✗ NOT verified{note} — {'; '.join(reasons)}. "
+        "Do NOT declare done; recover (cherry-pick onto the base branch / open a fresh PR).",
+        err=True,
+    )
+    raise typer.Exit(1)
+
+
+@isolation_app.command()
+def gc(
+    repo: Path = typer.Option(Path("."), help="Repo root (default: cwd)."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Classify + report only; mutate nothing."
+    ),
+    format: str = typer.Option("text", "--format", help="text | json"),
+) -> None:
+    """Reconcile isolation workspaces host-wide (#354).
+
+    Tears down workspaces whose PR merged, skips open PRs, warns on no-PR work,
+    and reaps orphaned containers — so end-to-end runs no longer depend on a
+    human running `down` in the originating session. Fired opportunistically on
+    every up/down; also runnable standalone or on a schedule.
+
+    Works in EVERY mode (#423), because unattended automation must not have to
+    special-case one:
+
+    - devcontainer — the full sweep (workspaces, orphaned containers, dangling
+      `vsc-*` images);
+    - host-worktree — the same sweep minus the docker-only steps;
+    - external — a non-destructive `external` verdict; the preparer owns the
+      cleanup of a checkout fr merely adopted.
+
+    `--repo` names the repo whose state records to reconcile (the fr worktree
+    cache and docker labels are host-wide regardless) — cron and agent runs
+    cannot rely on cwd.
+    """
+    target = _target_or_exit(_resolve_repo(repo))
+    actions = _gc_ops(target).gc(dry_run=dry_run)
+    if format == "json":
+        typer.echo(json.dumps([asdict(a) for a in actions], indent=2))
+        return
+    if not actions:
+        typer.echo("gc: no isolation workspaces.")
+        return
+    for a in actions:
+        line = f"gc: {a.branch or a.worktree}: {a.verdict} → {a.action}"
+        if a.detail:
+            line += f" ({a.detail})"
+        typer.echo(line)
