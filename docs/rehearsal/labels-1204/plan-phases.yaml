@@ -1,0 +1,14 @@
+- number: 1
+  title: Observe fixture labels and the reviewed downgrade refusal
+  tag: manual
+  depends_on: []
+  tasks:
+    - number: 1
+      title: Complete original step 1 after genuine review and separate authority
+      steps:
+        - id: P1.T1.S1
+          text: Obtain actual independent spec and plan review before recording its result or creating/adopting an active run.
+        - id: P1.T1.S2
+          text: After fresh remote-state reconciliation and explicit remote authority, retain the real fixture PR identity and label changes made by the shipped sync path.
+        - id: P1.T1.S3
+          text: With the reviewed active run and real PR, request gate none without answered-by operator; require the specific exit-2 refusal and unchanged local and PR state.
