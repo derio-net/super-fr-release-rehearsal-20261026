@@ -1,0 +1,25 @@
+schema_version: 10
+run: 2026-10-30-routing-1205
+workflow: fr-goal@1
+branch: feat/batch-routing-1205
+started: '2026-10-30T22:13:16+00:00'
+cursor: brainstorm
+steps:
+  brainstorm:
+    state: pending
+  spec-review:
+    state: pending
+  plan:
+    state: pending
+  plan-review:
+    state: pending
+  implement:
+    state: pending
+    members:
+    - implement-phase
+    - review-phase
+  journal-check:
+    state: pending
+  deliver:
+    state: pending
+fr_version: 6.0.0rc15
