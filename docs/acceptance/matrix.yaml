@@ -9909,3 +9909,16 @@ rows:
       and prior design review are not a passing walk. No original #1195/#1217 row, issue
       or gate is completed.'
     verify: live
+  - id: labels-1204-reviewed-downgrade-refusal
+    capability: 'Disposable #1204 labels walk'
+    acceptance: After independent spec review, a disposable run refuses removal of its
+      Tester gate without an operator answer and leaves local records and actual PR
+      labels unchanged.
+    origin:
+    - super-fr:docs/superpowers/specs/2026-10-29-labels-walk-1204-design.md#R2
+    levels: {}
+    status: walk-owed
+    notes: 'Fixture-only manual/real-forge observation remains owed. Local authoring
+      and prior design review are not a passing walk. No original #1195/#1217 row, issue
+      or gate is completed.'
+    verify: live
