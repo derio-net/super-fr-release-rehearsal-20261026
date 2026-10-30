@@ -13,10 +13,10 @@ tasks:
   steps:
   - id: P1.T1.S1
     text: |-
-      After setup review and merge, verify default-branch fixture CI/hooks and actual issue
+      After setup review and merge, verify default-branch fixture CI/hooks and actual issue #3, create batch routing-1205 and dispatch exactly one OpenCode session with openai/gpt-6.1-sol and --auto through the shipped runner.
   - id: P1.T1.S2
     text: |-
-      Retain actual session/run/branch identity and one reviewed new batch PR opened after dispatch with Refs issue
+      Retain actual session/run/branch identity and one reviewed new batch PR opened after dispatch with Refs issue #3; after its normal merge, run only the safe first bounded acting pass and capture Needs you Tester, the open awaiting-live issue and no close-out.
   - id: P1.T1.S3
     text: |-
       After genuine held evidence is accepted, record the dated live row walk via shipped CLI in the third reviewed fixture PR; after normal merge, run only the safe second acting pass, retain the fixture gate-pass comment and label swap, then stop before close-out or any original gate pass.

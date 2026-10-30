@@ -11,6 +11,6 @@ default: dev
 forge:
   type: github
 ci:
-  type: github-actions
+  type: none
 tracking:
   type: github

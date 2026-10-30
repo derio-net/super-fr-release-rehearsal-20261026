@@ -9903,7 +9903,7 @@ rows:
       row is genuinely walked and merged, the next bounded driver pass automatically
       records the fixture gate pass without closing out.
     origin:
-    - super-fr-release-rehearsal-20261026:docs/superpowers/specs/2026-10-30-routing-walk-1205-design.md#R1
+    - super-fr:docs/superpowers/specs/2026-10-30-routing-walk-1205-design.md#R1
     levels: {}
     status: walk-owed
     notes: 'Setup only: actual runner dispatch, held-state observation, accepted walk
