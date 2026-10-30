@@ -36,7 +36,14 @@ steps:
           reviewer: ses_e74f1bf6dffeWoz6D6rmhxf00c
           findings: none
   plan:
-    state: pending
+    state: running
+    at: '2026-10-30T04:29:26+00:00'
+    units:
+      step/plan:
+        attempts:
+        - dispatched: '2026-10-30T04:29:26+00:00'
+          harness: opencode
+          session: ses_ec52e48a3ffeYuGgSUiT9iZD10
   plan-review:
     state: pending
   implement:
