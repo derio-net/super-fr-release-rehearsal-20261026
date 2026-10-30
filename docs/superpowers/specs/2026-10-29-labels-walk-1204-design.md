@@ -28,6 +28,9 @@ or acceptance-status write is included in this preparation.
 strategy: candidate
 gate: tester
 
+- labels-1204-automatic-pr-labels: live — Only an actual fixture PR proves that the shipped synchronization path applies the required GitHub labels; local fakes cannot establish that result.
+- labels-1204-reviewed-downgrade-refusal: live — This walk checks the installed CLI against the genuinely reviewed active run and real fixture PR, including unchanged PR labels after refusal; pre-merge unit tests do not establish those observations.
+
 ## Test Plan
 
 1. Obtain actual independent review of this spec and the generated plan. Then

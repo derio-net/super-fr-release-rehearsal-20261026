@@ -4,6 +4,9 @@ phase:
   title: Observe fixture labels and the reviewed downgrade refusal
   tag: manual
   depends_on: []
+  acceptance:
+  - labels-1204-automatic-pr-labels
+  - labels-1204-reviewed-downgrade-refusal
   tracking_issue: null
 tasks:
 - number: 1
