@@ -1,0 +1,100 @@
+schema_version: 2
+run: 2026-10-30-labels-walk-1204
+captures:
+- host: h-174286ee
+  harness: opencode
+  mode: host-worktree
+  captured_at: '2026-10-30T04:20:19+00:00'
+  at:
+  - resolve:brainstorm
+  sessions:
+  - session: ses_ec52e48a3ffeYuGgSUiT9iZD10
+    role: main
+    models:
+      gpt-6.1-sol:
+        input: 19791084
+        cache_write: 0
+        cache_read: 965495680
+        output: 2426532
+        usd: null
+        usd_source: none
+    activity:
+      implementation:
+        usd: null
+        turns: 900
+      other:
+        usd: null
+        turns: 3474
+      paperwork:
+        usd: null
+        turns: 208
+    steps:
+      (outside run):
+        usd: null
+        turns: 4438
+        input: 19755101
+        cache_write: 0
+        cache_read: 953330944
+        output: 2416133
+      brainstorm:
+        usd: null
+        turns: 37
+        input: 35983
+        cache_write: 0
+        cache_read: 12164736
+        output: 10399
+    steps_by_role:
+      main:
+        (outside run):
+          usd: null
+          turns: 1990
+          input: 9480339
+          cache_write: 0
+          cache_read: 483538176
+          output: 610422
+        brainstorm:
+          usd: null
+          turns: 20
+          input: 14446
+          cache_write: 0
+          cache_read: 6114944
+          output: 4396
+      subagent:
+        (outside run):
+          usd: null
+          turns: 2448
+          input: 10274762
+          cache_write: 0
+          cache_read: 469792768
+          output: 1805711
+        brainstorm:
+          usd: null
+          turns: 17
+          input: 21537
+          cache_write: 0
+          cache_read: 6049792
+          output: 6003
+    units:
+      (unattributed):
+        subagent:
+          usd: null
+          turns: 2465
+          input: 10296299
+          cache_write: 0
+          cache_read: 475842560
+          output: 1811714
+    briefs:
+      ses_ec472fd02ffeXvPxnWq8wkk72A: 1331
+      ses_ec4699655ffeL3SP68hI3rHTR8: 786
+      ses_ec3f38899ffeDvvAyhmxZ7QQwj: 430
+      ses_e8b039c91ffeD3lfRg3lwQPACS: 1956
+      ses_e896fe256ffenBhmXVbnXBl73J: 1406
+      ses_e89598a51ffehGXDZPfUTnMYYf: 2119
+      ses_e890f0cf0ffemnoL14M1Y8y817: 2225
+      ses_e83adbd0affe8puCAruckhU0em: 1028
+      ses_e83aadeb9ffeJ9Bb72fyy86MSF: 1619
+      ses_e80d73e61ffeHtfSRuV3cStOUg: 2734
+      ses_e80d2849cffeEno3x7iDUsdJh6: 1239
+      ses_e80c8900effeV9SbxsX3GUBkDp: 1097
+      ses_e802e7c13ffexYgfQ5P2uIHlQa: 2145
+      ses_e7ea640b4ffeG2EHP1YMf07jbe: 2323

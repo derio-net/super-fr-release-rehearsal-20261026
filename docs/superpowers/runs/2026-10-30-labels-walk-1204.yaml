@@ -3,11 +3,16 @@ run: 2026-10-30-labels-walk-1204
 workflow: fr-goal@1
 branch: fixture/labels-1204-isolated
 started: '2026-10-30T04:04:49+00:00'
-cursor: brainstorm
+cursor: spec-review
 steps:
   brainstorm:
-    state: blocked
-    at: '2026-10-30T04:19:30+00:00'
+    state: done
+    at: '2026-10-30T04:20:15+00:00'
+    answered_by: operator
+    emitted:
+      spec: docs/superpowers/specs/2026-10-29-labels-walk-1204-design.md
+      journal:spec: docs/superpowers/journals/specs/2026-10-29-labels-walk-1204.md
+      acceptance: docs/acceptance/matrix.yaml
   spec-review:
     state: pending
   plan:
