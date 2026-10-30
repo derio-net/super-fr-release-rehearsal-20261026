@@ -1,0 +1,40 @@
+schema_version: 2
+phase:
+  number: 1
+  title: Perform the bounded real routing deployment and observations
+  tag: manual
+  depends_on: []
+  tracking_issue: null
+  acceptance:
+  - routing-1205-held-then-walked
+tasks:
+- number: 1
+  title: Retain actual held-state and automatic transition evidence without close-out
+  steps:
+  - id: P1.T1.S1
+    text: |-
+      After setup review and merge, verify default-branch fixture CI/hooks and actual issue
+  - id: P1.T1.S2
+    text: |-
+      Retain actual session/run/branch identity and one reviewed new batch PR opened after dispatch with Refs issue
+  - id: P1.T1.S3
+    text: |-
+      After genuine held evidence is accepted, record the dated live row walk via shipped CLI in the third reviewed fixture PR; after normal merge, run only the safe second acting pass, retain the fixture gate-pass comment and label swap, then stop before close-out or any original gate pass.
+state:
+  steps:
+    P1.T1.S1:
+      state: ' '
+      ticked_at: null
+      note: null
+    P1.T1.S2:
+      state: ' '
+      ticked_at: null
+      note: null
+    P1.T1.S3:
+      state: ' '
+      ticked_at: null
+      note: null
+  completion:
+    at: null
+    note: null
+    observed_prs: []

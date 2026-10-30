@@ -1,0 +1,7 @@
+schema_version: 2
+plan: 2026-10-30-routing-walk-1205
+spec: 2026-10-30-routing-walk-1205-design.md
+target_repo: derio-net/super-fr-release-rehearsal-20261026
+fr_version: '>=6.0.0rc11,<7.0.0'
+created: '2026-10-30'
+workflow: fr-goal
