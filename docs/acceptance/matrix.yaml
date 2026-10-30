@@ -9896,3 +9896,20 @@ rows:
       instruction test is not live evidence.
     verify: live
     scenario: tests/scenarios/herdr-closed-recovery-live.sh
+  - id: routing-1205-held-then-walked
+    capability: 'Disposable #1205 routing walk'
+    acceptance: A genuinely dispatched and merged disposable batch stays under Needs
+      you Tester with its Refs issue open and awaiting live; after the inherited Tester
+      row is genuinely walked and merged, the next bounded driver pass automatically
+      records the fixture gate pass without closing out.
+    origin:
+    - super-fr-release-rehearsal-20261026:docs/superpowers/specs/2026-10-30-routing-walk-1205-design.md#R1
+    levels: {}
+    status: walk-owed
+    notes: 'Setup only: actual runner dispatch, held-state observation, accepted walk
+      evidence on main and automatic gate transition remain owed. One target session
+      and two acting passes maximum. No original #1205 discharge or #1195/#1217 gate
+      pass.'
+    verify: live
+    issues:
+    - derio-net/super-fr-release-rehearsal-20261026#3
