@@ -3,7 +3,7 @@ run: 2026-10-30-labels-walk-1204
 workflow: fr-goal@1
 branch: fixture/labels-1204-isolated
 started: '2026-10-30T04:04:49+00:00'
-cursor: implement
+cursor: journal-check
 steps:
   brainstorm:
     state: done
@@ -56,10 +56,14 @@ steps:
     stdout: |
       self-review passed
   implement:
-    state: pending
+    state: done
+    at: '2026-10-30T04:39:42+00:00'
     members:
     - implement-phase
     - review-phase
+    units:
+      phase/1:
+        state: manual
   journal-check:
     state: pending
   deliver:
