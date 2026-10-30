@@ -50,7 +50,10 @@ steps:
           returned: '2026-10-30T04:29:31+00:00'
           outcome: done
   plan-review:
-    state: pending
+    state: failed
+    at: '2026-10-30T04:29:39+00:00'
+    exit: 2
+    stdout: ''
   implement:
     state: pending
     members:
