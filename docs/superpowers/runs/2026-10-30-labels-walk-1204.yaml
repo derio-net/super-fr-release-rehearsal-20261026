@@ -51,9 +51,11 @@ steps:
           outcome: done
   plan-review:
     state: failed
-    at: '2026-10-30T04:29:39+00:00'
-    exit: 2
-    stdout: ''
+    at: '2026-10-30T04:31:46+00:00'
+    exit: 1
+    stdout: "[error] spec has a Test Plan but no acceptance rows linked — add `acceptance:\
+      \ \n[row-ids]` to the phases that advance them (`fr acceptance add` creates\
+      \ rows).\n"
   implement:
     state: pending
     members:
