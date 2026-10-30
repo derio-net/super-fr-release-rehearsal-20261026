@@ -9898,18 +9898,18 @@ rows:
     scenario: tests/scenarios/herdr-closed-recovery-live.sh
   - id: routing-1205-held-then-walked
     capability: 'Disposable #1205 routing walk'
-    acceptance: A genuinely dispatched and merged disposable batch stays under Needs
-      you Tester with its Refs issue open and awaiting live; after the inherited Tester
-      row is genuinely walked and merged, the next bounded driver pass automatically
-      records the fixture gate pass without closing out.
+    acceptance: After a genuine disposable batch dispatch and reviewed PR merge, the
+      first bounded driver pass shows the held batch under Needs you Tester, keeps
+      its Refs issue open with fr:awaiting-live, and starts no close-out.
     origin:
     - super-fr:docs/superpowers/specs/2026-10-30-routing-walk-1205-design.md#R1
     levels: {}
     status: walk-owed
-    notes: 'Setup only: actual runner dispatch, held-state observation, accepted walk
-      evidence on main and automatic gate transition remain owed. One target session
-      and two acting passes maximum. No original #1205 discharge or #1195/#1217 gate
-      pass.'
+    notes: 'Setup only: this row owes the real pre-transition held-state observation.
+      Record it walked only after that observation is genuine and accepted. The later
+      automatic fixture gate transition is a separate overall Test Plan outcome,
+      not part of this row or a result certified before the second pass. No original
+      #1205 discharge or #1195/#1217 gate pass.'
     verify: live
     issues:
     - derio-net/super-fr-release-rehearsal-20261026#3

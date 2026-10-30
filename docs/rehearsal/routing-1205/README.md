@@ -51,13 +51,23 @@ fr triage batch dispatch routing-1205 --repo "$R" --dir "$Q" \
   --checkout "$C" --to herdr
 ```
 
-Inspect the generated brief BEFORE adding `--yes` once to dispatch. Its
-normal `/fr-goal` entrypoint and default closing-keyword instruction do not
-authorize an extra feature pipeline, extra session or closing issue #3.
-The reviewed post-merge live-row/Refs contract must be honored; otherwise
-stop before launch. Real questions go to the coordinator, not inferred
-answers. Record the existing spec/plan through supported real-run commands;
-never hand-author a run or copy a review result into an unreviewed unit.
+**EXECUTION HOLD:** this is a preview command, not a launch-ready route.
+The shipped batch CLI accepts only `goal|debug`, has no brief/prompt override,
+and renders `/fr-goal` plus member closing-keyword instructions. Issue detail
+and rationale are included, not substituted for those instructions. The
+runner submits that rendered brief unchanged. Prose here does not remove
+the conflict or grant permission to bypass it.
+
+Do not add `--yes` until the coordinator has reviewed the actual preview and
+a concrete supported one-session/Refs lifecycle. The shipped live-row PR-body
+guard can refuse a premature closing keyword; it does not customize dispatch
+or waive required operator/reviewer provenance. Any actual question or active
+review unit needs its genuine witness. Never hand-author a run, copy an old
+review as a fresh completion, or mark delivery done to sidestep an unmet gate.
+With readable OpenCode observations, the shipped reviewer check requires a
+matching child dispatch from the run's own session after the unit opened.
+A coordinator review in a different session does not automatically satisfy
+that check. Do not hide session identity or force the unobservable fallback.
 
 Read current `herdr --skill` first; the caller must actually be in Herdr.
 Do NOT run an extra `herdr agent start`: shipped dispatch creates the one
@@ -81,13 +91,17 @@ awaiting-live and held board output. Retain actual Tester lane, open issue
 with awaiting-live and no close-out. Any dispatch, merge, recovery, restart,
 installer, export, close-out or unrelated action is a hard stop.
 
-6. After the held observation is genuine and accepted, record the linked
-   row's dated live walk via shipped CLI, with actual model/harness/evidence.
-   Independently review and normally merge the THIRD fixture PR. Do not
-   close issue #3 because a CLI prints a close suggestion.
+6. After the held observation is genuine and accepted, record ONLY the linked
+   pre-transition held-state row's dated live walk via shipped CLI, with actual
+   model/harness/evidence. Independently review and normally merge the THIRD
+   fixture PR. That PR must not claim the later automatic transition was
+   observed. Do not close issue #3 because a CLI prints a close suggestion.
 7. Preview the same command again. The second and last `--yes` pass may
    maintain claims, automatically pass only this fixture Tester gate and
-   refresh its board. Retain the actual gate-pass comment and label swap;
+   refresh its board. Only after retaining the actual gate-pass comment and
+   label swap may the OVERALL routing outcome be recorded for coordinator
+   acceptance. Keep that later proof separately; no fourth fixture PR is
+   authorized. The row's earlier walked status certifies held state only;
    stop immediately after the pass, before any later close-out. No loop,
    `--single-pass`, manual gate pass or session cleanup is authorized.
 

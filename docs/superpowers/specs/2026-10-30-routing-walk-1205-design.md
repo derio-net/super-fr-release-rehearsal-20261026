@@ -13,10 +13,13 @@ R1. One genuinely dispatched triage batch opens a new PR after dispatch.
 After its reviewed normal merge, the held batch appears under Needs you ·
 Tester and stays out of close-out. Disposable
 https://github.com/derio-net/super-fr-release-rehearsal-20261026/issues/3
-remains open with `fr:awaiting-live`. After genuine held-state evidence is
-accepted and the row's dated walk is merged, the second bounded acting pass
+remains open with `fr:awaiting-live`. This pre-transition observation alone
+is the linked row's acceptance. After that evidence is genuine and accepted
+and the row's dated walk is merged, the second bounded acting pass
 automatically replaces only the fixture `gate:tester` with
-`gate:tester-passed`. Labels alone do not prove routing.
+`gate:tester-passed`. That later transition is a separate overall routing
+Test Plan outcome, recorded only after it actually occurs; it is not part
+of the row certified before the second pass. Labels alone do not prove routing.
 
 R2. At most three reviewed fixture PRs/normal merges (setup, batch, evidence),
 one issue, one real batch, one OpenCode session (`openai/gpt-6.1-sol`, `--auto`)
@@ -29,7 +32,7 @@ original gate pass, real queue, J or six-batch action.
 strategy: live
 gate: tester
 
-- routing-1205-held-then-walked: live — Only a genuine dispatched batch, merged PR, driver queue and default-branch walk evidence can prove routing and the automatic fixture gate transition. This row has the run's live kind and inherits its Tester gate, without a separate row gate.
+- routing-1205-held-then-walked: live — Only the real first driver pass over a genuinely dispatched, merged batch can prove the pre-transition Tester-held/open-awaiting-live/no-closeout observation. This row has the run's live kind and inherits its Tester gate, without a separate row gate. The later automatic transition is a separate overall Test Plan outcome, not this row's acceptance.
 
 ## Test Plan
 
@@ -48,12 +51,15 @@ gate: tester
    Permit only that batch's claim upkeep, awaiting-live label and held-state
    board output. Run it once; retain the real Tester lane, open issue with
    awaiting-live, and no close-out. Unexpected actions stop the test.
-5. After genuine held-state evidence is accepted, record this row's dated
-   live walk via `fr acceptance set-status`; independently review and merge
-   the third fixture PR. No observation is pre-recorded as passing.
+5. After genuine held-state evidence is accepted, record only this
+   pre-transition row's dated live walk via `fr acceptance set-status`;
+   independently review and merge the third fixture PR. Its evidence must
+   not claim that the later automatic transition has already happened.
 6. Preview the second specific-batch pass. Permit claim upkeep, automatic
    fixture Tester pass and board refresh only. Run once; require the actual
-   gate-pass comment and label swap. Stop before any later close-out. Do not
+   gate-pass comment and label swap before recording the overall routing
+   outcome. Retain that later proof separately for coordinator acceptance;
+   no fourth fixture PR is authorized. Stop before any later close-out. Do not
    close issue #3 or original #1205, or pass original #1195/#1217 gates.
 
 ## Failure boundaries
