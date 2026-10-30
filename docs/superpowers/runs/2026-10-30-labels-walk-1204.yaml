@@ -14,7 +14,17 @@ steps:
       journal:spec: docs/superpowers/journals/specs/2026-10-29-labels-walk-1204.md
       acceptance: docs/acceptance/matrix.yaml
   spec-review:
-    state: pending
+    state: running
+    at: '2026-10-30T04:24:25+00:00'
+    units:
+      step/spec-review:
+        attempts:
+        - dispatched: '2026-10-30T04:24:25+00:00'
+          agent_type: super-fr:fr-spec-reviewer
+          harness: opencode
+          tier: hard
+          bound: openai/gpt-6.1-sol
+          session: ses_ec52e48a3ffeYuGgSUiT9iZD10
   plan:
     state: pending
   plan-review:
