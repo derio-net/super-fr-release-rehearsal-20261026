@@ -9930,7 +9930,7 @@ rows:
       generators and large ints, rejects booleans and non-integers with TypeError and
       negatives with ValueError, preserving the CLI.
     origin:
-    - super-fr-release-rehearsal-20261026:docs/superpowers/specs/2026-10-31-closeout-1206-quantities-design.md#R1
+    - super-fr:docs/superpowers/specs/2026-10-31-closeout-1206-quantities-design.md#R1
     levels: {}
     status: not-implemented
     notes: Task implementation and local tests pending. Actions disabled; own row explicitly
