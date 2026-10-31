@@ -1,0 +1,35 @@
+schema_version: 10
+run: 2026-10-31-feat-batch-closeout-1206-quantities
+step: spec-review
+outcome: done
+evidence:
+  review: spec-review
+  reviewer: ses_e6e07bb95ffemitS7uoli1JYP6
+journal:
+  - kind: finding
+    id: s1
+    review_scope: in
+    title: Explicit input-boundary promises lack specified tests
+    body: |
+      check: consistency
+      target: spec
+      evidence: docs/superpowers/specs/2026-10-31-closeout-1206-quantities-design.md:29-34; Requirements R3; Test Plan
+      scope: in — these are behavioral promises introduced by this spec.
+      The design explicitly accepts int subclasses, rejects int-like non-int objects, and propagates iterator exceptions, but the required test cases do not cover those distinctions. Add explicit test cases for these promises to the specified unittest coverage, including their inclusion in the post-merge discovery run.
+  - kind: review
+    id: spec-review
+    title: 'independent spec review: 1 finding'
+    body: |
+      reviewer: OpenAI GPT-6.1 Sol, dispatched child 1
+      Parent-observed reviewer session: ses_e6e07bb95ffemitS7uoli1JYP6.
+      decisions: quantities-contract is honored by Requirements R1–R6 and Verification.
+      Verified spec journal decision at line 11; baseline fixture_app.py:9 and
+      test_fixture_app.py:10; own matrix row:9927 and issue:9940;
+      verification_cmd.py:99 supports exit --run; corrected profile:16-23;
+      record/model.py:80,261 supports the native schema.
+      Proposed quantities module and tests are additions. One in-scope finding.
+resolves:
+  - id: s1
+    state: fixed
+    body: Added explicit int-subclass, __int__-only object and iterator-exception test coverage to Design, including the post-merge discovery run.
+acceptance: []

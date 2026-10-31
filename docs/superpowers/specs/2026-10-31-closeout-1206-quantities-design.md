@@ -31,7 +31,10 @@ objects that are not Python ints. Iterator exceptions propagate normally.
 
 Tests live in `project/tests/test_quantities.py` alongside
 `project/tests/test_fixture_app.py`. Named TestTotalUnits methods cover each
-required case and consume a generator to exhaustion. Only the fixture module,
+required case and consume a generator to exhaustion. Also test acceptance of
+an int subclass, rejection of an object with only __int__, and propagation of
+an iterator's exception; these cases join the same post-merge discovery run.
+Only the fixture module,
 tests and native spec/plan/journal/run/acceptance artifacts are changed.
 Tracked profiles, lockfiles, product tooling, Actions and routing resources
 remain untouched. No labels-task launch, Ready/merge, gate pass, driver,
