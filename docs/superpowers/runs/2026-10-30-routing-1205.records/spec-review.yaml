@@ -1,0 +1,43 @@
+schema_version: 10
+run: 2026-10-30-routing-1205
+step: spec-review
+outcome: done
+journal:
+  - kind: finding
+    id: routing1205-a-s1
+    review_scope: in
+    title: Active plan prose contradicts the approved target-local review contract
+    body: |-
+      check: consistency
+      target: plan
+      evidence: docs/superpowers/plans/2026-10-30-routing-walk-1205/_prose.md:3-10; docs/superpowers/specs/2026-10-30-routing-walk-1205-design.md:24-46; decision routing-1205-target-operator-confirmation, docs/superpowers/journals/specs/2026-10-30-routing-walk-1205.md:48-59
+      scope: The reused active plan must agree with this change's approved target-local provenance requirements.
+      The plan prohibits an additional model session and says only the coordinator obtains independent reviews and actual operator answers. R2/R3 and the recorded decision instead require the target's own answered question and permit up to three target-dispatched reviewer children. Add a current clarification to the active plan distinguishing those required children and target-local witnesses from forbidden implementation workers; preserve historical setup evidence and leave every manual step unticked.
+  - kind: review
+    id: routing1205-a-review
+    title: 'independent spec review: 1 finding'
+    body: |-
+      Static documentation review only; no CLI, suite, forge operation, or live observation performed. No historical setup PASS was reused. The plan inconsistency remains a blocker; this review does not certify routing, any gate pass, or completed delivery.
+      verified:
+      - docs/superpowers/journals/specs/2026-10-30-routing-walk-1205.md:48-59 — recorded target-local decision agrees with spec R2–R4.
+      - docs/superpowers/specs/2026-10-30-routing-walk-1205-design.md:24-61 — three-child cap, RC15 identity requirement, and incomplete deliver/running hand-off are explicit.
+      - docs/superpowers/specs/2026-10-30-routing-walk-1205-design.md:100-109 — older setup runtime and reviewer restrictions are explicitly historical.
+      - docs/rehearsal/routing-1205/README.md:11-23 — historical RC11 and no-reviewer restrictions remain intact.
+      - docs/superpowers/plans/2026-10-30-routing-walk-1205/01.yaml:5-9 — sole phase is manual and links the acceptance row.
+      - docs/superpowers/plans/2026-10-30-routing-walk-1205/01.yaml:23-40 — all manual steps remain unticked and completion is absent.
+      - docs/acceptance/matrix.yaml:9899-9915 — live row remains walk-owed and certifies only the first held-state observation, not the later gate transition.
+      - docs/superpowers/runs/2026-10-30-routing-1205.yaml:6-27 — spec-review is running after brainstorm resolved; a reviewer attempt is recorded.
+      Runtime identity and actual child dispatch/return provenance were not independently observed; the parent must supply the actual returned reviewer identity. All manual observations remain owed.
+resolves:
+  - id: routing1205-a-s1
+    state: fixed
+    body: |-
+      Added a current target execution clarification to the reused active plan
+      _prose.md, distinguishing genuine target-local question/review witnesses
+      and at most three read-only reviewer children from forbidden implementation
+      workers. Preserved historical setup paragraphs and all manual step bytes.
+      No full suite, acting pass or completed delivery is claimed.
+acceptance: []
+evidence:
+  review: routing1205-a-review
+  reviewer: ses_e6fb0b02effe1D61HGm3FqPDsQ
