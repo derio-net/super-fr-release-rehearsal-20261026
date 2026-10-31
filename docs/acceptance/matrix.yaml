@@ -9924,3 +9924,17 @@ rows:
       outcome: pass
       at: '2026-10-31T05:10:17Z'
       evidence: docs/rehearsal/routing-1205/held-state-20261031.md
+  - id: closeout-1206-total-units
+    capability: Standalone fixture quantities
+    acceptance: total_units sums iterable nonnegative integers, including empty input,
+      generators and large ints, rejects booleans and non-integers with TypeError and
+      negatives with ValueError, preserving the CLI.
+    origin:
+    - super-fr-release-rehearsal-20261026:docs/superpowers/specs/2026-10-31-closeout-1206-quantities-design.md#R1
+    levels: {}
+    status: not-implemented
+    notes: Task implementation and local tests pending. Actions disabled; own row explicitly
+      Tester-gated for an operator rerun on merged main. No CI or walked claim.
+    verify: none
+    issues:
+    - derio-net/super-fr-release-rehearsal-20261026#9
