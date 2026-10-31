@@ -8,6 +8,47 @@ issue numbers, batch judgements, run cursors, walked rows, or gate passes here.
 
 ## Current permission boundary
 
+### Startup correction draft
+
+The setup-only Python 3.14 preflight proved an environment in an already-created
+container; it did not validate fresh profile startup. The first quantities
+parent correctly stopped before startup because the old dev profile installed
+floating Git tools without frozen/wheel-only constraints.
+
+The separately approved correction draft changes only the dev profile, its
+`bootstrap.sh`, and this runbook. Bootstrap downloads prebuilt CPython 3.14.10
+on Linux x86_64, uses a new container-only environment at
+`/home/vscode/.local/share/fr/closeout-1206-runtime-py314`, and installs this
+checkout with `uv sync --frozen --no-build`. External sdists are forbidden;
+local pure-Python workspace assembly remains allowed. Its resolver environment
+is explicitly whitelisted, with one build/install/download worker and zero
+HTTP retries. Existing environment paths are refused, not replaced. The real
+environment's `fr` is on container PATH for the native identity/version probe;
+no alias, fake executable, host install or identity override is involved.
+
+Preparation happens in the retained existing setup isolation, with current
+fixture main merged locally and a genuine untracked retention note protecting
+that bootstrap workspace/environment from GC. Commit the safe profile before
+creating exactly one new native validation workspace:
+
+```sh
+fr isolation up --branch test/closeout-1206-startup --base <safe-commit> --profile dev --print-path
+fr isolation exec --branch test/closeout-1206-startup -- uv run --frozen --no-sync --no-build --python /home/vscode/.local/share/fr/closeout-1206-runtime-py314/bin/python --no-python-downloads fr --identity
+fr isolation exec --branch test/closeout-1206-startup -- uv run --frozen --no-sync --no-build --python /home/vscode/.local/share/fr/closeout-1206-runtime-py314/bin/python --no-python-downloads fr acceptance status --brief
+```
+
+The native `--base` route reads the committed branch profile and retains native
+state/marker/version checks. Validation has a 15-minute aggregate limit,
+including fresh startup, with an outside command deadline, serial execution
+and no full suite. Stop on missing wheels, native compilation, unexpected load,
+failure or timeout; do not retry. Retain both setup/validation workspaces, all
+environments and the old routing retention note. This one extra correction PR
+raises the overall ceiling to five; publication is draft-only after independent
+review, and merge requires a separate exact-head grant. Quantities remains
+paused until validation, correction merge and explicit continuation. No labels
+launch, target input, batch test/merge/gate, driver or collection is authorized
+by the correction draft.
+
 Only local setup, scoped baseline checks, independent setup review, and at most
 one **draft setup PR** are authorized. The coordinator owns the review, push,
 and draft PR. The draft requires review and a separate merge grant. This agent

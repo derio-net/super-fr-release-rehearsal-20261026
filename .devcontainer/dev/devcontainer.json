@@ -5,13 +5,22 @@
     "ghcr.io/devcontainers/features/github-cli:1": {},
     "ghcr.io/jsburckhardt/devcontainer-features/uv:1": {}
   },
-  "postCreateCommand": "git config --global --add safe.directory \"$PWD\" || true; uv tool install --with 'git+https://github.com/derio-net/super-fr#subdirectory=packages/fr-claude-cloud' --with 'git+https://github.com/derio-net/super-fr#subdirectory=packages/fr-cncd' --with 'git+https://github.com/derio-net/super-fr#subdirectory=packages/fr-herdr' --with 'git+https://github.com/derio-net/super-fr#subdirectory=packages/fr-vk' 'git+https://github.com/derio-net/super-fr#subdirectory=packages/fr'",
+  "postCreateCommand": "bash .devcontainer/dev/bootstrap.sh",
   "runArgs": [
     "--env-file",
     "${localEnv:HOME}/.config/fr/secrets/super-fr/dev.env"
   ],
   "containerEnv": {
-    "UV_PROJECT_ENVIRONMENT": ".venv-container"
+    "PATH": "/home/vscode/.local/share/fr/closeout-1206-runtime-py314/bin:/home/vscode/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "UV_PROJECT_ENVIRONMENT": "/home/vscode/.local/share/fr/closeout-1206-runtime-py314",
+    "UV_PYTHON": "3.14.10",
+    "UV_PYTHON_DOWNLOADS": "never",
+    "UV_FROZEN": "1",
+    "UV_NO_BUILD": "1",
+    "UV_CONCURRENT_BUILDS": "1",
+    "UV_CONCURRENT_INSTALLS": "1",
+    "UV_CONCURRENT_DOWNLOADS": "1",
+    "UV_HTTP_RETRIES": "0"
   },
   "customizations": {
     "fr": {
