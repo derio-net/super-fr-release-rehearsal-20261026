@@ -11,6 +11,7 @@ phase:
   files:
   - docs/rehearsal/collected-closeout-1206/project/quantities.py
   - docs/rehearsal/collected-closeout-1206/project/tests/test_quantities.py
+  - docs/rehearsal/collected-closeout-1206/project/pytest.ini
   estimate_lines: 130
 tasks:
 - number: 1
@@ -24,7 +25,7 @@ tasks:
       GREEN: Implement quantities.total_units with one accumulator and per-element bool/non-int checks before negativity. Run complete standalone discovery through isolation exec; expect all baseline and new tests pass. Do not implement labels or change CLI.
   - id: P1.T1.S3
     text: |-
-      REFACTOR: Review the loop and tests for clarity and unnecessary storage; retain minimal one-pass implementation or record why no refactor is needed. Commit final code, run the FULL inherited uv run pytest -q --no-cov -n 0 via plain host isolation exec once, with a host-visible log and a 30-minute timeout; no automatic rerun on failure/timeout. Stop and report any unexpected failure. Keep total targeted/TDD/standalone checks within 15 minutes aggregate.
+      REFACTOR: Retain the reviewed minimal one-pass implementation. Under operator-approved standalone verification boundary, add project/pytest.ini containing [pytest] and testpaths = tests on separate lines; host-commit final code/config with existing identity. Through plain host isolation exec inside project, run /home/vscode/.local/share/fr/closeout-1206-runtime-py314/bin/python -m pytest -c pytest.ini -q --no-cov -n 0 exactly once, timeout two minutes within remaining 15-minute aggregate budget, into a fresh host-visible external log on committed-clean code. Preserve failed inherited log/commit 1fca788 and its actual exit=2; no inherited rerun, repair, pass claim or automatic application retry. Stop on failure, timeout, load or evidence-reuse refusal.
 state:
   steps:
     P1.T1.S1:

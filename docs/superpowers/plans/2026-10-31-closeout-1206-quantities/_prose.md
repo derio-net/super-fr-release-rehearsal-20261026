@@ -13,9 +13,15 @@ No allocation retry; cap six total children, including spec and code reviewers.
 No cleanup, labels task, Ready/merge, gate answer, driver or closeout.
 
 Run the full standalone discovery command in the spec for red and green.
-Commit the code before the full inherited suite and capture its real output
-outside the repository in a host-visible log. Run that full suite once at most
-30 minutes, no rerun after failure/timeout; return blocked on unexpected failures.
+The inherited suite already failed (commit 1fca788, exit=2; 1 failed, 595 passed,
+4 skipped, 46 errors, interrupted after 21m40s). Preserve it and its raw log;
+do not repair, retry or call it a passing baseline. The operator-approved
+scope revision in the spec journal now defines the complete standalone project
+as the application boundary. Add only project/pytest.ini with [pytest] and
+testpaths = tests. Host-commit final code/config before the same executor runs
+the complete application pytest command in the revised spec exactly once,
+at most two minutes within remaining aggregate budget, with a fresh external
+host-visible log. Stop on failure/timeout/load or native evidence refusal.
 The parent will set the own row unwired with named tests after actual passing
 evidence, then independently review and validate Tester/Refs and normal delivery.
 Actions remain disabled; post-merge verification is operator-owned, not a phase.
