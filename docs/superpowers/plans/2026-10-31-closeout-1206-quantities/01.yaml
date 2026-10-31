@@ -1,0 +1,45 @@
+schema_version: 2
+phase:
+  number: 1
+  title: Implement strict nonnegative total units with regression coverage
+  tag: agentic
+  depends_on: []
+  tracking_issue: null
+  acceptance:
+  - closeout-1206-total-units
+  tier: standard
+  files:
+  - docs/rehearsal/collected-closeout-1206/project/quantities.py
+  - docs/rehearsal/collected-closeout-1206/project/tests/test_quantities.py
+  estimate_lines: 130
+tasks:
+- number: 1
+  title: Strict iterable aggregation and preserved CLI
+  steps:
+  - id: P1.T1.S1
+    text: |-
+      RED: Add TestTotalUnits tests for empty, mixed nonnegative integers, exhausted generator, arbitrary large integers, negative integers, both booleans, float and string elements, int subclass acceptance, __int__-only rejection and iterator exception propagation. Through isolation exec run the complete unittest discovery command in the spec; expect only new-module import failure before implementation, baseline unchanged.
+  - id: P1.T1.S2
+    text: |-
+      GREEN: Implement quantities.total_units with one accumulator and per-element bool/non-int checks before negativity. Run complete standalone discovery through isolation exec; expect all baseline and new tests pass. Do not implement labels or change CLI.
+  - id: P1.T1.S3
+    text: |-
+      REFACTOR: Review the loop and tests for clarity and unnecessary storage; retain minimal one-pass implementation or record why no refactor is needed. Commit final code, run the FULL inherited uv run pytest -q --no-cov -n 0 via plain host isolation exec once, with a host-visible log and a 30-minute timeout; no automatic rerun on failure/timeout. Stop and report any unexpected failure. Keep total targeted/TDD/standalone checks within 15 minutes aggregate.
+state:
+  steps:
+    P1.T1.S1:
+      state: ' '
+      ticked_at: null
+      note: null
+    P1.T1.S2:
+      state: ' '
+      ticked_at: null
+      note: null
+    P1.T1.S3:
+      state: ' '
+      ticked_at: null
+      note: null
+  completion:
+    at: null
+    note: null
+    observed_prs: []

@@ -69,3 +69,9 @@ that native phase evidence for deliver only if the native gate accepts it.
    tests, before recording this batch's Tester pass. This checks integration
    with merged main, which a pre-merge checkout cannot establish. Issue #9
    stays open until the later collected housekeeping PR merges.
+
+## Implementation Plans
+
+| Plan | Repo | File | Depends on |
+|------|------|------|------------|
+| 2026-10-31-closeout-1206-quantities | `derio-net/super-fr-release-rehearsal-20261026` | `2026-10-31-closeout-1206-quantities` | — |
