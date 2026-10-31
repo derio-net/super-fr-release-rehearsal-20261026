@@ -19,5 +19,13 @@ journal:
     review_scope: in
     title: Container git commit refused missing author identity
     body: Standalone discovery passed all 14 tests. The isolation-exec git commit failed because the container has no author identity. The operator authorized continuation using existing host Git identity; inspected the staged and dirty diff and verified host author and committer identity before committing. No configuration or attribution was changed.
+  - kind: finding
+    id: quantities-full-suite-blocked
+    phase: 1
+    state: open
+    review_scope: in
+    title: Inherited full suite did not pass
+    body: The sole inherited serial pytest run on committed code 4c74fd0 exited 2 after 1300.65 seconds, reporting 1 failed, 595 passed, 4 skipped and 46 errors, ending with KeyboardInterrupt. Stopped without rerun or code changes. S3 remains incomplete; the external log preserves actual output and exit status.
 resolves: []
-evidence: {}
+evidence:
+  tests: /private/var/folders/28/d4n60x_92gbgh3rtf4vstb0h0000gn/T/opencode/quantities-phase1-full-20261031.log
