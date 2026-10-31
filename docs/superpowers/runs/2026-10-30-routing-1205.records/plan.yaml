@@ -1,0 +1,23 @@
+schema_version: 10
+run: 2026-10-30-routing-1205
+step: plan
+outcome: done
+journal:
+  - kind: decision
+    global: true
+    id: routing-1205-reuse-manual-plan
+    title: Reuse the existing manual-only routing deployment plan
+    body: |-
+      Reused docs/superpowers/plans/2026-10-30-routing-walk-1205 and this
+      existing plan journal. The sole phase remains tagged manual, with all
+      three step states and completion unchanged. Its linked live acceptance
+      row remains walk-owed. The active prose now carries the scoped
+      target-local reviewer/question clarification accepted by spec-review.
+      No regenerated implementation plan, implementation worker, suite or
+      manual completion is authorized. The shipped CLI owns plan-review,
+      empty agentic-group progression and journal-check. Stop if an agentic
+      implementation unit appears; otherwise stop at deliver/running.
+resolves: []
+emitted:
+  plan: docs/superpowers/plans/2026-10-30-routing-walk-1205
+evidence: {}
