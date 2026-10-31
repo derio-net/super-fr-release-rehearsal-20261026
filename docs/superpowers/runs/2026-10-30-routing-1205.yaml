@@ -12,7 +12,17 @@ steps:
     emitted:
       spec: docs/superpowers/specs/2026-10-30-routing-walk-1205-design.md
   spec-review:
-    state: pending
+    state: running
+    at: '2026-10-31T04:54:24+00:00'
+    units:
+      step/spec-review:
+        attempts:
+        - dispatched: '2026-10-31T04:54:24+00:00'
+          agent_type: super-fr:fr-spec-reviewer
+          harness: opencode
+          tier: hard
+          bound: openai/gpt-6.1-sol
+          session: ses_e71210cceffeiBPvi1x6z8VEG7
   plan:
     state: pending
   plan-review:
