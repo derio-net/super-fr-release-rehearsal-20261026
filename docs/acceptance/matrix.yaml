@@ -9931,10 +9931,31 @@ rows:
       negatives with ValueError, preserving the CLI.
     origin:
     - super-fr:docs/superpowers/specs/2026-10-31-closeout-1206-quantities-design.md#R1
-    levels: {}
-    status: not-implemented
-    notes: Task implementation and local tests pending. Actions disabled; own row explicitly
-      Tester-gated for an operator rerun on merged main. No CI or walked claim.
+    levels:
+      unit:
+      - super-fr:docs/rehearsal/collected-closeout-1206/project/tests/test_quantities.py#TestTotalUnits::test_empty_input
+      - super-fr:docs/rehearsal/collected-closeout-1206/project/tests/test_quantities.py#TestTotalUnits::test_mixed_nonnegative_integers
+      - super-fr:docs/rehearsal/collected-closeout-1206/project/tests/test_quantities.py#TestTotalUnits::test_generator_is_exhausted
+      - super-fr:docs/rehearsal/collected-closeout-1206/project/tests/test_quantities.py#TestTotalUnits::test_arbitrary_large_integers
+      - super-fr:docs/rehearsal/collected-closeout-1206/project/tests/test_quantities.py#TestTotalUnits::test_negative_integer_is_rejected
+      - super-fr:docs/rehearsal/collected-closeout-1206/project/tests/test_quantities.py#TestTotalUnits::test_both_booleans_are_rejected
+      - super-fr:docs/rehearsal/collected-closeout-1206/project/tests/test_quantities.py#TestTotalUnits::test_floats_are_rejected
+      - super-fr:docs/rehearsal/collected-closeout-1206/project/tests/test_quantities.py#TestTotalUnits::test_strings_are_rejected
+      - super-fr:docs/rehearsal/collected-closeout-1206/project/tests/test_quantities.py#TestTotalUnits::test_int_subclass_is_accepted
+      - super-fr:docs/rehearsal/collected-closeout-1206/project/tests/test_quantities.py#TestTotalUnits::test_int_only_object_is_rejected_without_coercion
+      - super-fr:docs/rehearsal/collected-closeout-1206/project/tests/test_quantities.py#TestTotalUnits::test_iterator_exception_propagates
+      - super-fr:docs/rehearsal/collected-closeout-1206/project/tests/test_fixture_app.py#FixtureAppTests::test_default_prints_application_name
+      - super-fr:docs/rehearsal/collected-closeout-1206/project/tests/test_fixture_app.py#FixtureAppTests::test_version_prints_fixture_version
+      - super-fr:docs/rehearsal/collected-closeout-1206/project/tests/test_fixture_app.py#FixtureAppTests::test_unknown_argument_is_rejected
+    status: unwired
+    notes: 'Implemented strict total_units. Full standalone unittest discovery: 14 passed.
+      Operator-approved complete application pytest boundary: 14 passed plus 4 subtests,
+      exit 0; fresh executor log quantities-phase1-application-20261031.log on committed
+      code 8f7d567. Actions disabled, so unwired, not CI/walked. Own Tester gate remains
+      for operator merged-main rerun; issue #9 stays open. Earlier inherited run remains
+      failed (exit 2, 1 failed, 595 passed, 4 skipped, 46 errors); obligation superseded
+      by operator decision quantities-application-verification-boundary, not repaired
+      or passed.'
     verify: none
     issues:
     - derio-net/super-fr-release-rehearsal-20261026#9
