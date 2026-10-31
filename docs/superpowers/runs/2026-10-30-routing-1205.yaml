@@ -32,7 +32,14 @@ steps:
           reviewer: ses_e6fb0b02effe1D61HGm3FqPDsQ
           findings: routing1205-a-s1
   plan:
-    state: pending
+    state: running
+    at: '2026-10-31T04:55:48+00:00'
+    units:
+      step/plan:
+        attempts:
+        - dispatched: '2026-10-31T04:55:48+00:00'
+          harness: opencode
+          session: ses_e71210cceffeiBPvi1x6z8VEG7
   plan-review:
     state: pending
   implement:
