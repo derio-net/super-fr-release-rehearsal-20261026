@@ -3,7 +3,7 @@ run: 2026-10-30-routing-1205
 workflow: fr-goal@1
 branch: feat/batch-routing-1205
 started: '2026-10-30T22:13:16+00:00'
-cursor: implement
+cursor: journal-check
 steps:
   brainstorm:
     state: done
@@ -51,10 +51,14 @@ steps:
     stdout: |
       self-review passed
   implement:
-    state: pending
+    state: done
+    at: '2026-10-31T04:56:12+00:00'
     members:
     - implement-phase
     - review-phase
+    units:
+      phase/1:
+        state: manual
   journal-check:
     state: pending
   deliver:
