@@ -30,3 +30,27 @@ The operator explicitly superseded the inherited copied-product verification obl
 ### no-refactor-p1-t1 · discovery · no-refactor-because P1.T1 (phase 1)
 
 The accumulator loop already makes one pass with constant auxiliary element storage; explicit type-before-sign checks and independently named tests need no further abstraction.
+
+<!-- fr:journal kind=finding scope=plan id=p1-r1 created=2026-10-31T15:05:53+00:00 phase=1 state=open review_scope=in -->
+### p1-r1 · finding [open] (reviewer: in scope) · Own acceptance row still claims implementation pending (phase 1)
+
+Independent reviewer ses_e6d82f6cbffeoVjh4f3saD0S5W found matrix.yaml:9934-9937
+had empty evidence, not-implemented and tests pending despite local passes.
+In scope: stale bookkeeping introduced by this change. Revised spec requires
+unwired and named test refs while retaining Tester, issue #9 and verify none.
+
+<!-- fr:journal kind=review scope=plan id=quantities-p1-review created=2026-10-31T15:05:53+00:00 phase=1 -->
+### quantities-p1-review · review · Independent implementation and revised contract review (phase 1)
+
+Reviewer ses_e6d82f6cbffeoVjh4f3saD0S5W inspected all 15 changed artifacts
+against revised spec/plan and operator decision. No functional code defects.
+Verified strict single-pass aggregation, arbitrary integers, iterator errors,
+all required tests, unchanged baseline CLI, exact two-line pytest.ini,
+preserved failed inherited history/log and new complete application evidence.
+One in-scope finding p1-r1; no out-of-scope findings. Read-only review, no
+new test run. Parent verified finding against matrix and applied native fix.
+
+<!-- fr:journal kind=finding scope=plan id=p1-r1-resolved created=2026-10-31T15:05:53+00:00 phase=1 state=fixed resolves=p1-r1 -->
+### p1-r1-resolved · finding [fixed] · resolves p1-r1: Own acceptance row still claims implementation pending (phase 1)
+
+Native acceptance set-status moved ONLY the own row to unwired and added all 14 named test refs; regenerated three reports. No CI/walked/gate pass claim. Existing host identity commits container-produced metadata, without identity configuration.

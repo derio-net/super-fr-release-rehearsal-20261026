@@ -3,7 +3,7 @@ run: 2026-10-31-feat-batch-closeout-1206-quantities
 workflow: fr-goal@1
 branch: feat/batch-closeout-1206-quantities
 started: '2026-10-31T11:56:35+00:00'
-cursor: implement
+cursor: journal-check
 steps:
   brainstorm:
     state: done
@@ -51,8 +51,8 @@ steps:
     stdout: |
       self-review passed
   implement:
-    state: running
-    at: '2026-10-31T15:03:33+00:00'
+    state: done
+    at: '2026-10-31T15:05:54+00:00'
     members:
     - implement-phase
     - review-phase
@@ -74,11 +74,19 @@ steps:
           tests: quantities-phase1-application-20261031.log@1004bcb261fe;tree=6a270e5b54cad30c26b58dc147c7c87527455d8879173ee5493667d8115c0a62
           visual: none
       phase/1/review-phase:
-        state: running
+        state: done
         attempts:
         - dispatched: '2026-10-31T15:03:33+00:00'
           harness: opencode
+          model: openai/gpt-6.1-sol
           session: ses_e6e491be0ffeBvdv5ch4PnSXdx
+          returned: '2026-10-31T15:05:54+00:00'
+          outcome: done
+        evidence:
+          review: quantities-p1-review
+          reviewer: ses_e6d82f6cbffeoVjh4f3saD0S5W
+          visual: none
+          findings: quantities-commit-identity,quantities-full-suite-blocked,p1-r1
   journal-check:
     state: pending
   deliver:
