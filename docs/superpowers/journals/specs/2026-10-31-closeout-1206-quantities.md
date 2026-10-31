@@ -55,3 +55,8 @@ row_kinds:
 run_gate: none
 run_kind: none
 ```
+
+<!-- fr:journal kind=decision scope=spec id=quantities-application-verification-boundary created=2026-10-31T15:01:43+00:00 narrows=derio-net/super-fr-release-rehearsal-20261026#9 decided_by=operator -->
+### quantities-application-verification-boundary · decision · Operator-approved standalone application verification boundary
+
+The actual user explicitly approved Approve simplified scope and supplied native question-tool evidence after the journal refused ordinary-text provenance: the complete standalone application docs/rehearsal/collected-closeout-1206/project is now the verification boundary. Earlier inherited copied-product full-suite requirement is superseded, not fixed or passed. Preserve commit 1fca788 and raw quantities-phase1-full-20261031.log: exit=2, 1 failed, 595 passed, 4 skipped, 46 errors, KeyboardInterrupt after 21m40s. Add only project/pytest.ini with [pytest] and testpaths = tests. Same executor makes exactly one fresh complete application pytest attempt after final code/config commit, within two minutes and remaining 15-minute aggregate budget; no filtering, skips, custom workflow, guard bypass or inherited rerun. Keep ordinary native evidence/review/deliver, own Tester gate, unwired truthfulness and Refs-only open issue #9. Native narrowing records the approved verification scope only, not reduced functional behavior or a gate answer.
