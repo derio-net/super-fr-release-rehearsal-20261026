@@ -1,0 +1,76 @@
+schema_version: 10
+run: 2026-10-30-routing-1205
+workflow: fr-goal@1
+branch: feat/batch-routing-1205
+started: '2026-10-30T22:13:16+00:00'
+cursor: deliver
+steps:
+  brainstorm:
+    state: done
+    at: '2026-10-31T04:54:16+00:00'
+    answered_by: operator
+    emitted:
+      spec: docs/superpowers/specs/2026-10-30-routing-walk-1205-design.md
+  spec-review:
+    state: done
+    at: '2026-10-31T04:55:43+00:00'
+    units:
+      step/spec-review:
+        attempts:
+        - dispatched: '2026-10-31T04:54:24+00:00'
+          agent: ses_e6fb0b02effe1D61HGm3FqPDsQ
+          agent_type: fr-spec-reviewer-hard
+          harness: opencode
+          model: openai/gpt-6.1-sol
+          tier: hard
+          bound: openai/gpt-6.1-sol
+          session: ses_e71210cceffeiBPvi1x6z8VEG7
+          returned: '2026-10-31T04:55:42+00:00'
+          outcome: done
+        evidence:
+          review: routing1205-a-review
+          reviewer: ses_e6fb0b02effe1D61HGm3FqPDsQ
+          findings: routing1205-a-s1
+  plan:
+    state: done
+    at: '2026-10-31T04:56:07+00:00'
+    emitted:
+      plan: docs/superpowers/plans/2026-10-30-routing-walk-1205
+    units:
+      step/plan:
+        attempts:
+        - dispatched: '2026-10-31T04:55:48+00:00'
+          harness: opencode
+          session: ses_e71210cceffeiBPvi1x6z8VEG7
+          returned: '2026-10-31T04:56:07+00:00'
+          outcome: done
+  plan-review:
+    state: done
+    at: '2026-10-31T04:56:11+00:00'
+    exit: 0
+    stdout: |
+      self-review passed
+  implement:
+    state: done
+    at: '2026-10-31T04:56:12+00:00'
+    members:
+    - implement-phase
+    - review-phase
+    units:
+      phase/1:
+        state: manual
+  journal-check:
+    state: done
+    at: '2026-10-31T04:56:14+00:00'
+    exit: 0
+    stdout: ''
+  deliver:
+    state: running
+    at: '2026-10-31T04:56:15+00:00'
+    units:
+      step/deliver:
+        attempts:
+        - dispatched: '2026-10-31T04:56:15+00:00'
+          harness: opencode
+          session: ses_e71210cceffeiBPvi1x6z8VEG7
+fr_version: 6.0.0rc15

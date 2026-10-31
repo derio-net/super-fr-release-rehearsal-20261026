@@ -22,10 +22,43 @@ Test Plan outcome, recorded only after it actually occurs; it is not part
 of the row certified before the second pass. Labels alone do not prove routing.
 
 R2. At most three reviewed fixture PRs/normal merges (setup, batch, evidence),
-one issue, one real batch, one OpenCode session (`openai/gpt-6.1-sol`, `--auto`)
-and two acting passes in a new queue. No subagents, extra target attempts,
-close-out, installer/restart/export hooks, release, protection overrides,
-original gate pass, real queue, J or six-batch action.
+one issue, one real batch, one OpenCode target session (`openai/gpt-6.1-sol`,
+`--auto`) and two coordinator-owned acting passes in a new queue. The operator's
+target-local confirmation permits at most THREE genuine `fr-spec-reviewer`
+children dispatched by this target after the required review unit opens. Each
+child is read-only and must not delegate; retain its actual returned identity
+and dispatch/return provenance. Stop before a fourth child. No implementation
+workers, further delegation, extra target attempts, close-out,
+installer/restart/export hooks, release, protection overrides, original gate
+pass, real queue, J or six-batch action. This scoped clarification supersedes
+the setup's no-reviewer-child restriction, not its other boundaries.
+
+R3. This target uses the installed released RC15 runtime
+(`/Users/derio/.local/bin/fr`, identity `6.0.0rc15
+/Users/derio/.local/share/uv/tools/fr/lib/python3.15/site-packages/fr`), preserving
+the inherited `FR_HARNESS_FR` pin. Reuse this spec and the existing manual-only
+plan through the unmodified shipped `fr-goal` lifecycle in host-worktree
+isolation on `feat/batch-routing-1205`, run `2026-10-30-routing-1205`.
+Reconcile before starting; no duplicate run, bypass, global tool/config change,
+unpublished diagnostic runtime, hidden observation identity or model fallback.
+The target must receive a genuine answer through its own question tool after
+the brainstorm gate opens and obtain a fresh target-dispatched spec review.
+No historical setup review substitutes for this evidence.
+
+R4. This target hands off an explicitly incomplete documentation fixture at
+`deliver/running`: no full suite, fabricated test/CI/reuse evidence or done
+delivery. Resolve only genuinely satisfied preceding gates; let the CLI run
+plan-review and journal-check and complete only the empty agentic group.
+Never tick or complete the manual phase; stop if any implementation unit
+appears. Open only one new draft batch PR after actual dispatch, with genuine
+run artifacts and a bounded observation note, `Refs
+derio-net/super-fr-release-rehearsal-20261026#3` and `Refs derio-net/super-fr#1205`,
+no closing keywords. All manual observations and the acceptance row remain
+owed. Independent coordinator review of the actual draft/head and incomplete
+cursor precedes any separate normal merge. Only shipped spec-bearing resolve
+may sync labels; report an absent sync, never manually label or use a no-op
+status set as proof. No acting driver pass, gate pass, merge, close-out,
+release, issue closure or cleanup is authorized to this target.
 
 ## Verification
 
@@ -67,8 +100,12 @@ gate: tester
 Read current `herdr --skill`; use only a new owned no-focus target. Partial,
 failed or ambiguous allocation/submission stops the single attempt without
 retry, repair or model/provider substitution. Coordinator handles actual
-questions and independent reviews. If the shipped workflow requires extra
-AI sessions, stop rather than expanding the one-session cap. Exact sequence:
+questions and independent reviews. The target's own answered question and
+required reviewer-child evidence cannot be replaced by coordinator answers or
+reviews. Stop at any unmet gate or before exceeding R2's scoped session cap.
+The setup execution brief below is historical where it names older runtimes
+or forbids reviewer children; R2–R4 govern this target's approved execution.
+Exact setup sequence:
 `docs/rehearsal/routing-1205/README.md`.
 
 ## Implementation Plans

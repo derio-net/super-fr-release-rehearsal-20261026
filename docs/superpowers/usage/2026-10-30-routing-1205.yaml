@@ -1,0 +1,61 @@
+schema_version: 2
+run: 2026-10-30-routing-1205
+captures:
+- host: h-d9835d87
+  harness: opencode
+  mode: host-worktree
+  captured_at: '2026-10-31T04:54:23+00:00'
+  at:
+  - resolve:brainstorm
+  sessions:
+  - session: ses_e71210cceffeiBPvi1x6z8VEG7
+    role: main
+    models:
+      gpt-6.1-sol:
+        input: 218765
+        cache_write: 0
+        cache_read: 1785728
+        output: 6559
+        usd: null
+        usd_source: none
+    activity:
+      implementation:
+        usd: null
+        turns: 3
+      other:
+        usd: null
+        turns: 20
+      paperwork:
+        usd: null
+        turns: 10
+    steps:
+      (outside run):
+        usd: null
+        turns: 11
+        input: 97353
+        cache_write: 0
+        cache_read: 482176
+        output: 997
+      brainstorm:
+        usd: null
+        turns: 17
+        input: 121412
+        cache_write: 0
+        cache_read: 1303552
+        output: 5562
+    steps_by_role:
+      main:
+        (outside run):
+          usd: null
+          turns: 11
+          input: 97353
+          cache_write: 0
+          cache_read: 482176
+          output: 997
+        brainstorm:
+          usd: null
+          turns: 17
+          input: 121412
+          cache_write: 0
+          cache_read: 1303552
+          output: 5562
