@@ -1,0 +1,61 @@
+schema_version: 2
+run: 2026-10-31-feat-batch-closeout-1206-quantities
+captures:
+- host: h-51509e59
+  harness: opencode
+  mode: devcontainer
+  captured_at: '2026-10-31T12:28:02+00:00'
+  at:
+  - resolve:brainstorm
+  sessions:
+  - session: ses_e6e491be0ffeBvdv5ch4PnSXdx
+    role: main
+    models:
+      gpt-6.1-sol:
+        input: 136627
+        cache_write: 0
+        cache_read: 2335872
+        output: 4774
+        usd: null
+        usd_source: none
+    activity:
+      implementation:
+        usd: null
+        turns: 4
+      other:
+        usd: null
+        turns: 19
+      paperwork:
+        usd: null
+        turns: 13
+    steps:
+      (outside run):
+        usd: null
+        turns: 12
+        input: 97907
+        cache_write: 0
+        cache_read: 577664
+        output: 1139
+      brainstorm:
+        usd: null
+        turns: 20
+        input: 38720
+        cache_write: 0
+        cache_read: 1758208
+        output: 3635
+    steps_by_role:
+      main:
+        (outside run):
+          usd: null
+          turns: 12
+          input: 97907
+          cache_write: 0
+          cache_read: 577664
+          output: 1139
+        brainstorm:
+          usd: null
+          turns: 20
+          input: 38720
+          cache_write: 0
+          cache_read: 1758208
+          output: 3635
