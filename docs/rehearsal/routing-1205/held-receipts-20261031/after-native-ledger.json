@@ -1,0 +1,19 @@
+{
+  "routing-1205": {
+    "pr": 6,
+    "labels": "frozenset({'verification:live', 'gate:tester'})",
+    "rows": [
+      {
+        "id": "routing-1205-held-then-walked",
+        "gate": "tester",
+        "walked": false,
+        "issues": [
+          "derio-net/super-fr-release-rehearsal-20261026#3"
+        ]
+      }
+    ],
+    "run_gate": "tester",
+    "run_gate_inherited": true,
+    "ops_promoted": false
+  }
+}

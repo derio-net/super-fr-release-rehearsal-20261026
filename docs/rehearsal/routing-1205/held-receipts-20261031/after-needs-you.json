@@ -1,0 +1,8 @@
+[
+  {
+    "kind": "needs-tester",
+    "ref": "routing-1205",
+    "text": "batch routing-1205: landed, held by a post-merge gate (tester: walk its gated rows, or `fr gate pass --pr 6 --gate tester`)",
+    "href": "#batch-routing-1205"
+  }
+]

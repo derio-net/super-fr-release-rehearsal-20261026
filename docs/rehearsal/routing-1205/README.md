@@ -4,6 +4,22 @@ Setup only; no routing PASS, batch dispatch or run completion is claimed.
 Actual member issue: https://github.com/derio-net/super-fr-release-rehearsal-20261026/issues/3.
 Original https://github.com/derio-net/super-fr/issues/1205 remains owed.
 
+## Current evidence-preparation addendum — 2026-10-31
+
+The execution brief below is historical, not current authority to act. The
+first held pass was independently accepted; only its held-state row is now
+recorded in [the dated evidence](held-state-20261031.md). The later automatic
+gate transition is unproven. Manual steps and `deliver/running` stay unchanged.
+
+The user's extra alignment grant makes the effective merge cap FOUR instead
+of the historical three: setup #4, alignment #5, batch #6 are the three used.
+The fourth evidence merge remains reserved/unconsumed until a separate grant.
+Current permission covers local preparation and coordinator-owned independent
+review/push/one draft PR only, not merge. Acting-pass cap remains two, one used;
+no second pass here. No new issue/allocation beyond the original four used,
+no fifth allocation, target input, cleanup, gate pass or original completion.
+Keep the genuine untracked target retention note until separate cleanup grant.
+
 ## Identity and bounds
 
 - Repo `derio-net/super-fr-release-rehearsal-20261026`, ID `1434822196`;

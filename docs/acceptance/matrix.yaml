@@ -9899,17 +9899,28 @@ rows:
   - id: routing-1205-held-then-walked
     capability: 'Disposable #1205 routing walk'
     acceptance: After a genuine disposable batch dispatch and reviewed PR merge, the
-      first bounded driver pass shows the held batch under Needs you Tester, keeps
-      its Refs issue open with fr:awaiting-live, and starts no close-out.
+      first bounded driver pass shows the held batch under Needs you Tester, keeps its
+      Refs issue open with fr:awaiting-live, and starts no close-out.
     origin:
     - super-fr:docs/superpowers/specs/2026-10-30-routing-walk-1205-design.md#R1
     levels: {}
-    status: walk-owed
-    notes: 'Setup only: this row owes the real pre-transition held-state observation.
-      Record it walked only after that observation is genuine and accepted. The later
-      automatic fixture gate transition is a separate overall Test Plan outcome,
-      not part of this row or a result certified before the second pass. No original
-      #1205 discharge or #1195/#1217 gate pass.'
+    status: walked
+    notes: 'Independently accepted first held-state observation only: 2026-10-31T05:10:00Z–05:10:17Z,
+      native RC15 drive --once --keep-sessions --yes exited 0; Needs you Tester, issue
+      #3 OPEN/fr:awaiting-live, PR #6 merged/gate:tester without passed label, closing
+      0 and zero closeout records. Reviewer ses_e6fa16643ffewnUs94wY6erI1F accepted
+      the packet; private script mode finding corrected to 0600, hash unchanged. Evidence
+      docs/rehearsal/routing-1205/held-state-20261031.md. This dated walk certifies
+      ONLY the first hold, not the later automatic gate transition, completed delivery,
+      manual steps, issue closure or original #1205/#1195/#1217 completion. No second
+      acting pass or gate pass performed by this preparation.'
     verify: live
     issues:
     - derio-net/super-fr-release-rehearsal-20261026#3
+    walks:
+    - strategy: live
+      harness: opencode
+      model: openai/gpt-6.1-sol
+      outcome: pass
+      at: '2026-10-31T05:10:17Z'
+      evidence: docs/rehearsal/routing-1205/held-state-20261031.md
