@@ -28,3 +28,18 @@ The CLI may complete only the empty agentic group. All manual steps remain
 unticked and incomplete, all live observations and the row remain owed,
 and the coordinator alone owns the two future bounded acting passes.
 Historical setup evidence is not rewritten by this scoped clarification.
+
+## Current evidence-preparation addendum — 2026-10-31
+
+The user's extra alignment grant changes the effective merge ceiling from
+the historical three to FOUR: setup #4, alignment #5 and batch #6 used three.
+The fourth evidence slot is reserved, not consumed; merge needs a separate
+grant. Prepare only the accepted first held-state row's historical dated walk
+and local evidence commits; coordinator owns independent review/push/one draft
+PR. Two acting passes remain the cap, one used; no second pass in preparation.
+No additional issue/allocation beyond the original four used, no fifth
+allocation, target input, cleanup, gate pass, original issue completion or
+manual step ticks. The run remains `deliver/running`. The row's current walk
+does not certify the later automatic transition. See
+`docs/rehearsal/routing-1205/held-state-20261031.md`; historical numbers above
+and in the manual phase are intentionally not rewritten.

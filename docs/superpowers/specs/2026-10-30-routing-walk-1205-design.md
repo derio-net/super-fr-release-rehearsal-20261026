@@ -60,6 +60,24 @@ may sync labels; report an absent sync, never manually label or use a no-op
 status set as proof. No acting driver pass, gate pass, merge, close-out,
 release, issue closure or cleanup is authorized to this target.
 
+## Current permission addendum — 2026-10-31
+
+R2's original three-merge budget above is historical. The user's extra alignment
+grant makes the effective fixture ceiling FOUR normal reviewed merges solely
+to accommodate alignment: setup #4, alignment #5 and batch #6 have used three.
+The fourth evidence-merge slot remains reserved and unconsumed until a separate
+grant. Current authority is local evidence preparation, then coordinator-owned
+independent review/push/one draft PR only; no merge or second acting pass.
+The acting-pass cap is still TWO, with ONE used (accepted first held pass at
+05:10 UTC). No new issue or allocation beyond the original four used, no fifth
+allocation, no target input, cleanup, gate pass or original issue completion.
+
+Only the R1 held-state row may now record its accepted historical walk. R4's
+target handoff and Test Plan steps' earlier owed/third-PR/no-fourth language
+remain historical, not a claim that the later automatic transition was proven
+or permission to proceed. Manual steps stay unticked and `deliver/running`
+stays unchanged. Evidence: `docs/rehearsal/routing-1205/held-state-20261031.md`.
+
 ## Verification
 
 strategy: live
