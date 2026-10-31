@@ -3,11 +3,14 @@ run: 2026-10-30-routing-1205
 workflow: fr-goal@1
 branch: feat/batch-routing-1205
 started: '2026-10-30T22:13:16+00:00'
-cursor: brainstorm
+cursor: spec-review
 steps:
   brainstorm:
-    state: blocked
-    at: '2026-10-30T22:13:32+00:00'
+    state: done
+    at: '2026-10-31T04:54:16+00:00'
+    answered_by: operator
+    emitted:
+      spec: docs/superpowers/specs/2026-10-30-routing-walk-1205-design.md
   spec-review:
     state: pending
   plan:
